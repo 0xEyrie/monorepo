@@ -1,3 +1,6 @@
 [submodule "sol/lib/forge-std"]
 	path = sol/lib/forge-std
 	url = https://github.com/foundry-rs/forge-std
+[submodule "baton-research"]
+	path = baton-research
+	url = https://github.com/djm07073/baton-research.git
