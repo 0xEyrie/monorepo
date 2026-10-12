@@ -12,6 +12,7 @@ use crate::{
     multimmit::{
         marshal::{
             actors::{backfill::CustodiedBlock, metrics::FetchReason},
+            ordering::{self, MAX_ORDERING_BLOCKS, OrderingContext},
             protocol::{order::Slot, paths::Branch},
             storage::{
                 commit::CustodyRef,
@@ -459,6 +460,97 @@ where
     where
         J: Iterator<Item = Slot<H::Digest>>,
     {
+        self.resolve_custody(stream, emitted, forward, batch, None)
+            .await
+    }
+
+    /// Reconstructs stable ordering contexts before suppressing already published blocks.
+    pub(super) async fn drive_ordered<J>(
+        &mut self,
+        history: H::Digest,
+        stream: &mut J,
+        base: &[BlockRef<H::Digest>],
+        emitted: &[BlockRef<H::Digest>],
+        forward: &[Option<Branch<H::Digest>>],
+        batch: &mut PublicationBatch<H, V, B>,
+    ) -> Result<(), Error>
+    where
+        J: Iterator<Item = Slot<H::Digest>>,
+    {
+        let policy = Arc::clone(
+            self.ordering
+                .as_ref()
+                .expect("custom ordering is configured"),
+        );
+        let mut cursor = base.to_vec();
+        loop {
+            let mut staged = Vec::with_capacity(MAX_ORDERING_BLOCKS);
+            while staged.len() < MAX_ORDERING_BLOCKS {
+                let Some(next) = self.next_staged(stream, base, forward).await? else {
+                    break;
+                };
+                staged.push(next);
+            }
+            if staged.is_empty() {
+                break;
+            }
+            let mut prefixes = vec![Vec::new(); base.len()];
+            let mut slots = vec![Vec::new(); base.len()];
+            for next in staged {
+                let chain = next.reference.chain().index();
+                prefixes[chain].push(next.reference);
+                slots[chain].push(next.slot);
+            }
+            let context = OrderingContext::new(self.epoch, history, cursor.clone(), prefixes);
+            let ordered = policy.order(&context);
+            ordering::validate(&context, &ordered)?;
+            let mut planned = VecDeque::with_capacity(ordered.len());
+            let mut new_output_seen = false;
+            for reference in ordered {
+                let chain = reference.chain().index();
+                let duplicate = reference.height() <= emitted[chain].height();
+                if duplicate && new_output_seen {
+                    return Err(Error::Invalid("ordering policy changed a published prefix"));
+                }
+                new_output_seen |= !duplicate;
+                let offset =
+                    usize::try_from(reference.height().get() - cursor[chain].height().get() - 1)
+                        .map_err(|_| Error::OutputExhausted)?;
+                if !duplicate {
+                    let slot = *slots[chain]
+                        .get(offset)
+                        .ok_or(Error::Invalid("ordering input has a chain-local gap"))?;
+                    planned.push_back(StagedSlot { slot, reference });
+                }
+            }
+            self.resolve_custody(
+                &mut std::iter::empty(),
+                emitted,
+                forward,
+                batch,
+                Some(planned),
+            )
+            .await?;
+            for (chain, prefix) in context.prefixes().iter().enumerate() {
+                if let Some(last) = prefix.last() {
+                    cursor[chain] = *last;
+                }
+            }
+        }
+        self.check_stack_empty(base.len()).await
+    }
+
+    async fn resolve_custody<J>(
+        &mut self,
+        stream: &mut J,
+        emitted: &[BlockRef<H::Digest>],
+        forward: &[Option<Branch<H::Digest>>],
+        batch: &mut PublicationBatch<H, V, B>,
+        mut preordered: Option<VecDeque<StagedSlot<H::Digest>>>,
+    ) -> Result<(), Error>
+    where
+        J: Iterator<Item = Slot<H::Digest>>,
+    {
         let mut window = CustodyWindow::new(
             self.epoch,
             WindowBounds {
@@ -472,7 +564,11 @@ where
         loop {
             let mut planned = 0u64;
             while window.has_room() {
-                match self.next_staged(stream, emitted, forward).await? {
+                let next = match &mut preordered {
+                    Some(planned) => planned.pop_front(),
+                    None => self.next_staged(stream, emitted, forward).await?,
+                };
+                match next {
                     Some(StagedSlot { slot, reference }) => {
                         window.push(slot, reference)?;
                         planned += 1;
@@ -542,7 +638,14 @@ where
             }
         }
         self.metrics.pressure(0, 0, 0);
-        for chain in 0..emitted.len() {
+        if preordered.is_none() {
+            self.check_stack_empty(emitted.len()).await?;
+        }
+        Ok(())
+    }
+
+    async fn check_stack_empty(&mut self, chains: usize) -> Result<(), Error> {
+        for chain in 0..chains {
             if self.block_stack.read_oldest(chain).await?.is_some() {
                 return Err(Error::Invalid(
                     "staged producer block is outside the ordering stream",

@@ -10,6 +10,7 @@
 
 use super::{
     actors::synchronizer,
+    ordering::Ordering,
     types::{Families, Floor},
 };
 use crate::{
@@ -29,7 +30,10 @@ use commonware_storage::{
     translator::Translator,
 };
 use commonware_utils::{NZU64, NZUsize};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
+};
 
 const DEFAULT_CATALOG_MAILBOX_SIZE: NonZeroUsize = NZUsize!(1024);
 const DEFAULT_ADMISSION_CUT_CAPACITY: NonZeroUsize = NZUsize!(1024);
@@ -353,6 +357,9 @@ pub struct Config<T: Translator, V: Variant, B: Codec + Digestible> {
     pub body_codec_config: B::Cfg,
     /// Archive buffers, page cache, section sizing, and translator.
     pub archive: ArchiveConfig<T>,
+    /// Optional final-order policy for authenticated history ranges.
+    /// All nodes and restarts must satisfy the [`Ordering`] protocol contract.
+    pub ordering: Option<Arc<dyn Ordering<B::Digest>>>,
 }
 
 impl<T: Translator, V: Variant, B: Codec + Digestible> Config<T, V, B> {
@@ -375,7 +382,18 @@ impl<T: Translator, V: Variant, B: Codec + Digestible> Config<T, V, B> {
             codec_config,
             body_codec_config,
             archive,
+            ordering: None,
         }
+    }
+
+    /// Selects the epoch's final-order policy for authenticated chain prefixes.
+    ///
+    /// The default retains proposal-first traversal and immediate final sweeps. Custom ordering
+    /// waits for a subsequent finalized leader to authenticate a common history range. Use the
+    /// same policy and retained policy data on every node, restart, and state-sync import.
+    pub fn with_ordering(mut self, ordering: impl Ordering<B::Digest>) -> Self {
+        self.ordering = Some(Arc::new(ordering));
+        self
     }
 
     /// Sizes every bound that follows from the largest encoded producer block.
@@ -611,6 +629,9 @@ impl<T: Translator, V: Variant, B: Codec + Digestible> Config<T, V, B> {
                 (floor.history.tips(), floor.emitted.as_slice())
             }
         };
+        if self.ordering.is_some() && ordered != emitted {
+            return Err(ConfigError::StartFrontier);
+        }
         let ordered = Frontier::new(ordered.to_vec()).map_err(|_| ConfigError::StartFrontier)?;
         let emitted = Frontier::new(emitted.to_vec()).map_err(|_| ConfigError::StartFrontier)?;
         if ordered.chains() != self.chains() || emitted.dominates(&ordered).is_err() {

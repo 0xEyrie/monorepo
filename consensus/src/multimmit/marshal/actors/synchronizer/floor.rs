@@ -87,6 +87,7 @@ where
             &candidate.history,
             &candidate.emitted,
             self.codec,
+            self.ordering.is_some(),
         )?;
         let floor_index = frontier_index(&candidate.emitted)
             .ok_or(Error::Invalid("floor frontier overflows the output index"))?;

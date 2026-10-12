@@ -44,6 +44,7 @@ use commonware_utils::{
     Acknowledgement as _, NZU16, NZU64, NZUsize, channel::oneshot, sync::Mutex,
 };
 use futures::{StreamExt as _, stream::FuturesUnordered};
+use rstest::rstest;
 use std::{
     num::{NonZeroU64, NonZeroUsize},
     sync::Arc,
@@ -495,6 +496,15 @@ async fn get_buffered(
         .filter(|block| block.reference() == reference)
 }
 
+#[derive(Clone, Copy)]
+struct ReverseLanePrefixes;
+
+impl super::Ordering<Sha256Digest> for ReverseLanePrefixes {
+    fn order(&self, context: &super::OrderingContext<Sha256Digest>) -> Vec<BlockRef<Sha256Digest>> {
+        context.prefixes().iter().rev().flatten().copied().collect()
+    }
+}
+
 struct Harness {
     context: deterministic::Context,
     oracle: simulated::Oracle<ed25519::PublicKey, deterministic::Context>,
@@ -504,6 +514,7 @@ struct Harness {
     launches: [u64; 2],
     seed: u64,
     archive_modes: [ArchiveMode; 3],
+    custom_ordering: bool,
     catalog_mailbox_size: NonZeroUsize,
     max_commit_outputs: NonZeroUsize,
     max_hot_block_bytes: NonZeroUsize,
@@ -540,6 +551,7 @@ impl Harness {
             launches: [0, 0],
             seed,
             archive_modes,
+            custom_ordering: false,
             catalog_mailbox_size: NZUsize!(64),
             max_commit_outputs: NZUsize!(8),
             max_hot_block_bytes: NZUsize!(512 * 1024 * 1024),
@@ -559,7 +571,7 @@ impl Harness {
             CacheRef::from_pooler(context, NZU16!(1024), NZUsize!(8)),
         );
         archive.items_per_section = NZU64!(2);
-        Config::new(
+        let config = Config::new(
             Start::Genesis(self.committee.config.genesis().clone()),
             format!("multimmit_marshal_e2e_{}_{}", self.seed, index),
             self.committee.codec(),
@@ -581,7 +593,12 @@ impl Harness {
             lqc: self.archive_modes[0],
             history: self.archive_modes[1],
             blocks: self.archive_modes[2],
-        })
+        });
+        if self.custom_ordering {
+            config.with_ordering(ReverseLanePrefixes)
+        } else {
+            config
+        }
     }
 
     async fn start(&mut self, index: usize) {
@@ -1014,6 +1031,113 @@ fn local_two_chain_delivery_is_offset_major_and_header_exact() {
             0,
             "{metrics}"
         );
+        harness.shutdown().await;
+    });
+}
+
+#[rstest]
+#[case::history_catchup(false)]
+#[case::floor_import(true)]
+fn custom_ordering_replays_one_authenticated_history_range(#[case] import_floor: bool) {
+    runner(140).start(|context| async move {
+        let mut harness = Harness::new(context, 140, [false, true]).await;
+        harness.custom_ordering = true;
+        harness.max_commit_outputs = NZUsize!(1);
+        harness.start(0).await;
+        let first = certify(
+            &harness.committee,
+            1,
+            initial_history(&harness.committee),
+            harness.committee.config.genesis().tips(),
+            vec![vec![body(10)], vec![body(12), body(13)]],
+        );
+        first.submit(&harness.mailbox(0)).await;
+        first.finalize(&harness.mailbox(0));
+        harness
+            .wait_progress(0, |p| p.floor == first.proof.id::<Sha256>())
+            .await;
+        assert!(harness.reporter(0).delivered().is_empty());
+        let history = Arc::new(
+            TipRecord::at_tips(first.history.commitment::<Sha256>(), first.tips()).unwrap(),
+        );
+        let second = certify(
+            &harness.committee,
+            2,
+            history,
+            &first.tips(),
+            vec![vec![body(20)], vec![body(22)]],
+        );
+        second.submit(&harness.mailbox(0)).await;
+        second.finalize(&harness.mailbox(0));
+        let delivered = harness.wait_updates(0, 3).await;
+        // A policy may merge whole certified lane prefixes without reserving an absent slot.
+        let expected = [(1, 0), (1, 1), (0, 0)];
+        for (actual, (chain, offset)) in delivered.iter().zip(expected) {
+            assert_eq!(actual.block.as_ref(), first.blocks[chain][offset].as_ref());
+        }
+        assert_eq!(
+            harness.reporter(0).acknowledge_next(),
+            Some(OutputIndex::new(1))
+        );
+        harness
+            .wait_progress(0, |p| p.acknowledged == OutputIndex::new(1))
+            .await;
+        harness.crash(0).await;
+        harness.start(0).await;
+        let replayed = harness.wait_updates(0, 5).await;
+        for (actual, expected) in replayed[3..].iter().zip(&delivered[1..]) {
+            assert_eq!(actual.index, expected.index);
+            assert_eq!(actual.block.as_ref(), expected.block.as_ref());
+        }
+        harness.start(1).await;
+        if import_floor {
+            let (index, floor) = harness
+                .mailbox(0)
+                .floor_at(OutputIndex::new(3))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(index, OutputIndex::new(3));
+            assert_eq!(floor.emitted(), first.tips());
+            harness.mailbox(1).install_floor(floor).await.unwrap();
+            harness
+                .wait_progress(1, |p| p.committed == OutputIndex::new(3))
+                .await;
+            assert!(harness.reporter(1).delivered().is_empty());
+        } else {
+            second.finalize(&harness.mailbox(1));
+            let recovered = harness.wait_updates(1, 3).await;
+            for (actual, expected) in recovered.iter().zip(&delivered) {
+                assert_eq!(actual.index, expected.index);
+                assert_eq!(actual.block.as_ref(), expected.block.as_ref());
+            }
+        }
+        let third_history = Arc::new(
+            TipRecord::at_tips(second.history.commitment::<Sha256>(), second.tips()).unwrap(),
+        );
+        let third = certify(
+            &harness.committee,
+            3,
+            third_history,
+            &second.tips(),
+            vec![vec![body(30)], vec![body(32)]],
+        );
+        third.submit(&harness.mailbox(0)).await;
+        third.finalize(&harness.mailbox(0));
+        third.finalize(&harness.mailbox(1));
+        let continued = harness.wait_updates(0, 7).await;
+        let target = harness
+            .wait_updates(1, if import_floor { 2 } else { 5 })
+            .await;
+        let target_start = if import_floor { 0 } else { 3 };
+        for (position, (chain, offset)) in [(1, 0), (0, 0)].into_iter().enumerate() {
+            let source = &continued[5 + position];
+            let peer = &target[target_start + position];
+            assert_eq!(source.index, OutputIndex::new(4 + position as u64));
+            assert_eq!(source.block.as_ref(), second.blocks[chain][offset].as_ref());
+            assert_eq!(peer.index, source.index);
+            assert_eq!(peer.block.as_ref(), source.block.as_ref());
+        }
         harness.shutdown().await;
     });
 }

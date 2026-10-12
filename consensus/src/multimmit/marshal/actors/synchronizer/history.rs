@@ -78,7 +78,7 @@ where
     Error: From<C::Error> + From<F::Error> + From<S::Error> + From<K::Error>,
 {
     /// Synchronizes to the same-view finalized `proofs`: opens every tip-history record they
-    /// commit to, then emits each proof's final sweep and selects it.
+    /// commit to, then selects each proof. Default ordering also emits its immediate final sweep.
     #[tracing::instrument(
         name = "multimmit.marshal.synchronizer.resolve_finality",
         level = "info",
@@ -116,6 +116,10 @@ where
     ///
     /// A fact applies only when it describes the floor proof's leader proposal.
     pub(super) async fn synchronize_pending_finality(&mut self) -> Result<(), Error> {
+        if self.ordering.is_some() {
+            self.finality.take_pending();
+            return Ok(());
+        }
         while let Some(fact) = self.finality.take_pending() {
             match fact.round().view().cmp(&self.floor_view) {
                 Ordering::Less => continue,
@@ -250,20 +254,22 @@ where
         self.history_stack.reset().await.map_err(Error::from)
     }
 
-    /// Emits the final sweep of `selected` and selects it.
+    /// Selects `selected`, emitting its immediate final sweep only for default ordering.
     async fn select(
         &mut self,
         selected: SelectedLqc<V, H>,
         batch: &mut PublicationBatch<H, V, B>,
     ) -> Result<(), Error> {
-        let preview = HistoryState::new(
-            self.state.history(),
-            self.state.ordered().to_vec(),
-            self.state.ordered().to_vec(),
-        )?;
-        let sweep =
-            preview.final_sweep::<H, V>(&selected.proof, self.codec, self.state.ordered())?;
-        self.sweep(sweep.into_stream(), batch).await?;
+        if self.ordering.is_none() {
+            let preview = HistoryState::new(
+                self.state.history(),
+                self.state.ordered().to_vec(),
+                self.state.ordered().to_vec(),
+            )?;
+            let sweep =
+                preview.final_sweep::<H, V>(&selected.proof, self.codec, self.state.ordered())?;
+            self.sweep(sweep.into_stream(), batch).await?;
+        }
         batch.selected.push(selected);
         if batch.selected.len() == self.bounds.max_commit_outputs {
             self.commit_pending(batch).await?;
@@ -340,18 +346,35 @@ where
         batch: &mut PublicationBatch<H, V, B>,
     ) -> Result<(), Error> {
         let emitted = self.state.emitted().to_vec();
-        let mut stream = SlotStream::new(
-            self.state.ordered(),
-            link.record.tips(),
-            link.record.proposed(),
-        )?;
-        let plan = self
-            .stage(stream.maxima(), link.record.tips(), &emitted)
+        let base = self.state.ordered().to_vec();
+        let mut stream = SlotStream::new(&base, link.record.tips(), link.record.proposed())?;
+        if self.ordering.is_some() {
+            // Reconstruct complete contexts even after a partial publication; replay suppresses
+            // duplicates only after the policy returns the same order.
+            let common = self.common_frontiers(link.record.tips(), &emitted).await?;
+            let plan = self
+                .stage(stream.maxima(), link.record.tips(), &base)
+                .await?;
+            self.state
+                .validate_opening::<H>(link.commitment, &link.record, &common)?;
+            self.drive_ordered(
+                link.commitment,
+                &mut stream,
+                &base,
+                &emitted,
+                &plan.forward,
+                batch,
+            )
             .await?;
-        self.state
-            .validate_opening::<H>(link.commitment, &link.record, &plan.common)?;
-        self.drive(&mut stream, &emitted, &plan.forward, batch)
-            .await?;
+        } else {
+            let plan = self
+                .stage(stream.maxima(), link.record.tips(), &emitted)
+                .await?;
+            self.state
+                .validate_opening::<H>(link.commitment, &link.record, &plan.common)?;
+            self.drive(&mut stream, &emitted, &plan.forward, batch)
+                .await?;
+        }
         self.record_opening(link, batch).await
     }
 
@@ -368,6 +391,12 @@ where
         links: Vec<HistoryLink<H>>,
         batch: &mut PublicationBatch<H, V, B>,
     ) -> Result<(), Error> {
+        if self.ordering.is_some() {
+            for link in links {
+                self.open(link, batch).await?;
+            }
+            return Ok(());
+        }
         let emitted = self.state.emitted().to_vec();
         let Some(staged) = self.stage_window(&links, &emitted).await? else {
             // An anchor jumped branches inside the window. Each opening then reads its blocks off

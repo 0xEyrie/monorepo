@@ -16,7 +16,7 @@ pub(crate) enum Error {
     /// The floor's emitted frontier is below the current one on some chain.
     #[error("floor emitted frontier regresses")]
     EmittedRegression,
-    /// The floor's emitted frontier is not where the anchor's final sweep ends.
+    /// The floor's emitted frontier does not match its configured ordering mode.
     #[error("floor emitted frontier is not the anchor's final sweep")]
     Sweep,
     /// The floor's frontiers or final sweep are malformed.
@@ -30,7 +30,7 @@ pub(crate) struct Frontiers<D: Digest> {
     pub history: D,
     /// Ordered frontier: the tips of the floor's tip-history record.
     pub ordered: Vec<BlockRef<D>>,
-    /// Final tips of the anchor's final sweep.
+    /// Target frontier against which the caller authenticates the emitted ancestry.
     pub target: Vec<BlockRef<D>>,
 }
 
@@ -38,14 +38,16 @@ pub(crate) struct Frontiers<D: Digest> {
 /// `emitted` against `state`.
 ///
 /// The history must be the one the anchor commits to, neither frontier may regress, and
-/// `emitted` must end the anchor's final sweep from the ordered frontier. The ancestry between
-/// `emitted` and the returned target is left to the caller.
+/// Default ordering requires `emitted` to end the anchor's final sweep. Custom ordering requires
+/// it to equal the complete history frontier. The ancestry between `emitted` and the returned
+/// target is left to the caller.
 pub(crate) fn validate<H, V>(
     state: &HistoryState<H::Digest>,
     anchor: &Lqc<V, H::Digest>,
     history: &TipRecord<H::Digest>,
     emitted: &[BlockRef<H::Digest>],
     codec: CodecConfig,
+    custom_ordering: bool,
 ) -> Result<Frontiers<H::Digest>, Error>
 where
     H: Hasher,
@@ -63,6 +65,17 @@ where
     let next_emitted = Frontier::new(emitted.to_vec()).map_err(order::Error::from)?;
     if !state.emitted_frontier().advances_to(&next_emitted) {
         return Err(Error::EmittedRegression);
+    }
+
+    if custom_ordering {
+        if emitted != ordered {
+            return Err(Error::Sweep);
+        }
+        return Ok(Frontiers {
+            history: commitment,
+            target: ordered.clone(),
+            ordered,
+        });
     }
 
     let base = HistoryState::new(commitment, ordered.clone(), ordered.clone())?;

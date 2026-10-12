@@ -14,6 +14,7 @@ use crate::{
             OutputIndex,
             actors::metrics,
             config::Retention,
+            ordering::Policy,
             protocol::{order::HistoryState, paths::PathCache},
             storage::scratch::{BlockStack, HistoryStack},
             types::LqcVerifier,
@@ -24,7 +25,7 @@ use crate::{
     types::{Epoch, View},
 };
 use commonware_actor::mailbox;
-use commonware_cryptography::{Hasher, bls12381::primitives::variant::Variant};
+use commonware_cryptography::{Digest, Hasher, bls12381::primitives::variant::Variant};
 use commonware_macros::select_loop;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use commonware_utils::{
@@ -36,7 +37,7 @@ use std::{collections::BTreeMap, future::ready, marker::PhantomData, num::NonZer
 use tracing::{Instrument as _, Span, debug, debug_span, info_span};
 
 /// Configuration for the synchronization actor.
-pub(crate) struct Config<C, F, S, K, Q> {
+pub(crate) struct Config<C, F, S, K, Q, D: Digest> {
     /// Catalog that holds the durable cut and receives commits.
     pub catalog: C,
     /// Fetches of history, headers and blocks missing from the catalog.
@@ -49,6 +50,8 @@ pub(crate) struct Config<C, F, S, K, Q> {
     pub verifier: Q,
     /// Decode bounds for the epoch.
     pub codec: CodecConfig,
+    /// Final-order policy for authenticated history ranges.
+    pub ordering: Policy<D>,
     /// Capacity of the actor's mailbox.
     pub mailbox_size: NonZeroUsize,
     /// Maximum number of cached producer headers and forward paths.
@@ -82,7 +85,7 @@ pub(super) struct SyncBounds {
 }
 
 impl SyncBounds {
-    fn new<C, F, S, K, Q>(config: &Config<C, F, S, K, Q>) -> Result<Self, Error> {
+    fn new<C, F, S, K, Q, D: Digest>(config: &Config<C, F, S, K, Q, D>) -> Result<Self, Error> {
         let backfill_concurrency = config.backfill_concurrency.get();
         let max_commit_outputs = config.max_commit_outputs.get();
         let max_block_bytes = config.max_block_bytes.get();
@@ -140,6 +143,7 @@ where
     /// Direct-pool finality facts waiting for their final sweep.
     pub(super) finality: FinalityHints<H::Digest>,
     pub(super) codec: CodecConfig,
+    pub(super) ordering: Policy<H::Digest>,
     pub(super) bounds: SyncBounds,
     pub(super) epoch: Epoch,
     /// Generation of the installed floor; each floor installation increments it.
@@ -206,6 +210,7 @@ where
             commitments,
             finality,
             codec,
+            ordering,
             bounds,
             epoch,
             floor_generation,
@@ -231,6 +236,7 @@ where
             commitments,
             finality,
             codec,
+            ordering,
             bounds,
             epoch,
             floor_generation,
@@ -262,7 +268,7 @@ where
 {
     /// Restores the durable cut and finishes synchronizing to the latest retained L-QC.
     pub(super) async fn recover(
-        config: Config<C, F, S, K, Q>,
+        config: Config<C, F, S, K, Q, H::Digest>,
         metrics: metrics::Synchronizer,
     ) -> Result<Self, Error> {
         let bounds = SyncBounds::new(&config)?;
@@ -273,6 +279,7 @@ where
             block_stack,
             verifier,
             codec,
+            ordering,
             header_cache_capacity,
             ..
         } = config;
@@ -301,6 +308,7 @@ where
             ),
             finality: FinalityHints::new(checkpoint.epoch(), codec),
             codec,
+            ordering,
             bounds,
             epoch: checkpoint.epoch(),
             floor_generation: checkpoint.floor_generation(),
@@ -520,7 +528,7 @@ where
     V: Variant,
 {
     context: ContextCell<E>,
-    config: Config<C, F, S, K, Q>,
+    config: Config<C, F, S, K, Q, H::Digest>,
     receiver: mailbox::Receiver<Message<V, H::Digest>>,
     metrics: metrics::Synchronizer,
     _body: PhantomData<B>,
@@ -542,7 +550,10 @@ where
     /// Creates the actor and its mailbox.
     ///
     /// `context` is marshal's: the actor registers its metrics under `synchronizer`.
-    pub(crate) fn new(context: &E, config: Config<C, F, S, K, Q>) -> (Self, Mailbox<V, H::Digest>) {
+    pub(crate) fn new(
+        context: &E,
+        config: Config<C, F, S, K, Q, H::Digest>,
+    ) -> (Self, Mailbox<V, H::Digest>) {
         let context = context.child("synchronizer");
         let (sender, receiver) = mailbox::new(context.child("mailbox"), config.mailbox_size);
         let metrics = metrics::Synchronizer::new(&context);

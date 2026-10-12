@@ -166,7 +166,7 @@ must reach marshal for pending custody to be reclaimed.
 
 ### Marshal service lifecycle
 
-Marshal implements the Section 6 two-pass ordering variant. Consensus emits authenticated L-QCs,
+Marshal implements the Section 6 two-pass ordering variant by default. Consensus emits authenticated L-QCs,
 accepted producer headers, available history openings, and the DA certificates it has durably
 recorded through one best-effort `Activity` stream; marshal validates each identity, persists useful hints, and resolves missing openings or
 blocks by authenticated digest. Dense delivery and application acknowledgement never enter
@@ -182,9 +182,14 @@ consensus storage. `marshal/mod.rs` lists the actors; each owns its own store:
   `commonware-resolver`. Producer wire keys contain only chain and header digest to avoid redundant
   bytes; request completion still compares the complete `BlockRef`, including height.
 - `Synchronizer` walks recursive history commitments and producer ancestry through disk-backed
-  scratch journals, applies the deterministic offset-major sweeps in two passes (proposed blocks,
-  then extensions), and asks Catalog to commit bounded batches of adjacent history openings and
-  dense rows. Producer ancestry is serial within each chain and concurrent across chains up to
+  scratch journals and asks Catalog to commit bounded batches of history openings and dense
+  rows. By default it applies offset-major sweeps in two passes (proposed blocks, then extensions).
+  With `Config::with_ordering`, it opens each authenticated history range separately and calls
+  `Ordering::order(&OrderingContext)` with at most 1,024 exact block references in chain prefixes.
+  It validates a complete permutation and increasing chain-local order before publishing. Context
+  boundaries depend on the history range, not storage or acknowledgement batches; partial replay
+  reconstructs the same context before suppressing duplicates. Custom output waits for a later
+  finalized leader's history commitment instead of emitting a locally growing final sweep. Producer ancestry is serial within each chain and concurrent across chains up to
   `backfill_concurrency`, so a stalled chain does not block another chain. Once block references
   are known, missing bodies share one global pool at the same bound. Fetch completion order cannot
   affect output order because each result retains its canonical output position. Each new block
@@ -652,9 +657,11 @@ Marshal checks a separate invariant set after every durable commit and recovery:
 - **M-INV-03:** Dense outputs are contiguous by `OutputIndex` above the floor index; each index
   names one complete transaction block. Every output advances one chain by one height, so the
   committed index is the sum of the emitted frontier's heights and is the same on every node,
-  whichever floor it started from. History is processed oldest first. Each sweep visits every
+  whichever floor it started from. History is processed oldest first. Default sweeps visit every
   chain's proposed region before any chain's extension region, preserving offset-major order
-  within each pass.
+  within each pass. Custom ordering merges complete chain prefixes from common authenticated
+  history contexts; every node and replay must use the same frozen policy data and return the
+  same permutation. A custom floor's emitted frontier equals its history frontier.
 - **M-INV-04:** Evidence, openings, blocks, and output rows are durable before checkpoint exposure. An
   ordinary checkpoint carries its remaining temporary-cleanup obligation, which startup completes
   before serving reads. Delivery advances only through a contiguous FIFO prefix whose `Exact`

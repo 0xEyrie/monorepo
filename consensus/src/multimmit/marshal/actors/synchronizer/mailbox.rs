@@ -30,6 +30,9 @@ use tracing::Span;
 /// A synchronization operation failed.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
+    /// A final-order policy violated the certified-prefix contract.
+    #[error(transparent)]
+    Policy(#[from] crate::multimmit::marshal::ordering::InvalidOrder),
     /// The synchronizer has stopped accepting commands.
     #[error("synchronizer mailbox is closed")]
     Closed,

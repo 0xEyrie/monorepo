@@ -20,6 +20,20 @@
 //! 6. [`ServiceHandle::abort`] stops marshal; [`ServiceHandle::join`] returns its first
 //!    failure.
 //!
+//! # Custom final order
+//!
+//! [`Config::with_ordering`] installs an [`Ordering`] implementation. Marshal authenticates a
+//! history range, resolves its producer references, and passes bounded chain prefixes to
+//! [`OrderingContext`]. The returned `Vec<BlockRef<_>>` may interleave chains freely, including
+//! their proposed and extension regions, while retaining each chain's increasing height order.
+//! Missing blocks outside that range reserve no output positions.
+//!
+//! Custom ordering waits for a finalized leader to commit the same history range on every node;
+//! it does not emit that leader's locally growing final sweep. Without a policy, the existing
+//! proposal-first traversal and immediate final sweeps remain in use. The same frozen policy
+//! data must be available on every node and replay; see [`Ordering`]'s protocol contract. Local
+//! report arrival or speculative execution progress cannot determine canonical output order.
+//!
 //! # Actors
 //!
 //! ```text
@@ -68,6 +82,7 @@ mod bodies;
 mod config;
 mod mailbox;
 mod open;
+pub mod ordering;
 mod protocol;
 mod relay;
 mod service;
@@ -85,6 +100,7 @@ pub use config::{
 };
 pub use mailbox::Mailbox;
 pub use open::OpenError;
+pub use ordering::{Ordering, OrderingContext};
 #[cfg(any(test, feature = "mocks"))]
 pub(crate) use protocol::fuzz;
 pub use relay::Relay;

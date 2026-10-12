@@ -71,6 +71,7 @@ use tracing_subscriber::{prelude::*, registry};
 mod custody;
 mod floor;
 mod mocks;
+mod ordering;
 mod publish;
 mod run;
 mod walk;
@@ -389,6 +390,7 @@ async fn recover(
                 ..MockVerifier::default()
             },
             codec,
+            ordering: None,
             mailbox_size: NonZeroUsize::MIN,
             header_cache_capacity: NonZeroUsize::new(16 * 1024).unwrap(),
             backfill_concurrency: NonZeroUsize::new(backfill_concurrency).unwrap(),
