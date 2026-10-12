@@ -3,4 +3,4 @@
 	url = https://github.com/foundry-rs/forge-std
 [submodule "baton"]
 	path = baton
-	url = https://github.com/djm07073/baton.git
+	url = https://github.com/0xEyrie/baton.git
