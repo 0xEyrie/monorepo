@@ -5,18 +5,6 @@ use commonware_consensus::multimmit::{
     types::BlockRef,
 };
 use commonware_cryptography::Digest;
-use serde::{Deserialize, Serialize};
-
-/// Delivery policy shared by every node and retained across restarts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OrderingMode {
-    /// Use marshal's default proposed-first, offset-major traversal.
-    #[default]
-    Native,
-    /// Deliver complete lane prefixes in descending chain-ID order.
-    ReverseLanes,
-}
 
 /// Reorders lanes while preserving every block and each lane's increasing height.
 pub struct ReverseLanes;

@@ -3,7 +3,6 @@
 use crate::{
     bench::{self, EmptyBody, ScheduleError},
     deploy::NodeConfig,
-    ordering::OrderingMode,
 };
 use clap::Args;
 use commonware_consensus::multimmit::types::{CodecConfigError, PathLimits};
@@ -198,11 +197,6 @@ pub struct NodeTuning {
     #[arg(long, value_enum, default_value = "endorsed")]
     #[serde(default)]
     pub proposal_policy: ProposalPolicy,
-
-    /// Delivery order; use the same mode on every node and across restarts.
-    #[arg(long, value_enum, default_value = "native")]
-    #[serde(default)]
-    pub ordering: OrderingMode,
 
     /// Parallel verification threads.
     #[arg(long, default_value_t = COMPUTE_THREADS)]
@@ -713,22 +707,6 @@ mod tests {
             Some(NZUsize!(128 * 1024 * 1024))
         );
         assert!(parse(["--marshal-delivery-bytes", "0"]).is_err());
-    }
-
-    #[test]
-    fn ordering_is_shared_by_local_and_deployed_configuration() {
-        let default = parse([]).unwrap();
-        assert_eq!(default.tuning.ordering, OrderingMode::Native);
-        let explicit = parse(["--ordering", "reverse-lanes"]).unwrap();
-        assert_eq!(explicit.tuning.ordering, OrderingMode::ReverseLanes);
-        assert!(parse(["--ordering", "unknown"]).is_err());
-
-        let yaml = serde_yaml::to_string(&explicit.tuning).unwrap();
-        let decoded: NodeTuning = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(decoded.ordering, OrderingMode::ReverseLanes);
-        let without_ordering = yaml.replace("ordering: reverse_lanes\n", "");
-        let decoded: NodeTuning = serde_yaml::from_str(&without_ordering).unwrap();
-        assert_eq!(decoded.ordering, OrderingMode::Native);
     }
 
     #[test]

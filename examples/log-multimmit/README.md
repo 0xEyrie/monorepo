@@ -63,22 +63,23 @@ acknowledges without keeping them.
 
 ### Custom Ordering
 
-`--ordering reverse-lanes` installs the [`ReverseLanes`](src/ordering.rs) implementation from
-this example crate through `Config::with_ordering`. It uses only the public
+[`Marshal configuration`](src/marshal.rs) installs [`ReverseLanes`](src/ordering.rs) from this
+example crate directly with `Config::with_ordering(ReverseLanes)`. It uses only the public
 `Ordering::order(&OrderingContext<D>) -> Vec<BlockRef<D>>` interface. Marshal supplies the
 authenticated prefixes; the policy visits lanes in descending chain-ID order and keeps each
 lane's oldest block first. For inputs `A: [A1]` and `B: [B1, B2]`, it returns `B1, B2, A1`.
 No position is reserved for an absent `A2`.
 
-The default `--ordering native` retains marshal's proposed-first, offset-major traversal and
-immediate final sweeps. Custom ordering waits until a subsequent finalized leader authenticates
-the history range, so application delivery can be later than with the default. Larger ranges
+Without `with_ordering`, marshal uses proposed-first, offset-major traversal and immediate
+final sweeps. This example's custom ordering waits until a subsequent finalized leader
+authenticates the history range, so application delivery can be later than with the default. Larger ranges
 are split into deterministic contexts of at most 1,024 blocks; the policy orders each context
 separately. Consensus voting and finality continue independently.
 
-Use the same mode on every node for the entire epoch and when restarting from its storage.
-Use separate storage directories when comparing modes. Marshal validates complete membership,
-exact digests, increasing height on each lane, and compatibility with the published prefix.
+Keep the same policy on every node for the entire epoch and when restarting from its storage.
+Start with fresh storage if previously running the example with native ordering. Marshal
+validates complete membership, exact digests, increasing height on each lane, and compatibility
+with the published prefix.
 A policy that uses application reports must read the same frozen, retained direction for the
 exact context on every node; this hook does not authenticate or distribute those reports.
 
@@ -98,7 +99,7 @@ for node in 0 1 2 3 4 5; do
   target/release/commonware-log-multimmit \
     --me "$node@$((3000 + node))" --participants 0,1,2,3,4,5 --producers 0,1 \
     --storage-dir "$storage/$node" "${bootstrap[@]}" \
-    --ordering reverse-lanes --production-interval-ms 250 --headless \
+    --production-interval-ms 250 --headless \
     >"$storage/$node.jsonl" 2>&1 &
   pids+=("$!")
 done
@@ -106,7 +107,7 @@ wait
 ```
 
 Stop the script with Ctrl-C. To inspect delivery order in the terminal UI, run each node in
-its own terminal without `--headless`, using the same ordering mode and storage directories.
+its own terminal without `--headless`, using the same storage directories.
 The total-order pane shows actual deliveries, newest first.
 
 ## Network
@@ -194,8 +195,6 @@ order and defaults to every participant.
   (32 by default).
 - `--proposal-policy endorsed|certified`: append the leader's contiguous DA-voted frontier
   (default: `endorsed`), or propose only its highest held DA certificate (`certified`).
-- `--ordering native|reverse-lanes`: retain the default delivery policy, or order authenticated
-  history prefixes in descending lane order (use the same mode on every node).
 - `--extension-bound <blocks>`: how many fresh blocks one vote extension carries per chain (16 by
   default); zero disables extensions.
 - `--compute-threads` and `--critical-threads`: size the bulk verification pool and the separate
