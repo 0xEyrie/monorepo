@@ -88,11 +88,16 @@ pub(super) struct ParentRecord<V: Variant, D: Digest> {
 impl<V: Variant, D: Digest> ParentRecord<V, D> {
     /// Returns the safe-tip opening a child leader block commits to as its history.
     pub(super) fn tip_record(&self) -> Result<TipRecord<D>, ViewError> {
-        TipRecord::new(
-            self.history,
-            self.tips.blocks().to_vec(),
-            self.proposed.clone(),
-        )
+        match &self.proof {
+            ParentProof::Genesis => TipRecord::new(
+                self.history,
+                self.tips.blocks().to_vec(),
+                self.proposed.clone(),
+            ),
+            ParentProof::Vqc(proof) => {
+                TipRecord::from_leader(proof.get().leader(), self.tips.blocks().to_vec())
+            }
+        }
         .map_err(|_| ViewError::Proposal)
     }
 

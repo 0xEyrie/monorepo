@@ -1,6 +1,8 @@
 //! Application-defined merging of authenticated producer-chain prefixes.
 
 use crate::{multimmit::types::BlockRef, types::Epoch};
+use bytes::Bytes;
+use commonware_codec::{Codec, Decode as _, Error as CodecError};
 use commonware_cryptography::Digest;
 use std::sync::Arc;
 
@@ -16,15 +18,16 @@ pub const MAX_ORDERING_BLOCKS: usize = 1024;
 /// All blocks are authenticated ancestors of the history's tips. `base` is the frontier before
 /// this context, including blocks in earlier contexts of the same history, not the node's local
 /// acknowledgement or speculative execution position. This makes contexts identical on replay.
-pub struct OrderingContext<D: Digest> {
+pub struct OrderingContext<D: Digest, T = [u8; 0]> {
     epoch: Epoch,
     history: D,
-    base: Vec<BlockRef<D>>,
-    prefixes: Vec<Vec<BlockRef<D>>>,
+    base: Arc<[BlockRef<D>]>,
+    prefixes: Arc<[Vec<BlockRef<D>>]>,
+    proposal_extension: Option<T>,
 }
 
 impl<D: Digest> OrderingContext<D> {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         epoch: Epoch,
         history: D,
         base: Vec<BlockRef<D>>,
@@ -33,9 +36,29 @@ impl<D: Digest> OrderingContext<D> {
         Self {
             epoch,
             history,
-            base,
-            prefixes,
+            base: base.into(),
+            prefixes: prefixes.into(),
+            proposal_extension: None,
         }
+    }
+}
+
+impl<D: Digest, T> OrderingContext<D, T> {
+    pub(crate) fn with_proposal_extension<U>(&self, extension: Option<U>) -> OrderingContext<D, U> {
+        OrderingContext {
+            epoch: self.epoch,
+            history: self.history,
+            base: Arc::clone(&self.base),
+            prefixes: Arc::clone(&self.prefixes),
+            proposal_extension: extension,
+        }
+    }
+
+    /// Returns the typed application data authenticated by this history link.
+    ///
+    /// `None` denotes a record without proposal extension data, including genesis.
+    pub const fn proposal_extension(&self) -> Option<&T> {
+        self.proposal_extension.as_ref()
     }
 
     /// Returns the producer epoch.
@@ -71,8 +94,9 @@ impl<D: Digest> OrderingContext<D> {
 /// node, including history catch-up and restart. Use the same policy for the entire epoch and
 /// storage namespace. Do not depend on arrival order, local execution progress, acknowledgement
 /// timing, or mutable report collection. A report-based adapter must read the same frozen,
-/// retained direction for the exact context on all nodes. This trait does not authenticate or
-/// distribute application policy data.
+/// retained direction for the exact context on all nodes. Proposal extensions are included in
+/// each history commitment and supplied as `Option<T>`. Configure the same `T: commonware_codec::Codec`
+/// and codec bounds in the engine and Marshal. Callbacks need no serialization code.
 ///
 /// State-sync snapshots must contain a prefix of this same policy's output. Floor verification
 /// authenticates a checkpoint boundary; it does not invoke the policy or authenticate snapshot
@@ -99,14 +123,34 @@ impl<D: Digest> OrderingContext<D> {
 ///         context.prefixes().iter().flatten().copied().collect()
 ///     }
 /// }
-/// // Install on every node with config.with_ordering(LaneMajor).
+/// // Install on every node with config.with_ordering(LaneMajor, ()).
 /// ```
-pub trait Ordering<D: Digest>: Send + Sync + 'static {
+pub trait Ordering<D: Digest, T = [u8; 0]>: Send + Sync + 'static {
     /// Returns a complete chain-order-preserving permutation of the context's blocks.
-    fn order(&self, context: &OrderingContext<D>) -> Vec<BlockRef<D>>;
+    fn order(&self, context: &OrderingContext<D, T>) -> Vec<BlockRef<D>>;
 }
 
-pub(crate) type Policy<D> = Option<Arc<dyn Ordering<D>>>;
+type Callback<D> =
+    dyn Fn(&OrderingContext<D, Bytes>) -> Result<Vec<BlockRef<D>>, CodecError> + Send + Sync;
+
+pub(crate) type Policy<D> = Option<Arc<Callback<D>>>;
+
+pub(crate) fn policy<D, P, T>(ordering: P, codec: T::Cfg) -> Arc<Callback<D>>
+where
+    D: Digest,
+    P: Ordering<D, T>,
+    T: Codec + 'static,
+    T::Cfg: Send + Sync + 'static,
+{
+    Arc::new(move |context| {
+        let extension = context
+            .proposal_extension()
+            .map(|bytes| Option::<T>::decode_cfg(bytes.clone(), &codec))
+            .transpose()?
+            .flatten();
+        Ok(ordering.order(&context.with_proposal_extension(extension)))
+    })
+}
 
 /// A policy returned something other than a complete merge of the certified prefixes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -119,8 +163,8 @@ pub(crate) enum InvalidOrder {
     Block,
 }
 
-pub(crate) fn validate<D: Digest>(
-    context: &OrderingContext<D>,
+pub(crate) fn validate<D: Digest, T>(
+    context: &OrderingContext<D, T>,
     ordered: &[BlockRef<D>],
 ) -> Result<(), InvalidOrder> {
     if ordered.len() != context.prefixes.iter().map(Vec::len).sum::<usize>() {

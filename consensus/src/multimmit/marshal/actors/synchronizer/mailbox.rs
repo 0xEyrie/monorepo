@@ -30,6 +30,9 @@ use tracing::Span;
 /// A synchronization operation failed.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
+    /// Application extension data cannot be read under the configured codec.
+    #[error(transparent)]
+    Extension(#[from] commonware_codec::Error),
     /// A final-order policy violated the certified-prefix contract.
     #[error(transparent)]
     Policy(#[from] crate::multimmit::marshal::ordering::InvalidOrder),

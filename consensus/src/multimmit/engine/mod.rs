@@ -123,8 +123,17 @@ impl<H: Hasher, P: PublicKey, V: Variant, A, R, F, T, C, B> Config<H, P, V, A, R
     ///
     /// Configure the matching byte bound in [`crate::multimmit::config::Parameters`] and use
     /// the same validation rules on every node, including recovery.
-    pub fn with_proposal_extension(mut self, extension: impl ProposalExtension<H::Digest>) -> Self {
-        self.proposal_extension = Some(Arc::new(extension));
+    /// `E` uses its existing codec, with matching type and bounds in Marshal's ordering policy.
+    pub fn with_proposal_extension<E>(
+        mut self,
+        extension: impl ProposalExtension<H::Digest, E>,
+        codec: E::Cfg,
+    ) -> Self
+    where
+        E: commonware_codec::Codec + 'static,
+        E::Cfg: Send + Sync + 'static,
+    {
+        self.proposal_extension = Some(crate::multimmit::extension::policy(extension, codec));
         self
     }
 }

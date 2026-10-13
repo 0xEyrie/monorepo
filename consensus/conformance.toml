@@ -80,7 +80,7 @@ hash = "0a64af25ec3432d415e1dc79a96c6e1eb1859a9babb22a843a805c819401f59d"
 
 ["commonware_consensus::multimmit::marshal::types::tests::conformance::CodecConformance<TestFloor>"]
 n_cases = 128
-hash = "0f4bd31bf779d75b71075779e89856cd563bfafe39ea5976737a1a519d257981"
+hash = "4c407cda1a888401ec24f415a61a36056556c93dd40c39ab10920b374fb01987"
 
 ["commonware_consensus::multimmit::marshal::wire::tests::conformance::CodecConformance<BackfillKey<D>>"]
 n_cases = 128
@@ -240,7 +240,7 @@ hash = "5600f8a1a65da061111d23406af949b46e6af5b41fc8d00ce8e46f80bafec8d6"
 
 ["commonware_consensus::multimmit::types::conformance::CodecConformance<TipRecord<Sha256Digest>>"]
 n_cases = 128
-hash = "6bead31438abe29af9a22ab77c27c25c7aaaa92fd8148ded7f1484e64ba52d16"
+hash = "3158edcd46013c75b2cd8c31c9cf9a4dd9027a49bc69a094dcdeabf33c744c95"
 
 ["commonware_consensus::multimmit::types::conformance::CodecConformance<TransactionBlock<Sha256,MockBody>>"]
 n_cases = 128

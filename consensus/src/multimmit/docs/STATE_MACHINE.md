@@ -407,19 +407,22 @@ conditions without moving signing authority into the chain plane.
 `Config::proposal_extension` defaults to `None` in application assembly: leaders construct empty
 extensions and nodes reject nonempty extensions. `Parameters::with_proposal_extension_bound`
 sets the epoch's byte bound, zero by default. An application installs `ProposalExtension` with
-`Config::with_proposal_extension` to construct and validate bounded opaque data such as a Baton
-direction. It receives the native round, parent V-QC identifier, history commitment and chain
-anchors/body digests through `ProposalContext`.
+`Config::with_proposal_extension` to construct and validate a typed value `T`, such as a Baton
+direction. The engine and Marshal use the same existing `commonware_codec::Codec` type and codec
+bounds. No extension-specific encode/decode trait is required, and callbacks exchange values
+directly. `ProposalContext` supplies the native round, parent V-QC identifier, history commitment
+and chain anchors/body digests.
 
 ```mermaid
 flowchart TD
     P["Native proposal context"] --> A["ProposalExtension::propose(context)"]
     A -->|"None"| T["Existing view timeout remains active"]
-    A -->|"Some(Bytes)"| V["Byte bound + ProposalExtension::verify"]
+    A -->|"Some(T)"| E["Existing codec encodes bounded wire data"]
+    E --> V["ProposalExtension::verify(context, &T)"]
     V -->|"valid"| S["Durably reserve full LeaderBlock, then sign"]
     V -->|"invalid"| X["Reject"]
     S --> R["Proposal / V-QC / L-QC carries extension bytes"]
-    R --> C["Authenticate native evidence, then verify extension"]
+    R --> C["Authenticate native evidence, decode T, then verify extension"]
     C -->|"valid"| N["Native consensus admission"]
     C -->|"invalid"| X
     N --> D["Existing journal, snapshot and resolver custody"]
@@ -436,14 +439,38 @@ uses complete supplied data and immutable epoch rules, never local report arriva
 progress. Persisted signing requests retain the original extension; recovery reissues that exact
 subject and rejects stored extensions unsupported by the configured rules.
 
-This interface authenticates application data; it does not invoke Marshal's `Ordering` policy.
-Baton still implements direction semantics, prefix continuity and the mapping from an authenticated
-proposal to the exact immutable ordering context. Once selected, every node and replay must use
-the same direction for that context. No new application ACK or execution gate is introduced.
+Each parent V-QC contributes its proposal extension to its `TipRecord`. The child leader's
+history commitment includes that data, so a finalized child authenticates both the producer
+prefixes and their extension. History archives, scratch storage and backfill retain the same
+record. Marshal reads the extension from the record it is opening, rather than using the newest
+proposal's data for an older range.
 
-LeaderBlock encoding includes a length-delimited extension, including a zero length when unused.
-This ALPHA wire/storage format change requires a fresh deployment namespace and storage; old
-proposal encodings are not accepted. Extension rules and bounds are epoch protocol settings.
+```mermaid
+flowchart TD
+    P["ProposalExtension<D, T>::propose(context) -> Option<T>"] -->|"Some(T)"| Q["Existing proposal / V-QC custody"]
+    Q --> H["TipRecord: certified tips + proposal extension"]
+    H --> L["Child LeaderBlock.history + L-QC authenticate the record"]
+    L --> B["Existing history archive / backfill / recovery"]
+    B --> C["OrderingContext<D, T>::proposal_extension() -> Option<&T>"]
+    C --> O["Ordering<D, T>::order(context)"]
+    O --> V["Validate complete prefix merge"]
+    V --> U["Publish ordered updates"]
+```
+
+`Config::with_proposal_extension(implementation, codec)` and
+`marshal::Config::with_ordering(implementation, codec)` infer `T` from the respective trait
+implementation. The existing codec handles the wire/storage boundary; implementations need no
+serialization methods. `None` in an ordering context denotes a history record without extension
+data. Each bounded context of the same record receives the same value, including partial replay.
+An invalid typed value stops synchronization before invoking the policy or publishing outputs.
+
+Baton implements direction semantics and prefix continuity in its typed proposal and ordering
+implementations. No new application ACK or execution gate is introduced.
+
+LeaderBlock stores the codec encoding of `Some(T)` in its bounded native extension; empty bytes
+remain the disabled default. TipRecord encoding and commitments include an optional extension.
+These ALPHA wire/storage changes require a fresh deployment namespace and storage. The type,
+codec bounds and extension rules are epoch protocol settings.
 
 Leaders follow the deterministic `LeaderSchedule`. Randomized election is not supported: an
 unpredictable election needs a unique per-view value, and the ordinary exit path produces none. A

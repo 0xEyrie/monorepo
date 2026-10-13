@@ -289,6 +289,7 @@ where
         self.state.validate_reconciliation(&target, &plan.common)?;
         self.drive(
             self.state.history(),
+            None,
             &mut stream,
             &emitted,
             &plan.forward,
@@ -369,8 +370,15 @@ where
             &link.record,
             common.as_deref().unwrap_or(&plan.common),
         )?;
-        self.drive(link.commitment, &mut stream, &emitted, &plan.forward, batch)
-            .await?;
+        self.drive(
+            link.commitment,
+            link.record.proposal_extension(),
+            &mut stream,
+            &emitted,
+            &plan.forward,
+            batch,
+        )
+        .await?;
         self.record_opening(link, batch).await
     }
 
@@ -418,6 +426,7 @@ where
 
         self.drive(
             self.state.history(),
+            None,
             &mut stream,
             &emitted,
             &staged.forward,

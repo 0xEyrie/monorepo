@@ -34,6 +34,17 @@ fn proposal_extension_is_authenticated_by_proposals_and_qcs<V: Variant>() {
     assert_eq!(decoded.leader().extension().as_ref(), b"direction");
     let decoded = Vqc::<V, Digest>::decode_cfg(vqc.encode(), &codec).unwrap();
     assert_eq!(decoded.leader().extension().as_ref(), b"direction");
+    let validated = validate_vqc::<Sha256, V, Digest>(&vqc, codec)
+        .unwrap()
+        .into_parts();
+    let record =
+        crate::multimmit::types::TipRecord::from_leader(&leader, validated.tips.blocks().to_vec())
+            .unwrap();
+    assert_eq!(
+        record.proposal_extension().map(|data| data.as_ref()),
+        Some(b"direction".as_slice())
+    );
+    assert_eq!(validated.child_history, Some(record.commitment::<Sha256>()));
 
     let changed = leader
         .with_extension(bytes::Bytes::from_static(b"other"), codec)

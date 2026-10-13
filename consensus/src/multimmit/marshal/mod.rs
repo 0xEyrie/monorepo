@@ -33,6 +33,9 @@
 //! proposal-first traversal and immediate final sweeps remain in use. The same frozen policy
 //! data must be available on every node and replay; see [`Ordering`]'s protocol contract. Local
 //! report arrival or speculative execution progress cannot determine canonical output order.
+//! `Ordering<D, T>` receives `Option<T>` from the proposal extension committed in each history
+//! link. Both configuration builders use the existing codec for the same `T`; callbacks do not
+//! implement or call serialization. Missing extension data appears as `None`.
 //!
 //! # Actors
 //!

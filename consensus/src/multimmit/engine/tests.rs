@@ -53,19 +53,19 @@ type TestBlocker = NoopBlocker<ed25519::PublicKey>;
 
 struct RoundExtension;
 
-impl crate::multimmit::ProposalExtension<Sha256Digest> for RoundExtension {
+impl crate::multimmit::ProposalExtension<Sha256Digest, crate::types::Round> for RoundExtension {
     fn propose(
         &self,
         context: &crate::multimmit::ProposalContext<'_, Sha256Digest>,
-    ) -> Option<bytes::Bytes> {
-        Some(context.round().encode())
+    ) -> Option<crate::types::Round> {
+        Some(context.round())
     }
     fn verify(
         &self,
         context: &crate::multimmit::ProposalContext<'_, Sha256Digest>,
-        extension: &bytes::Bytes,
+        extension: &crate::types::Round,
     ) -> bool {
-        *extension == context.round().encode()
+        *extension == context.round()
     }
 }
 
@@ -107,7 +107,7 @@ fn proposal_extensions_travel_with_finalized_view_proofs(#[case] enabled: bool) 
             let mut config = config(&context, &committee, index, "proposal_extensions");
             config.automaton.pause_building();
             if enabled {
-                config = config.with_proposal_extension(RoundExtension);
+                config = config.with_proposal_extension(RoundExtension, ());
             }
             let engine = Engine::open(context.child(label), config).await.unwrap();
             servers.push(engine.proofs());
@@ -128,7 +128,7 @@ fn proposal_extensions_travel_with_finalized_view_proofs(#[case] enabled: bool) 
                 unreachable!()
             };
             let expected = if enabled {
-                certificate.leader().round().encode()
+                Some(certificate.leader().round()).encode()
             } else {
                 bytes::Bytes::new()
             };

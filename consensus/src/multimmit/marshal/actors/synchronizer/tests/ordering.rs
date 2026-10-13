@@ -39,6 +39,123 @@ impl FinalOrdering<Sha256Digest> for Policy {
     }
 }
 
+struct Directed;
+
+impl FinalOrdering<Sha256Digest, bool> for Directed {
+    fn order(&self, context: &OrderingContext<Sha256Digest, bool>) -> Vec<BlockRef<Sha256Digest>> {
+        if context.proposal_extension().copied().unwrap_or(false) {
+            context.prefixes().iter().rev().flatten().copied().collect()
+        } else {
+            context.prefixes().iter().flatten().copied().collect()
+        }
+    }
+}
+
+#[rstest]
+#[case::none(None, 0)]
+#[case::lane_major(Some(false), 0)]
+#[case::reverse_lanes(Some(true), 0)]
+#[case::reverse_lanes_after_restart(Some(true), 1)]
+fn typed_extensions_determine_the_same_order_after_restart(
+    #[case] extension: Option<bool>,
+    #[case] published: usize,
+) {
+    use commonware_codec::{Decode as _, Encode as _};
+    deterministic::Runner::default().start(|context| async move {
+        let committee = committee(177, 2, PathLimits::new(2, 1).unwrap());
+        let codec = committee.codec().with_proposal_extension_bound(16);
+        let epoch = committee.config.epoch();
+        let bases = vec![base(0, 0), base(1, 0)];
+        let blocks = vec![chain(epoch, bases[0], 1), chain(epoch, bases[1], 2)];
+        let parent = digest(b"typed history", 0);
+        let record = TipRecord::at_tips(parent, vec![tip(&blocks[0]), tip(&blocks[1])])
+            .unwrap()
+            .with_proposal_extension(extension.map(|value| Some(value).encode()), codec)
+            .unwrap();
+        let record = Arc::new(TipRecord::decode_cfg(record.encode(), &codec).unwrap());
+        let expected = if extension == Some(true) {
+            vec![
+                blocks[1][0].reference(),
+                blocks[1][1].reference(),
+                blocks[0][0].reference(),
+            ]
+        } else {
+            vec![
+                blocks[0][0].reference(),
+                blocks[1][0].reference(),
+                blocks[1][1].reference(),
+            ]
+        };
+        let mut emitted = bases.clone();
+        for reference in &expected[..published] {
+            emitted[reference.chain().index()] = *reference;
+        }
+        let mut actor = actor(
+            &context,
+            checkpoint(epoch, parent, bases, emitted),
+            blocks,
+            codec,
+            1,
+        )
+        .await;
+        actor.ordering = Some(crate::multimmit::marshal::ordering::policy(Directed, ()));
+        commit_opening(
+            &mut actor,
+            HistoryLink {
+                commitment: record.commitment::<Sha256>(),
+                record,
+            },
+        )
+        .await;
+        assert_eq!(actor.catalog.outputs, expected[published..]);
+    });
+}
+
+#[rstest]
+#[case::missing_value(bytes::Bytes::from_static(&[1]))]
+#[case::invalid_bool(bytes::Bytes::from_static(&[1, 2]))]
+#[case::trailing_data(bytes::Bytes::from_static(&[1, 1, 0]))]
+fn invalid_typed_extension_cannot_publish_outputs(#[case] extension: bytes::Bytes) {
+    deterministic::Runner::default().start(|context| async move {
+        let committee = committee(178, 2, PathLimits::new(2, 1).unwrap());
+        let codec = committee.codec().with_proposal_extension_bound(16);
+        let epoch = committee.config.epoch();
+        let bases = vec![base(0, 0), base(1, 0)];
+        let blocks = vec![chain(epoch, bases[0], 1), chain(epoch, bases[1], 1)];
+        let parent = digest(b"invalid typed extension", 0);
+        let record = Arc::new(
+            TipRecord::at_tips(parent, vec![tip(&blocks[0]), tip(&blocks[1])])
+                .unwrap()
+                .with_proposal_extension(Some(extension), codec)
+                .unwrap(),
+        );
+        let mut actor = actor(
+            &context,
+            checkpoint(epoch, parent, bases.clone(), bases),
+            blocks,
+            codec,
+            1,
+        )
+        .await;
+        actor.ordering = Some(crate::multimmit::marshal::ordering::policy(Directed, ()));
+        let mut batch = PublicationBatch::new(1, 0);
+        assert!(matches!(
+            actor
+                .open(
+                    HistoryLink {
+                        commitment: record.commitment::<Sha256>(),
+                        record
+                    },
+                    &mut batch
+                )
+                .await,
+            Err(Error::Extension(_))
+        ));
+        assert!(actor.catalog.outputs.is_empty());
+        assert!(batch.outputs.is_empty());
+    });
+}
+
 #[rstest]
 #[case::fresh(0)]
 #[case::partially_published(1)]
@@ -79,10 +196,13 @@ fn receives_the_same_certified_prefixes_after_partial_publication(#[case] publis
         )
         .await;
         let contexts = Arc::new(Mutex::new(Vec::new()));
-        actor.ordering = Some(Arc::new(Policy {
-            merge: Merge::ReverseLanes,
-            contexts: Arc::clone(&contexts),
-        }));
+        actor.ordering = Some(crate::multimmit::marshal::ordering::policy(
+            Policy {
+                merge: Merge::ReverseLanes,
+                contexts: Arc::clone(&contexts),
+            },
+            (),
+        ));
         commit_opening(&mut actor, HistoryLink { commitment, record }).await;
         assert_eq!(actor.catalog.outputs, expected[published..]);
         assert_eq!(actor.catalog.checkpoint.committed(), OutputIndex::new(3));
@@ -127,10 +247,13 @@ fn invalid_order_cannot_publish_any_new_output(#[case] merge: Merge, #[case] par
             1,
         )
         .await;
-        actor.ordering = Some(Arc::new(Policy {
-            merge,
-            contexts: Arc::default(),
-        }));
+        actor.ordering = Some(crate::multimmit::marshal::ordering::policy(
+            Policy {
+                merge,
+                contexts: Arc::default(),
+            },
+            (),
+        ));
         let mut batch = PublicationBatch::new(1, 0);
         assert!(
             actor
@@ -173,10 +296,13 @@ fn floor_resume_checks_the_snapshot_prefix_when_ordering_outputs(
             bases,
         );
         let mut actor = actor(&context, current, blocks.clone(), committee.codec(), 1).await;
-        actor.ordering = Some(Arc::new(Policy {
-            merge,
-            contexts: Arc::default(),
-        }));
+        actor.ordering = Some(crate::multimmit::marshal::ordering::policy(
+            Policy {
+                merge,
+                contexts: Arc::default(),
+            },
+            (),
+        ));
         actor
             .install_floor(Floor::new(
                 proof,
@@ -249,10 +375,13 @@ fn ordering_contexts_are_bounded_independently_of_storage_batches(
         )
         .await;
         let contexts = Arc::new(Mutex::new(Vec::new()));
-        actor.ordering = Some(Arc::new(Policy {
-            merge: Merge::ReverseLanes,
-            contexts: Arc::clone(&contexts),
-        }));
+        actor.ordering = Some(crate::multimmit::marshal::ordering::policy(
+            Policy {
+                merge: Merge::ReverseLanes,
+                contexts: Arc::clone(&contexts),
+            },
+            (),
+        ));
         commit_opening(&mut actor, HistoryLink { commitment, record }).await;
         let contexts = contexts.lock();
         assert_eq!(

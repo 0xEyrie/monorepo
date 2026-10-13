@@ -335,7 +335,19 @@ where
             .map(|_| u.arbitrary())
             .collect::<ArbitraryResult<_>>()?;
 
-        Ok(Self::new(u.arbitrary()?, tips, proposed).expect("generated tip record is canonical"))
+        let extension = if u.arbitrary()? {
+            let mut bytes = arbitrary_vec::<u8>(u, codec_config().proposal_extension_bound())?;
+            if bytes.is_empty() {
+                bytes.push(0);
+            }
+            Some(Bytes::from(bytes))
+        } else {
+            None
+        };
+        Ok(Self::new(u.arbitrary()?, tips, proposed)
+            .expect("generated tip record is canonical")
+            .with_proposal_extension(extension, codec_config())
+            .expect("generated history extension respects its bound"))
     }
 }
 

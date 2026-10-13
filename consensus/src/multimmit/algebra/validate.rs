@@ -313,13 +313,9 @@ where
     V: Variant,
     D: Digest,
 {
-    TipRecord::new(
-        leader.history(),
-        tips.blocks().to_vec(),
-        leader.proposed_heights(),
-    )
-    .ok()
-    .map(|record| record.commitment::<H>())
+    TipRecord::from_leader(leader, tips.blocks().to_vec())
+        .ok()
+        .map(|record| record.commitment::<H>())
 }
 
 /// Returns a V-QC's canonical encoding and the certificate identifier hashed from it.

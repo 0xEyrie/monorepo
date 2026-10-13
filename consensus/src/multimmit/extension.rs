@@ -5,6 +5,7 @@ use crate::{
     types::Round,
 };
 use bytes::Bytes;
+use commonware_codec::{Codec, Decode as _, Encode as _};
 use commonware_cryptography::{Digest, Hasher, bls12381::primitives::variant::Variant};
 use core::fmt;
 
@@ -83,7 +84,11 @@ impl<'a, D: Digest> ProposalContext<'a, D> {
 /// reports needed to construct an extension. Verification must depend on the supplied data and
 /// immutable protocol rules, never local report arrival or speculative execution progress.
 ///
-/// Extension bytes are included in the leader digest, signatures, votes, certificates and durable
+/// Configure the same `T: commonware_codec::Codec` and codec bounds in the engine and Marshal.
+/// Builders use its existing codec; callbacks exchange typed values and need no serialization code.
+/// The wire value is the codec encoding of `Some(T)`; an empty native extension denotes absence.
+///
+/// Extension data is included in the leader digest, signatures, votes, certificates and durable
 /// proposal records. A V-QC is view-exit evidence; final ordering still requires native L-QC
 /// finality. This interface does not choose an ordering policy or implement Baton reports.
 ///
@@ -92,33 +97,71 @@ impl<'a, D: Digest> ProposalContext<'a, D> {
 /// Authenticate a round label alongside the native proposal:
 ///
 /// ```
-/// use bytes::Bytes;
-/// use commonware_codec::Encode;
 /// use commonware_cryptography::Digest;
 /// use commonware_consensus::multimmit::{ProposalContext, ProposalExtension};
+/// use commonware_consensus::types::Round;
 ///
 /// struct RoundLabel;
-/// impl<D: Digest> ProposalExtension<D> for RoundLabel {
-///     fn propose(&self, context: &ProposalContext<'_, D>) -> Option<Bytes> {
-///         Some(context.round().encode())
+/// impl<D: Digest> ProposalExtension<D, Round> for RoundLabel {
+///     fn propose(&self, context: &ProposalContext<'_, D>) -> Option<Round> {
+///         Some(context.round())
 ///     }
-///     fn verify(&self, context: &ProposalContext<'_, D>, extension: &Bytes) -> bool {
-///         *extension == context.round().encode()
+///     fn verify(&self, context: &ProposalContext<'_, D>, extension: &Round) -> bool {
+///         *extension == context.round()
 ///     }
 /// }
-/// // Configure the epoch's bound, then install with config.with_proposal_extension(RoundLabel).
+/// // Configure the epoch's byte bound, then use config.with_proposal_extension(RoundLabel, ()).
 /// ```
-pub trait ProposalExtension<D: Digest>: Send + Sync + 'static {
+pub trait ProposalExtension<D: Digest, T = Bytes>: Send + Sync + 'static {
     /// Returns the extension for this proposal, or declines to propose at this time.
     ///
-    /// Returning `None` leaves the normal view timeout active. Returned bytes must fit the
+    /// Returning `None` leaves the normal view timeout active. Encoded values must fit the
     /// epoch's proposal-extension bound and pass this implementation's verification rules.
-    fn propose(&self, context: &ProposalContext<'_, D>) -> Option<Bytes>;
+    fn propose(&self, context: &ProposalContext<'_, D>) -> Option<T>;
 
     /// Checks a complete extension against its exact proposal context.
     ///
     /// Returning `false` rejects the proposal or certificate before consensus admission.
-    fn verify(&self, context: &ProposalContext<'_, D>, extension: &Bytes) -> bool;
+    fn verify(&self, context: &ProposalContext<'_, D>, extension: &T) -> bool;
+}
+
+struct Configured<P, T: Codec> {
+    extension: P,
+    codec: T::Cfg,
+}
+
+impl<D, P, T> ProposalExtension<D> for Configured<P, T>
+where
+    D: Digest,
+    P: ProposalExtension<D, T>,
+    T: Codec + 'static,
+    T::Cfg: Send + Sync + 'static,
+{
+    fn propose(&self, context: &ProposalContext<'_, D>) -> Option<Bytes> {
+        self.extension
+            .propose(context)
+            .map(|value| Some(value).encode())
+    }
+
+    fn verify(&self, context: &ProposalContext<'_, D>, extension: &Bytes) -> bool {
+        Option::<T>::decode_cfg(extension.clone(), &self.codec)
+            .ok()
+            .flatten()
+            .is_some_and(|value| self.extension.verify(context, &value))
+    }
+}
+
+pub(crate) fn policy<D, P, T>(
+    extension: P,
+    codec: T::Cfg,
+) -> std::sync::Arc<dyn ProposalExtension<D>>
+where
+    D: Digest,
+    P: ProposalExtension<D, T>,
+    T: Codec + 'static,
+    T::Cfg: Send + Sync + 'static,
+{
+    std::sync::Arc::new(Configured::<P, T> { extension, codec })
 }
 
 impl<D: Digest> fmt::Debug for dyn ProposalExtension<D> {
