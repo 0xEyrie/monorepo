@@ -784,6 +784,7 @@ impl<V: Variant> Cluster<V> {
             genesis: committee.config.genesis().clone(),
             tuning: self.tuning(),
             automaton: application.clone(),
+            proposal_extension: None,
             relay: application,
             reporter,
             strategy: Sequential,

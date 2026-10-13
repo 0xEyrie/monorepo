@@ -70,7 +70,10 @@ fn floor_boundaries_are_independent_of_delivery_policy(
         let current = checkpoint(epoch, parent, bases.clone(), bases);
         let mut actor = actor(&context, current.clone(), blocks, committee.codec(), 4).await;
         if custom {
-            actor.ordering = Some(Arc::new(NoFloorOrdering));
+            actor.ordering = Some(crate::multimmit::marshal::ordering::policy(
+                NoFloorOrdering,
+                (),
+            ));
         }
         let result = actor
             .install_floor(Floor::new(anchor, history, emitted.clone()))

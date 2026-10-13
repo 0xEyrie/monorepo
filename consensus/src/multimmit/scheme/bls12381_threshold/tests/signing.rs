@@ -2,6 +2,96 @@
 
 use super::*;
 
+fn proposal_extension_is_authenticated_by_proposals_and_qcs<V: Variant>() {
+    let committee = Committee::<V>::builder(77, 6)
+        .proposal_extension_bound(32)
+        .build();
+    let codec = committee.codec();
+    let view = View::new(1);
+    let base = committee.leader_block(view);
+    let leader = base
+        .block()
+        .clone()
+        .with_extension(bytes::Bytes::from_static(b"direction"), codec)
+        .unwrap();
+    let scheduled = committee.config.leader(view);
+    let signed = committee.signers[usize::from(scheduled)]
+        .sign_leader_block(leader.clone())
+        .unwrap();
+    let votes = (0..codec.view_quorum())
+        .map(|signer| committee.vote(Participant::from_usize(signer), &signed))
+        .collect::<Vec<_>>();
+    let lqc = committee
+        .verifier
+        .assemble_lqc::<Sha256, _>(leader.clone(), &votes, &Sequential)
+        .unwrap();
+    let messages = votes.into_iter().map(ViewMessage::Vote).collect::<Vec<_>>();
+    let vqc = committee
+        .verifier
+        .assemble_vqc::<Sha256, _>(leader.clone(), &messages, &Sequential)
+        .unwrap();
+    let decoded = Lqc::<V, Digest>::decode_cfg(lqc.encode(), &codec).unwrap();
+    assert_eq!(decoded.leader().extension().as_ref(), b"direction");
+    let decoded = Vqc::<V, Digest>::decode_cfg(vqc.encode(), &codec).unwrap();
+    assert_eq!(decoded.leader().extension().as_ref(), b"direction");
+    let validated = validate_vqc::<Sha256, V, Digest>(&vqc, codec)
+        .unwrap()
+        .into_parts();
+    let record =
+        crate::multimmit::types::TipRecord::from_leader(&leader, validated.tips.blocks().to_vec())
+            .unwrap();
+    assert_eq!(
+        record.proposal_extension().map(|data| data.as_ref()),
+        Some(b"direction".as_slice())
+    );
+    assert_eq!(validated.child_history, Some(record.commitment::<Sha256>()));
+
+    let changed = leader
+        .with_extension(bytes::Bytes::from_static(b"other"), codec)
+        .unwrap();
+    let changed_proposal = SignedLeaderBlock::new(changed.clone(), signed.attestation().clone());
+    let changed_lqc = Lqc::new(
+        changed.clone(),
+        lqc.tally().clone(),
+        lqc.signature().unwrap().clone(),
+        codec,
+    )
+    .unwrap();
+    let changed_vqc = Vqc::new(
+        changed,
+        vqc.tally().clone(),
+        vqc.novoters().clone(),
+        vqc.conflicting_votes().to_vec(),
+        vqc.signature().unwrap().clone(),
+        codec,
+    )
+    .unwrap();
+    let artifacts = [
+        Artifact::LeaderBlock(signed),
+        Artifact::Vqc(vqc),
+        Artifact::Lqc(lqc),
+        Artifact::LeaderBlock(changed_proposal),
+        Artifact::Vqc(changed_vqc),
+        Artifact::Lqc(changed_lqc),
+    ];
+    let refs = artifacts.iter().collect::<Vec<_>>();
+    assert_eq!(
+        committee.verifier.verify_artifacts::<_, Sha256, Digest>(
+            &mut test_rng(),
+            &refs,
+            &[],
+            &Sequential
+        ),
+        vec![true, true, true, false, false, false]
+    );
+}
+
+#[test]
+fn proposal_extension_is_authenticated_for_both_variants() {
+    proposal_extension_is_authenticated_by_proposals_and_qcs::<MinPk>();
+    proposal_extension_is_authenticated_by_proposals_and_qcs::<MinSig>();
+}
+
 fn ordinary_signatures_are_role_and_domain_bound<V: Variant>() {
     let fixture = Fixture::<V>::new();
     let header = fixture.header(2, 1);

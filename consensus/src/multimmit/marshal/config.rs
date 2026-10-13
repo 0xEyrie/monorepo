@@ -10,7 +10,7 @@
 
 use super::{
     actors::synchronizer,
-    ordering::Ordering,
+    ordering::{self, Ordering},
     types::{Families, Floor},
 };
 use crate::{
@@ -30,10 +30,7 @@ use commonware_storage::{
     translator::Translator,
 };
 use commonware_utils::{NZU64, NZUsize};
-use std::{
-    num::{NonZeroU64, NonZeroUsize},
-    sync::Arc,
-};
+use std::num::{NonZeroU64, NonZeroUsize};
 
 const DEFAULT_CATALOG_MAILBOX_SIZE: NonZeroUsize = NZUsize!(1024);
 const DEFAULT_ADMISSION_CUT_CAPACITY: NonZeroUsize = NZUsize!(1024);
@@ -357,9 +354,7 @@ pub struct Config<T: Translator, V: Variant, B: Codec + Digestible> {
     pub body_codec_config: B::Cfg,
     /// Archive buffers, page cache, section sizing, and translator.
     pub archive: ArchiveConfig<T>,
-    /// Optional final-order policy for authenticated history ranges.
-    /// All nodes and restarts must satisfy the [`Ordering`] protocol contract.
-    pub ordering: Option<Arc<dyn Ordering<B::Digest>>>,
+    pub(crate) ordering: ordering::Policy<B::Digest>,
 }
 
 impl<T: Translator, V: Variant, B: Codec + Digestible> Config<T, V, B> {
@@ -391,8 +386,14 @@ impl<T: Translator, V: Variant, B: Codec + Digestible> Config<T, V, B> {
     /// The default retains proposal-first traversal and immediate final sweeps. Custom ordering
     /// waits for a subsequent finalized leader to authenticate a common history range. Use the
     /// same policy and retained policy data on every node, restart, and state-sync import.
-    pub fn with_ordering(mut self, ordering: impl Ordering<B::Digest>) -> Self {
-        self.ordering = Some(Arc::new(ordering));
+    /// `E` is the extension type supplied to [`super::OrderingContext`]. Use the same type and
+    /// codec bounds as [`crate::multimmit::Config::with_proposal_extension`].
+    pub fn with_ordering<E>(mut self, ordering: impl Ordering<B::Digest, E>, codec: E::Cfg) -> Self
+    where
+        E: Codec + 'static,
+        E::Cfg: Send + Sync + 'static,
+    {
+        self.ordering = Some(ordering::policy(ordering, codec));
         self
     }
 

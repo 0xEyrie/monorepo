@@ -62,6 +62,7 @@ pub struct CodecConfig {
     participants: u32,
     chains: u32,
     limits: PathLimits,
+    proposal_extension_bound: u32,
 }
 
 impl CodecConfig {
@@ -86,7 +87,21 @@ impl CodecConfig {
             participants,
             chains,
             limits,
+            proposal_extension_bound: 0,
         })
+    }
+
+    /// Sets the maximum application-extension bytes in a leader proposal.
+    ///
+    /// Every participant must use the same bound for the epoch. Zero disables extensions.
+    pub const fn with_proposal_extension_bound(mut self, bytes: u32) -> Self {
+        self.proposal_extension_bound = bytes;
+        self
+    }
+
+    /// Returns the maximum application-extension bytes in a leader proposal.
+    pub const fn proposal_extension_bound(self) -> usize {
+        self.proposal_extension_bound as usize
     }
 
     /// Returns the number of participants.

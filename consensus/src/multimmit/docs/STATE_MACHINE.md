@@ -402,6 +402,76 @@ conditions without moving signing authority into the chain plane.
    requires transmitting it.
 5. A proposal becomes externally visible only after its signing reservation is durable.
 
+#### Application proposal extensions
+
+`Config::proposal_extension` defaults to `None` in application assembly: leaders construct empty
+extensions and nodes reject nonempty extensions. `Parameters::with_proposal_extension_bound`
+sets the epoch's byte bound, zero by default. An application installs `ProposalExtension` with
+`Config::with_proposal_extension` to construct and validate a typed value `T`, such as a Baton
+direction. The engine and Marshal use the same existing `commonware_codec::Codec` type and codec
+bounds. No extension-specific encode/decode trait is required, and callbacks exchange values
+directly. `ProposalContext` supplies the native round, parent V-QC identifier, history commitment
+and chain anchors/body digests.
+
+```mermaid
+flowchart TD
+    P["Native proposal context"] --> A["ProposalExtension::propose(context)"]
+    A -->|"None"| T["Existing view timeout remains active"]
+    A -->|"Some(T)"| E["Existing codec encodes bounded wire data"]
+    E --> V["ProposalExtension::verify(context, &T)"]
+    V -->|"valid"| S["Durably reserve full LeaderBlock, then sign"]
+    V -->|"invalid"| X["Reject"]
+    S --> R["Proposal / V-QC / L-QC carries extension bytes"]
+    R --> C["Authenticate native evidence, decode T, then verify extension"]
+    C -->|"valid"| N["Native consensus admission"]
+    C -->|"invalid"| X
+    N --> D["Existing journal, snapshot and resolver custody"]
+```
+
+The extension participates in the leader digest, so leader signatures and votes bind its exact
+bytes and context. Both certificate forms retain that LeaderBlock. Receiving a QC therefore
+provides the extension even when the node missed the proposal or earlier reports. A V-QC remains
+view-exit evidence; its presence alone does not finalize an application direction.
+
+Callbacks are bounded and synchronous, without I/O or execution. A leader may decline while its
+prepared data is unavailable, and the ordinary timeout/nullification path continues. Validation
+uses complete supplied data and immutable epoch rules, never local report arrival or speculative
+progress. Persisted signing requests retain the original extension; recovery reissues that exact
+subject and rejects stored extensions unsupported by the configured rules.
+
+Each parent V-QC contributes its proposal extension to its `TipRecord`. The child leader's
+history commitment includes that data, so a finalized child authenticates both the producer
+prefixes and their extension. History archives, scratch storage and backfill retain the same
+record. Marshal reads the extension from the record it is opening, rather than using the newest
+proposal's data for an older range.
+
+```mermaid
+flowchart TD
+    P["ProposalExtension<D, T>::propose(context) -> Option<T>"] -->|"Some(T)"| Q["Existing proposal / V-QC custody"]
+    Q --> H["TipRecord: certified tips + proposal extension"]
+    H --> L["Child LeaderBlock.history + L-QC authenticate the record"]
+    L --> B["Existing history archive / backfill / recovery"]
+    B --> C["OrderingContext<D, T>::proposal_extension() -> Option<&T>"]
+    C --> O["Ordering<D, T>::order(context)"]
+    O --> V["Validate complete prefix merge"]
+    V --> U["Publish ordered updates"]
+```
+
+`Config::with_proposal_extension(implementation, codec)` and
+`marshal::Config::with_ordering(implementation, codec)` infer `T` from the respective trait
+implementation. The existing codec handles the wire/storage boundary; implementations need no
+serialization methods. `None` in an ordering context denotes a history record without extension
+data. Each bounded context of the same record receives the same value, including partial replay.
+An invalid typed value stops synchronization before invoking the policy or publishing outputs.
+
+Baton implements direction semantics and prefix continuity in its typed proposal and ordering
+implementations. No new application ACK or execution gate is introduced.
+
+LeaderBlock stores the codec encoding of `Some(T)` in its bounded native extension; empty bytes
+remain the disabled default. TipRecord encoding and commitments include an optional extension.
+These ALPHA wire/storage changes require a fresh deployment namespace and storage. The type,
+codec bounds and extension rules are epoch protocol settings.
+
 Leaders follow the deterministic `LeaderSchedule`. Randomized election is not supported: an
 unpredictable election needs a unique per-view value, and the ordinary exit path produces none. A
 V-QC is an aggregate of ordinary signatures, which is not unique and can be ground by its assembler;

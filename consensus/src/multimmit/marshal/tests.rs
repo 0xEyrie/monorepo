@@ -595,7 +595,7 @@ impl Harness {
             blocks: self.archive_modes[2],
         });
         if self.custom_ordering {
-            config.with_ordering(ReverseLanePrefixes)
+            config.with_ordering(ReverseLanePrefixes, ())
         } else {
             config
         }

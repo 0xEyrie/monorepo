@@ -11,15 +11,17 @@ use super::fixtures::{
 use crate::{
     Epochable as _, Viewable as _,
     multimmit::{
+        ProposalContext, ProposalExtension,
         algebra::VqcExtraction,
-        config::{LeaderSchedule, Profile, ResourceLimits, Role, Tuning},
+        config::{LeaderSchedule, Profile, Protocol, ResourceLimits, Role, Tuning},
         machine::{
             ProposalParent,
             artifact::Dependency,
             capability::{Capability, ResolverCommand},
             core_state::{CoreState, CoreTurn},
             durability::{
-                Change, DurableEffect, EffectCompletion, PersistDirective, SignEffect, SignRequest,
+                Change, DomainEvent, DurableEffect, EffectCompletion, EffectId, PersistDirective,
+                SignEffect, SignRequest,
             },
             input::Input,
             reducer::machine::Machine,
@@ -40,6 +42,7 @@ use crate::{
     },
     types::{Attributable, Height, Participant, Round, View, ViewDelta},
 };
+use bytes::Bytes;
 use commonware_cryptography::{
     Sha256,
     bls12381::primitives::{ops::aggregate, variant::MinPk},
@@ -48,6 +51,210 @@ use commonware_cryptography::{
 };
 use core::num::NonZeroUsize;
 use std::sync::Arc;
+
+struct TestProposalExtension(Option<Bytes>);
+
+impl ProposalExtension<Digest> for TestProposalExtension {
+    fn propose(&self, _: &ProposalContext<'_, Digest>) -> Option<Bytes> {
+        self.0.clone()
+    }
+    fn verify(&self, _: &ProposalContext<'_, Digest>, extension: &Bytes) -> bool {
+        self.0.as_ref() == Some(extension)
+    }
+}
+
+fn extension_profile(value: Option<Bytes>, role: Role) -> Profile<Digest> {
+    let base = Harness::validator(0).profile();
+    let parameters = base
+        .protocol()
+        .parameters()
+        .as_ref()
+        .clone()
+        .with_proposal_extension_bound(16);
+    let protocol =
+        Protocol::from_parameters(Arc::new(parameters), base.protocol().genesis().clone()).unwrap();
+    Profile::new::<MinPk>(protocol, role, Tuning::default())
+        .unwrap()
+        .with_proposal_extension(Some(Arc::new(TestProposalExtension(value))))
+}
+
+#[rstest::rstest]
+#[case::ready(Some(Bytes::from_static(b"direction")))]
+#[case::pending(None)]
+fn local_proposal_waits_for_its_application_extension(#[case] value: Option<Bytes>) {
+    let profile = extension_profile(value.clone(), Role::Validator(Participant::new(0)));
+    let (mut machine, started) = start_profile(profile);
+    let proposal =
+        started.find(
+            |effect| match durable_effect(effect).and_then(EffectExt::sign_one) {
+                Some(SignRequest::LeaderBlock(request)) => Some(request.block().clone()),
+                _ => None,
+            },
+        );
+    match value {
+        Some(expected) => assert_eq!(
+            proposal
+                .expect("ready extension permits a proposal")
+                .extension(),
+            &expected
+        ),
+        None => {
+            assert!(
+                proposal.is_none(),
+                "pending extension must not authorize a proposal"
+            );
+            let timer = started
+                .find(|effect| match effect {
+                    Capability::Timer(crate::multimmit::machine::TimerCommand::View(timer)) => {
+                        Some(*timer)
+                    }
+                    _ => None,
+                })
+                .expect("pending proposal keeps its view timer");
+            let elapsed = machine.step(Input::TimerFired(timer)).unwrap();
+            let elapsed = machine.settle(elapsed, Until::CursorAdvance);
+            assert!(elapsed.persist_job().events().iter().any(|event| {
+                matches!(event.change(), Change::OutboxQueued { effect, .. }
+                    if matches!(effect.sign_requests(), Some([SignRequest::NoVote { .. }, SignRequest::Nullify { .. }])))
+            }), "pending proposal must still reserve the timeout choice");
+        }
+    }
+}
+
+#[rstest::rstest]
+#[case::proposal(true, 0, true)]
+#[case::vqc(true, 1, true)]
+#[case::lqc(true, 2, true)]
+#[case::invalid_proposal(false, 0, true)]
+#[case::invalid_vqc(false, 1, true)]
+#[case::invalid_lqc(false, 2, true)]
+#[case::disabled_empty(true, 0, false)]
+#[case::disabled_proposal(false, 0, false)]
+#[case::disabled_vqc(false, 1, false)]
+#[case::disabled_lqc(false, 2, false)]
+fn proposal_extensions_are_checked_on_every_authenticated_entry(
+    #[case] valid: bool,
+    #[case] kind: u8,
+    #[case] enabled: bool,
+) {
+    let mut profile = extension_profile(Some(Bytes::from_static(b"direction")), Role::Observer);
+    if !enabled {
+        profile = profile.with_proposal_extension(None);
+    }
+    let (mut machine, _) = start_profile(profile);
+    let value = if !enabled && valid {
+        b"".as_slice()
+    } else if valid {
+        b"direction".as_slice()
+    } else {
+        b"wrong".as_slice()
+    };
+    let proposed = leader(&machine, 1)
+        .with_extension(Bytes::copy_from_slice(value), machine.profile().codec())
+        .unwrap();
+    let votes = vec![view_vote(&machine, &proposed, 0)];
+    let artifact = match kind {
+        0 => Artifact::LeaderBlock(SignedLeaderBlock::new(proposed, attestation(0))),
+        1 => Artifact::Vqc(vqc(
+            &machine,
+            proposed,
+            &[ViewMessage::Vote(votes[0].clone())],
+        )),
+        2 => Artifact::Lqc(lqc(&machine, proposed, &votes)),
+        _ => unreachable!(),
+    };
+    let job = observe(&mut machine, artifact);
+    let completed = machine.verify(&job, true, Until::CursorAdvance);
+    assert_eq!(
+        completed.status(),
+        &crate::multimmit::machine::input::StepStatus::Verified {
+            valid: usize::from(valid),
+            invalid: usize::from(!valid),
+        }
+    );
+}
+
+#[rstest::rstest]
+#[case::same_policy(true)]
+#[case::disabled_policy(false)]
+fn proposal_extension_recovery_keeps_the_reserved_subject(#[case] enabled: bool) {
+    let profile = extension_profile(
+        Some(Bytes::from_static(b"direction")),
+        Role::Validator(Participant::new(0)),
+    );
+    let (mut machine, started) = start_profile(profile.clone());
+    let original = sign_request(&sign_job(&started)).clone();
+    machine.persist(&started.persist_job(), Until::CursorAdvance);
+    let snapshot = machine.live_snapshot_for_test();
+    let profile = if enabled {
+        profile
+    } else {
+        profile.with_proposal_extension(None)
+    };
+    let restored = Machine::<Sha256, MinPk>::restore(profile, snapshot);
+    if !enabled {
+        assert!(
+            restored.is_err(),
+            "recovery must reject an unsupported reserved extension"
+        );
+        return;
+    }
+    let mut restored = restored.unwrap();
+    let recovery = restored.step(Input::RecoveryComplete).unwrap();
+    let recovered = restored.persist(&recovery.persist_job(), Until::CursorAdvance);
+    let request = sign_request(&sign_job(&recovered)).clone();
+    assert_eq!(request, original);
+    let SignRequest::LeaderBlock(request) = request else {
+        panic!("proposal must be reissued")
+    };
+    assert_eq!(request.block().extension().as_ref(), b"direction");
+}
+
+#[rstest::rstest]
+#[case::vqc(true, false, false)]
+#[case::lqc(true, true, false)]
+#[case::unsupported_vqc(false, false, false)]
+#[case::unsupported_lqc(false, true, false)]
+#[case::publication(true, false, true)]
+#[case::unsupported_publication(false, false, true)]
+fn proposal_extension_recovery_checks_retained_certificates(
+    #[case] enabled: bool,
+    #[case] finalized: bool,
+    #[case] publication: bool,
+) {
+    let profile = extension_profile(Some(Bytes::from_static(b"direction")), Role::Observer);
+    let machine = Machine::<Sha256, MinPk>::new(profile.clone());
+    let block = leader(&machine, 1)
+        .with_extension(Bytes::from_static(b"direction"), profile.codec())
+        .unwrap();
+    let vote = view_vote(&machine, &block, 0);
+    let artifact = Arc::new(if finalized {
+        Artifact::Lqc(lqc(&machine, block, &[vote]))
+    } else {
+        Artifact::Vqc(vqc(&machine, block, &[ViewMessage::Vote(vote)]))
+    });
+    let cursor = machine.live_snapshot_for_test().cursor().next().unwrap();
+    let change = if publication {
+        Change::OutboxQueued {
+            id: EffectId::from_cursor(cursor),
+            effect: Box::new(DurableEffect::broadcast(artifact)),
+        }
+    } else {
+        Change::ViewCertificateCreated { artifact }
+    };
+    let event = DomainEvent::new(profile.protocol().epoch(), cursor, change);
+    let disabled = profile.clone().with_proposal_extension(None);
+    let profile = if enabled { profile } else { disabled.clone() };
+    let mut restored =
+        Machine::<Sha256, MinPk>::restore(profile, machine.live_snapshot_for_test()).unwrap();
+    assert_eq!(restored.replay(event).is_ok(), enabled);
+    if enabled {
+        assert!(
+            Machine::<Sha256, MinPk>::restore(disabled, restored.live_snapshot_for_test()).is_err(),
+            "snapshots must reject retained certificates with unsupported extensions"
+        );
+    }
+}
 
 #[test]
 fn vqc_does_not_supersede_a_vote_needed_for_lqc() {

@@ -454,6 +454,7 @@ where
     pub(super) async fn drive<J>(
         &mut self,
         history: H::Digest,
+        extension: Option<&bytes::Bytes>,
         stream: &mut J,
         emitted: &[BlockRef<H::Digest>],
         forward: &[Option<Branch<H::Digest>>],
@@ -487,7 +488,8 @@ where
                     slots[chain].push(next.slot);
                 }
                 let context = OrderingContext::new(self.epoch, history, cursor.clone(), prefixes);
-                let ordered = policy.order(&context);
+                let context = context.with_proposal_extension(extension.cloned());
+                let ordered = policy(&context)?;
                 ordering::validate(&context, &ordered)?;
                 let mut planned = VecDeque::with_capacity(ordered.len());
                 let mut new_output_seen = false;

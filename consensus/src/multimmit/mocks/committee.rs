@@ -61,10 +61,16 @@ pub struct CommitteeBuilder<V: Variant> {
     producers: Option<Vec<Participant>>,
     limits: PathLimits,
     leaders: Option<LeaderSchedule>,
+    proposal_extension_bound: u32,
     _variant: PhantomData<V>,
 }
 
 impl<V: Variant> CommitteeBuilder<V> {
+    /// Bounds application data in each leader proposal.
+    pub const fn proposal_extension_bound(mut self, bytes: u32) -> Self {
+        self.proposal_extension_bound = bytes;
+        self
+    }
     /// Signs under `namespace`.
     pub fn namespace(mut self, namespace: &[u8]) -> Self {
         self.namespace = namespace.to_vec();
@@ -105,6 +111,13 @@ impl<V: Variant> CommitteeBuilder<V> {
             producers,
             self.limits,
         );
+        let parameters = config
+            .parameters()
+            .as_ref()
+            .clone()
+            .with_proposal_extension_bound(self.proposal_extension_bound);
+        let config = Protocol::from_parameters(Arc::new(parameters), config.genesis().clone())
+            .expect("extension bounds preserve the committee shape");
         let mut network_keys = (0..self.participants)
             .map(|index| ed25519::PrivateKey::from_seed(self.seed ^ (u64::from(index) + 1)))
             .collect::<Vec<_>>();
@@ -143,6 +156,7 @@ impl<V: Variant> Committee<V> {
             producers: None,
             limits: PathLimits::new(2, 1).expect("default limits are valid"),
             leaders: None,
+            proposal_extension_bound: 0,
             _variant: PhantomData,
         }
     }

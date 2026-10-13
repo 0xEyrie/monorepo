@@ -17,6 +17,7 @@
 use crate::{
     Automaton, Epochable as _, Relay, Reporter,
     multimmit::{
+        ProposalExtension,
         actors::{
             ingress::{self, IngressLimits},
             resolver, verifier,
@@ -84,6 +85,11 @@ pub struct Config<H: Hasher, P: PublicKey, V: Variant, A, R, F, T, C, B> {
     pub tuning: Tuning,
     /// Application commitment construction and validation.
     pub automaton: A,
+    /// Application data constructed and checked for leader proposals and certificates.
+    ///
+    /// `None` constructs empty extensions and rejects nonempty peer extensions. Every node must
+    /// use the same rules and the scheme's proposal-extension byte bound for the epoch.
+    pub proposal_extension: Option<Arc<dyn ProposalExtension<H::Digest>>>,
     /// Transaction-header dissemination notification by canonical header digest.
     pub relay: R,
     /// Authenticated activity reporting.
@@ -110,6 +116,26 @@ pub struct Config<H: Hasher, P: PublicKey, V: Variant, A, R, F, T, C, B> {
     pub page_cache: CacheRef,
     /// Mailbox capacity for every actor.
     pub mailbox_size: NonZeroUsize,
+}
+
+impl<H: Hasher, P: PublicKey, V: Variant, A, R, F, T, C, B> Config<H, P, V, A, R, F, T, C, B> {
+    /// Installs application proposal-extension rules for this epoch.
+    ///
+    /// Configure the matching byte bound in [`crate::multimmit::config::Parameters`] and use
+    /// the same validation rules on every node, including recovery.
+    /// `E` uses its existing codec, with matching type and bounds in Marshal's ordering policy.
+    pub fn with_proposal_extension<E>(
+        mut self,
+        extension: impl ProposalExtension<H::Digest, E>,
+        codec: E::Cfg,
+    ) -> Self
+    where
+        E: commonware_codec::Codec + 'static,
+        E::Cfg: Send + Sync + 'static,
+    {
+        self.proposal_extension = Some(crate::multimmit::extension::policy(extension, codec));
+        self
+    }
 }
 
 /// The four network channels one engine runs over, as `(sender, receiver)` pairs.
@@ -614,6 +640,7 @@ where
         Protocol::from_parameters(config.scheme.parameters().clone(), config.genesis.clone())?;
     let role = config.scheme.me().map_or(Role::Observer, Role::Validator);
     Profile::new::<V>(protocol, role, config.tuning)
+        .map(|profile| profile.with_proposal_extension(config.proposal_extension.clone()))
 }
 
 #[cfg(test)]

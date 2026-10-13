@@ -8,6 +8,7 @@ use super::{
 use crate::{
     Epochable,
     multimmit::{
+        ProposalContext,
         config::Profile,
         machine::{
             chain::ChainState,
@@ -15,10 +16,11 @@ use crate::{
             util::Drive,
             vote_body::{VoteBodyPass, VoteBodyProgress, VoteBuild, VoteBuilds},
         },
-        types::{Anchor, ChainProposal, CodecConfig, LeaderBlock, SignedLeaderBlock, VoteBody},
+        types::{Anchor, ChainProposal, LeaderBlock, SignedLeaderBlock, VoteBody},
     },
     types::{Round, View},
 };
+use bytes::Bytes;
 use commonware_cryptography::{Digest, Hasher, bls12381::primitives::variant::Variant};
 use std::{mem::take, sync::Arc};
 
@@ -104,7 +106,7 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
                 self.vote_builds.push(pass.started());
             }
         }
-        let (epoch, config) = (self.epoch, self.config);
+        let epoch = self.epoch;
         let drive = match self.regular_sign_pass.as_mut() {
             None => return Ok(Drive::idle()),
             Some(RegularSignPass::Vote { pass, ready, .. }) => {
@@ -115,10 +117,10 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
                 parent,
                 attach_parent,
                 proposals,
-            }) => Self::step_proposal(
+            }) => Self::step_proposal::<H>(
+                profile,
                 chain,
                 Round::new(epoch, *view),
-                config,
                 parent,
                 *attach_parent,
                 proposals,
@@ -187,10 +189,10 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
     }
 
     /// Advances a proposal pass one chain per unit of `budget`, then seals the leader block.
-    fn step_proposal(
+    fn step_proposal<H: Hasher<Digest = D>>(
+        profile: &Profile<D>,
         chain: &ChainState<V, D>,
         round: Round,
-        config: CodecConfig,
         parent: &ParentRecord<V, D>,
         attach_parent: bool,
         proposals: &mut Vec<ChainProposal<V, D>>,
@@ -202,14 +204,14 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
                     proposals.push(chain.propose_chain(tip).map_err(|_| ViewError::Chain)?);
                 }
                 None => {
-                    let request = Self::finish_proposal_request(
+                    let request = Self::finish_proposal_request::<H>(
+                        profile,
                         round,
-                        config,
                         parent,
                         attach_parent,
                         proposals,
                     )?;
-                    return Ok(Drive::done(processed, Some(request)));
+                    return Ok(Drive::done(processed, request));
                 }
             }
         }
@@ -326,13 +328,14 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
         }))
     }
 
-    fn finish_proposal_request(
+    fn finish_proposal_request<H: Hasher<Digest = D>>(
+        profile: &Profile<D>,
         round: Round,
-        config: CodecConfig,
         parent: &ParentRecord<V, D>,
         attach_parent: bool,
         proposals: &[ChainProposal<V, D>],
-    ) -> Result<SignRequest<V, D>, ViewError> {
+    ) -> Result<Option<SignRequest<V, D>>, ViewError> {
+        let config = profile.codec();
         let parent_proof = match &parent.proof {
             ParentProof::Genesis => ProposalParent::Genesis,
             ParentProof::Vqc(certificate) => {
@@ -347,11 +350,27 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
             config,
         )
         .map_err(|_| ViewError::Proposal)?;
-        Ok(SignRequest::LeaderBlock(ProposalRequest::new(
+        let extension = match &profile.proposal_extension {
+            Some(hook) => {
+                let context = ProposalContext::new::<H, V>(&block);
+                let Some(extension) = hook.propose(&context) else {
+                    return Ok(None);
+                };
+                if !hook.verify(&context, &extension) {
+                    return Err(ViewError::Proposal);
+                }
+                extension
+            }
+            None => Bytes::new(),
+        };
+        let block = block
+            .with_extension(extension, config)
+            .map_err(|_| ViewError::Proposal)?;
+        Ok(Some(SignRequest::LeaderBlock(ProposalRequest::new(
             block,
             parent_proof,
             attach_parent,
-        )))
+        ))))
     }
 
     /// Returns the no-vote and nullify requests owed once `view` timed out without a valid

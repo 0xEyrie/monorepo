@@ -5,6 +5,7 @@ use crate::{
     Epochable, Viewable,
     multimmit::{
         config::{Profile, Protocol, Role},
+        extension,
         machine::job::Issued,
         scheme::bls12381_threshold::{Error as SchemeError, Scheme},
         types::{
@@ -505,7 +506,12 @@ impl<V: Variant, D: Digest> Publication<V, D> {
                         ),
                         _ => true,
                     };
-                    authorized && artifact_in_bounds(artifact, profile)
+                    authorized
+                        && artifact_in_bounds(artifact, profile)
+                        && extension::verify_artifact::<H, V>(
+                            profile.proposal_extension.as_deref(),
+                            artifact,
+                        )
                 }
                 (Role::Validator(signer), [novote, nullify]) => {
                     let timeout = match (novote.as_ref(), nullify.as_ref()) {
@@ -657,6 +663,9 @@ where
     D: Digest,
 {
     let protocol = profile.protocol();
+    if !extension::verify::<H, V>(profile.proposal_extension.as_deref(), block) {
+        return false;
+    }
     match parent {
         ProposalParent::Genesis => block.parent() == protocol.genesis().vqc(),
         ProposalParent::Exact(parent) => {
@@ -664,6 +673,7 @@ where
                 && parent.epoch() == protocol.epoch()
                 && parent.view() < block.view()
                 && parent.encode_size() <= profile.resources().max_artifact_bytes()
+                && extension::verify::<H, V>(profile.proposal_extension.as_deref(), parent.leader())
                 && block.parent() == parent.id::<H>()
         }
     }

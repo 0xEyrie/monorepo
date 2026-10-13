@@ -180,9 +180,9 @@ pub(crate) enum StepStatus<D: Digest> {
     },
     /// A matching verification completion was applied.
     Verified {
-        /// Number of cryptographically valid items.
+        /// Number of authenticated items passing application extension checks.
         valid: usize,
-        /// Number of cryptographically invalid items.
+        /// Number of items failing authentication or application extension checks.
         invalid: usize,
     },
     /// A matched view-proof resolution was classified for verification.
