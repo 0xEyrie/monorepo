@@ -5,6 +5,7 @@ use crate::{
     committee::Committee,
     config::NodeTuning,
     node::PARTITION_PREFIX,
+    ordering::{OrderingMode, ReverseLanes},
 };
 use commonware_broadcast::buffered;
 use commonware_consensus::{
@@ -80,6 +81,10 @@ fn config(
     .with_max_materialized_block_bytes(tuning.marshal_materialized_cache_bytes)
     .with_max_pending_acks(DELIVERY_ACK_WINDOW)
     .with_retention(Retention::uniform(ArchiveMode::Prunable));
+    let config = match tuning.ordering {
+        OrderingMode::Native => config,
+        OrderingMode::ReverseLanes => config.with_ordering(ReverseLanes),
+    };
     match tuning.marshal_delivery_bytes {
         Some(bytes) => config.with_max_delivery_bytes(bytes),
         None => config,
@@ -205,7 +210,38 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Cli, config::RunConfig};
+    use clap::Parser;
     use commonware_consensus::multimmit::marshal::Limits;
+    use commonware_runtime::{Runner as _, deterministic};
+
+    #[test]
+    fn command_line_installs_custom_ordering_on_marshal() {
+        deterministic::Runner::default().start(|context| async move {
+            for (mode, custom) in [("native", false), ("reverse-lanes", true)] {
+                let cli = Cli::try_parse_from([
+                    "log-multimmit",
+                    "--me",
+                    "0@3000",
+                    "--participants",
+                    "0,1,2,3,4,5",
+                    "--producers",
+                    "0,1",
+                    "--storage-dir",
+                    "unused",
+                    "--ordering",
+                    mode,
+                ])
+                .unwrap();
+                let run = RunConfig::load(cli.run);
+                let committee = crate::committee::derive(&run);
+                assert_eq!(
+                    config(&context, &committee, &run.tuning).ordering.is_some(),
+                    custom
+                );
+            }
+        });
+    }
 
     #[test]
     fn resolver_responses_page_large_blocks() {

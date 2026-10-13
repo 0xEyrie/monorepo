@@ -6,6 +6,7 @@ use commonware_actor::Feedback;
 use commonware_consensus::{Reporter, multimmit::marshal::Update};
 use commonware_runtime::Clock;
 use commonware_utils::Acknowledgement as _;
+use tracing::debug;
 
 /// Tells the application about each ordered block, then hands the block to the terminal UI or
 /// acknowledges it directly.
@@ -34,8 +35,15 @@ impl<C: Clock> Reporter for OutputReporter<C> {
     type Activity = Update<Block>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        let Update { block, .. } = &activity;
-        self.application.ordered(block.reference());
+        let reference = activity.block.reference();
+        debug!(
+            index = activity.index.get(),
+            chain = reference.chain().get(),
+            height = reference.height().get(),
+            digest = %reference.digest(),
+            "ordered block"
+        );
+        self.application.ordered(reference);
         match &mut self.sink {
             Some(sink) => sink.report(activity),
             None => {
