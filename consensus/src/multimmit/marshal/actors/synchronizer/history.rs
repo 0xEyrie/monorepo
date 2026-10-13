@@ -287,8 +287,14 @@ where
         let emitted = self.state.emitted().to_vec();
         let plan = self.stage(stream.maxima(), &target, &emitted).await?;
         self.state.validate_reconciliation(&target, &plan.common)?;
-        self.drive(&mut stream, &emitted, &plan.forward, batch)
-            .await
+        self.drive(
+            self.state.history(),
+            &mut stream,
+            &emitted,
+            &plan.forward,
+            batch,
+        )
+        .await
     }
 
     /// Collects the largest oldest-first run of staged openings whose outputs fit in one custody
@@ -348,33 +354,23 @@ where
         let emitted = self.state.emitted().to_vec();
         let base = self.state.ordered().to_vec();
         let mut stream = SlotStream::new(&base, link.record.tips(), link.record.proposed())?;
-        if self.ordering.is_some() {
-            // Reconstruct complete contexts even after a partial publication; replay suppresses
-            // duplicates only after the policy returns the same order.
+        let (start, common) = if self.ordering.is_some() {
+            // The common-frontier walk clears scratch storage, so complete it before staging.
             let common = self.common_frontiers(link.record.tips(), &emitted).await?;
-            let plan = self
-                .stage(stream.maxima(), link.record.tips(), &base)
-                .await?;
-            self.state
-                .validate_opening::<H>(link.commitment, &link.record, &common)?;
-            self.drive_ordered(
-                link.commitment,
-                &mut stream,
-                &base,
-                &emitted,
-                &plan.forward,
-                batch,
-            )
-            .await?;
+            (&base, Some(common))
         } else {
-            let plan = self
-                .stage(stream.maxima(), link.record.tips(), &emitted)
-                .await?;
-            self.state
-                .validate_opening::<H>(link.commitment, &link.record, &plan.common)?;
-            self.drive(&mut stream, &emitted, &plan.forward, batch)
-                .await?;
-        }
+            (&emitted, None)
+        };
+        let plan = self
+            .stage(stream.maxima(), link.record.tips(), start)
+            .await?;
+        self.state.validate_opening::<H>(
+            link.commitment,
+            &link.record,
+            common.as_deref().unwrap_or(&plan.common),
+        )?;
+        self.drive(link.commitment, &mut stream, &emitted, &plan.forward, batch)
+            .await?;
         self.record_opening(link, batch).await
     }
 
@@ -420,8 +416,14 @@ where
             preview.finish_opening::<H>(link.commitment, &link.record)?;
         }
 
-        self.drive(&mut stream, &emitted, &staged.forward, batch)
-            .await?;
+        self.drive(
+            self.state.history(),
+            &mut stream,
+            &emitted,
+            &staged.forward,
+            batch,
+        )
+        .await?;
         for link in links {
             self.record_opening(link, batch).await?;
         }

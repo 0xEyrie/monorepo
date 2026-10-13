@@ -40,9 +40,10 @@ impl FinalOrdering<Sha256Digest> for Policy {
 }
 
 #[rstest]
-#[case::fresh(false)]
-#[case::partially_published(true)]
-fn receives_the_same_certified_prefixes_after_partial_publication(#[case] partial: bool) {
+#[case::fresh(0)]
+#[case::partially_published(1)]
+#[case::fully_published(3)]
+fn receives_the_same_certified_prefixes_after_partial_publication(#[case] published: usize) {
     deterministic::Runner::default().start(|context| async move {
         let committee = committee(170, 2, PathLimits::new(2, 1).unwrap());
         let epoch = committee.config.epoch();
@@ -60,11 +61,15 @@ fn receives_the_same_certified_prefixes_after_partial_publication(#[case] partia
             .unwrap(),
         );
         let commitment = record.commitment::<Sha256>();
-        let emitted = if partial {
-            vec![bases[0], blocks[1][0].reference()]
-        } else {
-            bases.clone()
-        };
+        let expected = [
+            blocks[1][0].reference(),
+            blocks[1][1].reference(),
+            blocks[0][0].reference(),
+        ];
+        let mut emitted = bases.clone();
+        for reference in &expected[..published] {
+            emitted[reference.chain().index()] = *reference;
+        }
         let mut actor = actor(
             &context,
             checkpoint(epoch, parent, bases.clone(), emitted),
@@ -79,12 +84,7 @@ fn receives_the_same_certified_prefixes_after_partial_publication(#[case] partia
             contexts: Arc::clone(&contexts),
         }));
         commit_opening(&mut actor, HistoryLink { commitment, record }).await;
-        let expected = [
-            blocks[1][0].reference(),
-            blocks[1][1].reference(),
-            blocks[0][0].reference(),
-        ];
-        assert_eq!(actor.catalog.outputs, expected[usize::from(partial)..]);
+        assert_eq!(actor.catalog.outputs, expected[published..]);
         assert_eq!(actor.catalog.checkpoint.committed(), OutputIndex::new(3));
         assert_eq!(
             *contexts.lock(),
