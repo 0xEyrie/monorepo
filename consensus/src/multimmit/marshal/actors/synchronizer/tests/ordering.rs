@@ -145,6 +145,79 @@ fn invalid_order_cannot_publish_any_new_output(#[case] merge: Merge, #[case] par
 }
 
 #[rstest]
+#[case::matching_snapshot(Merge::LaneMajor, true)]
+#[case::incompatible_snapshot(Merge::ReverseLanes, false)]
+fn floor_resume_checks_the_snapshot_prefix_when_ordering_outputs(
+    #[case] merge: Merge,
+    #[case] compatible: bool,
+) {
+    deterministic::Runner::default().start(|context| async move {
+        let committee = committee(176, 2, PathLimits::new(2, 1).unwrap());
+        let genesis = committee.config.genesis();
+        let epoch = genesis.epoch();
+        let bases = genesis.tips().to_vec();
+        let blocks = vec![chain(epoch, bases[0], 1), chain(epoch, bases[1], 2)];
+        let floor_history = genesis_record(&committee);
+        let emitted = vec![blocks[0][0].reference(), blocks[1][0].reference()];
+        let proof = super::floor::anchored_lqc(
+            &committee,
+            1,
+            floor_history.commitment::<Sha256>(),
+            emitted.clone(),
+            vec![Vec::new(), Vec::new()],
+        );
+        let current = checkpoint(
+            epoch,
+            genesis_history::<Sha256>(genesis),
+            bases.clone(),
+            bases,
+        );
+        let mut actor = actor(&context, current, blocks.clone(), committee.codec(), 1).await;
+        actor.ordering = Some(Arc::new(Policy {
+            merge,
+            contexts: Arc::default(),
+        }));
+        actor
+            .install_floor(Floor::new(
+                proof,
+                Arc::clone(&floor_history),
+                emitted.clone(),
+            ))
+            .await
+            .unwrap();
+        let record = Arc::new(
+            TipRecord::new(
+                floor_history.commitment::<Sha256>(),
+                vec![tip(&blocks[0]), tip(&blocks[1])],
+                vec![Height::new(1), Height::new(1)],
+            )
+            .unwrap(),
+        );
+        let commitment = record.commitment::<Sha256>();
+        let mut batch = PublicationBatch::new(1, 0);
+        let result = actor
+            .open(HistoryLink { commitment, record }, &mut batch)
+            .await;
+        if compatible {
+            result.unwrap();
+            actor.commit_pending(&mut batch).await.unwrap();
+            actor.finish_commits().await.unwrap();
+            assert_eq!(actor.catalog.outputs, vec![blocks[1][1].reference()]);
+            assert_eq!(actor.catalog.checkpoint.committed(), OutputIndex::new(3));
+        } else {
+            assert!(matches!(
+                result,
+                Err(Error::Invalid("ordering policy changed a published prefix"))
+            ));
+            assert!(actor.catalog.outputs.is_empty());
+            assert!(batch.outputs.is_empty());
+            assert_eq!(actor.state.emitted(), emitted);
+            assert_eq!(actor.catalog.checkpoint.committed(), OutputIndex::new(2));
+        }
+    });
+}
+
+#[rstest]
 #[case::small_batches(17, false)]
 #[case::larger_batches(31, false)]
 #[case::partial_second_context_small_batches(17, true)]

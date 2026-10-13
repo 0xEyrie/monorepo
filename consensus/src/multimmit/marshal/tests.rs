@@ -602,6 +602,14 @@ impl Harness {
     }
 
     async fn start(&mut self, index: usize) {
+        self.start_from(
+            index,
+            Start::Genesis(self.committee.config.genesis().clone()),
+        )
+        .await;
+    }
+
+    async fn start_from(&mut self, index: usize, start: Start<MinPk, Sha256Digest>) {
         assert!(self.nodes[index].is_none(), "node is already running");
         let floor_generation = self.launches[index];
         self.launches[index] += 1;
@@ -611,7 +619,8 @@ impl Harness {
                 .copied()
                 .expect("test restart bound is sufficient"),
         );
-        let config = self.config(&node_context, index);
+        let mut config = self.config(&node_context, index);
+        config.start = start;
         let verifier = CommitteeVerifier {
             scheme: self.committee.verifier.clone(),
             gate: self.verification_gate.take(),
@@ -1035,10 +1044,21 @@ fn local_two_chain_delivery_is_offset_major_and_header_exact() {
     });
 }
 
+#[derive(Clone, Copy)]
+enum FloorSource {
+    History,
+    Sweep,
+    Startup,
+}
+
 #[rstest]
-#[case::history_catchup(false)]
-#[case::floor_import(true)]
-fn custom_ordering_replays_one_authenticated_history_range(#[case] import_floor: bool) {
+#[case::history_catchup(None)]
+#[case::history_floor(Some(FloorSource::History))]
+#[case::sweep_floor(Some(FloorSource::Sweep))]
+#[case::startup_sweep_floor(Some(FloorSource::Startup))]
+fn custom_ordering_replays_one_authenticated_history_range(
+    #[case] import_floor: Option<FloorSource>,
+) {
     runner(140).start(|context| async move {
         let mut harness = Harness::new(context, 140, [false, true]).await;
         harness.custom_ordering = true;
@@ -1089,22 +1109,46 @@ fn custom_ordering_replays_one_authenticated_history_range(#[case] import_floor:
             assert_eq!(actual.index, expected.index);
             assert_eq!(actual.block.as_ref(), expected.block.as_ref());
         }
-        harness.start(1).await;
-        if import_floor {
-            let (index, floor) = harness
-                .mailbox(0)
-                .floor_at(OutputIndex::new(3))
-                .await
-                .unwrap()
-                .unwrap();
+        if let Some(source) = import_floor {
+            let (index, floor) = if matches!(source, FloorSource::Sweep | FloorSource::Startup) {
+                (
+                    OutputIndex::new(3),
+                    Floor::new(
+                        Arc::clone(&first.proof),
+                        Arc::clone(&first.history),
+                        first.tips(),
+                    ),
+                )
+            } else {
+                harness
+                    .mailbox(0)
+                    .floor_at(OutputIndex::new(3))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
             assert_eq!(index, OutputIndex::new(3));
             assert_eq!(floor.emitted(), first.tips());
-            harness.mailbox(1).install_floor(floor).await.unwrap();
+            if matches!(source, FloorSource::Startup) {
+                harness
+                    .start_from(
+                        1,
+                        Start::Floor {
+                            floor_generation: 1,
+                            floor: Box::new(floor),
+                        },
+                    )
+                    .await;
+            } else {
+                harness.start(1).await;
+                harness.mailbox(1).install_floor(floor).await.unwrap();
+            }
             harness
                 .wait_progress(1, |p| p.committed == OutputIndex::new(3))
                 .await;
             assert!(harness.reporter(1).delivered().is_empty());
         } else {
+            harness.start(1).await;
             second.finalize(&harness.mailbox(1));
             let recovered = harness.wait_updates(1, 3).await;
             for (actual, expected) in recovered.iter().zip(&delivered) {
@@ -1127,9 +1171,9 @@ fn custom_ordering_replays_one_authenticated_history_range(#[case] import_floor:
         third.finalize(&harness.mailbox(1));
         let continued = harness.wait_updates(0, 7).await;
         let target = harness
-            .wait_updates(1, if import_floor { 2 } else { 5 })
+            .wait_updates(1, if import_floor.is_some() { 2 } else { 5 })
             .await;
-        let target_start = if import_floor { 0 } else { 3 };
+        let target_start = if import_floor.is_some() { 0 } else { 3 };
         for (position, (chain, offset)) in [(1, 0), (0, 0)].into_iter().enumerate() {
             let source = &continued[5 + position];
             let peer = &target[target_start + position];

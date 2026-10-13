@@ -227,11 +227,13 @@ Immutable final archives retain old values and treat pruning as a no-op.
 `Start::Genesis` opens or resumes the namespace at protocol genesis. `Start::Floor` seeds only an
 empty namespace and trusts the caller to authenticate the application snapshot, signature, and
 generation that justify the supplied floor. Runtime state sync uses `install_floor`, which verifies
-the L-QC, its opening, non-regressing ordering frontiers, and internal sweep consistency before
+the L-QC, its opening, non-regressing frontiers, and the checkpoint boundary before
 durably installing a new generation. Delivery resumes strictly after the application-owned emitted
 frontier, at the index that frontier's heights sum to. `floor_at` serves the newest retained floor at
-or below an output index: each floor-establishing L-QC is recorded with the frontier its final
-sweep ends at, so another node can install that floor and resume at the same indices.
+or below an output index. A floor ends either the complete authenticated history or its anchor's
+final sweep, independently of the delivery policy. Each floor-establishing L-QC is recorded with
+the published emitted frontier. The application binds snapshot state to the prefix under the same
+policy; ordering replay rejects incompatible prefixes before publishing the context's new outputs.
 
 ### Startup and recovery
 
@@ -661,7 +663,10 @@ Marshal checks a separate invariant set after every durable commit and recovery:
   chain's proposed region before any chain's extension region, preserving offset-major order
   within each pass. Custom ordering merges complete chain prefixes from common authenticated
   history contexts; every node and replay must use the same frozen policy data and return the
-  same permutation. A custom floor's emitted frontier equals its history frontier.
+  same permutation. Floor verification authenticates complete history or final-sweep checkpoint
+  boundaries independently of the delivery policy. Imported snapshot state must match that policy's
+  output prefix, and ordering replay rejects incompatible prefixes before publishing new outputs
+  from the context.
 - **M-INV-04:** Evidence, openings, blocks, and output rows are durable before checkpoint exposure. An
   ordinary checkpoint carries its remaining temporary-cleanup obligation, which startup completes
   before serving reads. Delivery advances only through a contiguous FIFO prefix whose `Exact`

@@ -629,9 +629,6 @@ impl<T: Translator, V: Variant, B: Codec + Digestible> Config<T, V, B> {
                 (floor.history.tips(), floor.emitted.as_slice())
             }
         };
-        if self.ordering.is_some() && ordered != emitted {
-            return Err(ConfigError::StartFrontier);
-        }
         let ordered = Frontier::new(ordered.to_vec()).map_err(|_| ConfigError::StartFrontier)?;
         let emitted = Frontier::new(emitted.to_vec()).map_err(|_| ConfigError::StartFrontier)?;
         if ordered.chains() != self.chains() || emitted.dominates(&ordered).is_err() {

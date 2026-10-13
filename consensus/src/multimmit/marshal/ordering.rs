@@ -74,6 +74,11 @@ impl<D: Digest> OrderingContext<D> {
 /// retained direction for the exact context on all nodes. This trait does not authenticate or
 /// distribute application policy data.
 ///
+/// State-sync snapshots must contain a prefix of this same policy's output. Floor verification
+/// authenticates a checkpoint boundary; it does not invoke the policy or authenticate snapshot
+/// state. On replay, Marshal rejects a policy result that places an already applied block after
+/// a new output in the same context.
+///
 /// Custom policies run on history ranges committed by a finalized leader, not on that leader's
 /// locally growing vote pool. Outputs from the latter wait until a subsequent finalized leader
 /// authenticates their history. This preserves a common input across different L-QCs.
