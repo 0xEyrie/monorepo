@@ -60,6 +60,7 @@ fn mutable_journal_sync_failure_stops_production_engine() {
                 genesis: committee.config.genesis().clone(),
                 tuning: tuning(),
                 automaton: application.clone(),
+                proposal_extension: None,
                 relay: application.clone(),
                 reporter: TestReporter::default(),
                 strategy: Sequential,

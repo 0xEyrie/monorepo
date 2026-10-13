@@ -9,6 +9,7 @@ use crate::{
     multimmit::{
         algebra::DerivedVqc,
         config::Role,
+        extension,
         machine::{
             durability::{
                 Change, DomainEvent, DurableEffect, EffectId, ProposalParent, Publication,
@@ -709,12 +710,19 @@ impl<H: Hasher, V: Variant> Machine<H, V> {
         self.compact_view_history(self.durable.state.retired_view)
     }
 
-    /// Checks a durable artifact's epoch and encoded size.
+    /// Checks a durable artifact's epoch, encoded size and application extension.
     fn check_artifact_bounds(&self, artifact: &Artifact<V, H::Digest>) -> Result<(), ReplayError> {
         ensure!(artifact.epoch() == self.profile.protocol().epoch(), Epoch);
         ensure!(
             artifact.encoded_len() <= self.profile.resources().max_artifact_bytes(),
             ArtifactSize
+        );
+        ensure!(
+            extension::verify_artifact::<H, V>(
+                self.profile.proposal_extension.as_deref(),
+                artifact
+            ),
+            Unauthorized
         );
         Ok(())
     }

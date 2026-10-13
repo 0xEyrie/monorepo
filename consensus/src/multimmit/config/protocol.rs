@@ -139,6 +139,15 @@ pub struct Parameters {
 }
 
 impl Parameters {
+    /// Sets the epoch's maximum leader proposal-extension bytes.
+    ///
+    /// Changing this bound or the application's extension rules requires a new namespace.
+    /// Zero disables extensions.
+    pub const fn with_proposal_extension_bound(mut self, bytes: u32) -> Self {
+        self.codec_config = self.codec_config.with_proposal_extension_bound(bytes);
+        self
+    }
+
     /// Validates and creates the parameters of an epoch with a round-robin leader schedule.
     ///
     /// `namespace` identifies the deployment. It must be globally unique and change whenever any

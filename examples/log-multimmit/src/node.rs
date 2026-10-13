@@ -313,6 +313,7 @@ pub async fn run(context: tokio::Context, config: RunConfig) {
                 ..committee::tuning()
             },
             automaton: application_mailbox.clone(),
+            proposal_extension: None,
             relay,
             // Marshal receives every activity; the application keeps only what it tracks.
             reporter: Reporters::from((marshal, application_mailbox)),

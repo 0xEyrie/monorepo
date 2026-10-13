@@ -10,6 +10,7 @@ use crate::{
     types::{Epoch, Height, Round, View},
 };
 use ::arbitrary::{Arbitrary, Result as ArbitraryResult, Unstructured};
+use bytes::Bytes;
 use commonware_cryptography::{
     Digest, Hasher, Sha256,
     bls12381::{
@@ -33,7 +34,9 @@ const EXTENSION_BOUND: u32 = 2;
 pub(crate) fn codec_config() -> CodecConfig {
     let limits =
         PathLimits::new(PIPELINE_DEPTH, EXTENSION_BOUND).expect("arbitrary codec limits are valid");
-    CodecConfig::new(PARTICIPANTS, PARTICIPANTS, limits).expect("arbitrary codec config is valid")
+    CodecConfig::new(PARTICIPANTS, PARTICIPANTS, limits)
+        .expect("arbitrary codec config is valid")
+        .with_proposal_extension_bound(16)
 }
 
 fn arbitrary_live_round(u: &mut Unstructured<'_>) -> ArbitraryResult<Round> {
@@ -181,7 +184,12 @@ where
         proposals,
         config,
     )
-    .expect("generated leader block is canonical"))
+    .expect("generated leader block is canonical")
+    .with_extension(
+        Bytes::from(arbitrary_vec::<u8>(u, config.proposal_extension_bound())?),
+        config,
+    )
+    .expect("generated proposal extension respects its byte bound"))
 }
 
 fn arbitrary_vote_body<D>(

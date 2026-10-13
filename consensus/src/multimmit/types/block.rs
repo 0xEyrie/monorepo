@@ -14,7 +14,7 @@ use crate::{
     multimmit::types::CodecConfig,
     types::{Attributable, Epoch, Height, Participant, Round, View},
 };
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 use commonware_codec::{
     Buf, BufsMut, Codec, EncodeSize, Error as CodecError, FixedSize as _, RangeCfg, Read, ReadExt,
     Write,
@@ -797,13 +797,14 @@ impl<V: Variant, D: Digest> EncodeSize for ChainProposal<V, D> {
     }
 }
 
-/// A transaction-free leader block spanning every producer chain.
+/// A transaction-free leader block spanning every producer chain with a bounded application extension.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LeaderBlock<V: Variant, D: Digest> {
     round: Round,
     parent: CertificateId<D>,
     history: D,
     proposals: Vec<ChainProposal<V, D>>,
+    extension: Bytes,
 }
 
 impl<V: Variant, D: Digest> LeaderBlock<V, D> {
@@ -820,12 +821,16 @@ impl<V: Variant, D: Digest> LeaderBlock<V, D> {
             parent,
             history,
             proposals,
+            extension: Bytes::new(),
         };
         block.validate(limits)?;
         Ok(block)
     }
 
     pub(crate) fn validate(&self, limits: CodecConfig) -> Result<(), Error> {
+        if self.extension.len() > limits.proposal_extension_bound() {
+            return Err(Error::ProposalExtensionLength);
+        }
         if self.round.view().is_zero() {
             return Err(Error::GenesisView);
         }
@@ -847,6 +852,22 @@ impl<V: Variant, D: Digest> LeaderBlock<V, D> {
     /// Returns the block's round.
     pub const fn round(&self) -> Round {
         self.round
+    }
+
+    /// Attaches application data authenticated by the leader digest and its votes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the extension exceeds the epoch's configured byte bound.
+    pub fn with_extension(mut self, extension: Bytes, limits: CodecConfig) -> Result<Self, Error> {
+        self.extension = extension;
+        self.validate(limits)?;
+        Ok(self)
+    }
+
+    /// Returns the application data authenticated by this leader's digest.
+    pub const fn extension(&self) -> &Bytes {
+        &self.extension
     }
 
     /// Returns the referenced parent V-QC identifier.
@@ -892,6 +913,8 @@ impl<V: Variant, D: Digest> LeaderBlock<V, D> {
             checked_product(2, MAX_U64_VARINT_SIZE)?,
             checked_product(2, D::SIZE)?,
             proposals,
+            encoded_len(codec.proposal_extension_bound())?,
+            codec.proposal_extension_bound(),
         ])
     }
 }
@@ -958,6 +981,7 @@ impl<V: Variant, D: Digest> Write for LeaderBlock<V, D> {
         self.parent.write(buf);
         self.history.write(buf);
         self.proposals.write(buf);
+        self.extension.write(buf);
     }
 }
 
@@ -977,7 +1001,9 @@ impl<V: Variant, D: Digest> Read for LeaderBlock<V, D> {
             proposals.push(ChainProposal::read_cfg(buf, &(chain, *limits))?);
         }
 
+        let extension = Bytes::read_cfg(buf, &(0..=limits.proposal_extension_bound()).into())?;
         Self::new(round, parent, history, proposals, *limits)
+            .and_then(|block| block.with_extension(extension, *limits))
             .map_err(|error| CodecError::Wrapped("LeaderBlock", error.into()))
     }
 }
@@ -988,6 +1014,7 @@ impl<V: Variant, D: Digest> EncodeSize for LeaderBlock<V, D> {
             + self.parent.encode_size()
             + self.history.encode_size()
             + self.proposals.encode_size()
+            + self.extension.encode_size()
     }
 }
 
@@ -1322,6 +1349,74 @@ mod tests {
             build(vec![proposal(0, 1), long]).unwrap_err(),
             Error::ProposalLength
         );
+    }
+
+    #[test]
+    fn leader_block_codec_rejects_missing_proposal_extension() {
+        let limits = codec_config();
+        let leader = LeaderBlock::new(
+            Round::new(Epoch::new(7), View::new(1)),
+            CertificateId::new(digest(b"parent")),
+            digest(b"history"),
+            vec![proposal(0, 2), proposal(1, 1)],
+            limits,
+        )
+        .unwrap();
+        let mut encoded = bytes::BytesMut::new();
+        leader.round().write(&mut encoded);
+        leader.parent().write(&mut encoded);
+        leader.history().write(&mut encoded);
+        leader.proposals().write(&mut encoded);
+        assert!(
+            LeaderBlock::<MinSig, sha256::Digest>::decode_cfg(encoded.freeze(), &limits).is_err()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::empty(b"", true)]
+    #[case::at_bound(b"direction", true)]
+    #[case::over_bound(b"directions", false)]
+    fn proposal_extension_codec_enforces_the_epoch_bound(
+        #[case] bytes: &'static [u8],
+        #[case] accepted: bool,
+    ) {
+        let limits = codec_config().with_proposal_extension_bound(9);
+        let leader = LeaderBlock::new(
+            Round::new(Epoch::new(7), View::new(1)),
+            CertificateId::new(digest(b"parent")),
+            digest(b"history"),
+            vec![proposal(0, 2), proposal(1, 1)],
+            limits,
+        )
+        .unwrap();
+        let result = leader
+            .clone()
+            .with_extension(Bytes::from_static(bytes), limits);
+        assert_eq!(result.is_ok(), accepted);
+        let mut encoded = bytes::BytesMut::new();
+        leader.round().write(&mut encoded);
+        leader.parent().write(&mut encoded);
+        leader.history().write(&mut encoded);
+        leader.proposals().write(&mut encoded);
+        Bytes::from_static(bytes).write(&mut encoded);
+        let decoded = LeaderBlock::<MinSig, sha256::Digest>::decode_cfg(encoded.freeze(), &limits);
+        assert_eq!(decoded.is_ok(), accepted);
+        if accepted {
+            let extended = result.unwrap();
+            assert_eq!(decoded.unwrap(), extended);
+            assert_eq!(extended.extension().as_ref(), bytes);
+            assert_eq!(extended.encode_size(), extended.encode().len());
+            if !bytes.is_empty() {
+                assert_ne!(extended.digest::<Sha256>(), leader.digest::<Sha256>());
+                assert!(
+                    LeaderBlock::<MinSig, sha256::Digest>::decode_cfg(
+                        extended.encode(),
+                        &codec_config()
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]

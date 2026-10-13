@@ -11,6 +11,7 @@ use crate::{
     Epochable, Viewable,
     multimmit::{
         config::{Profile, Role},
+        extension,
         machine::view::{ViewSlotSnapshot, ViewStance, ViewTransition},
         types::{Artifact, ArtifactKind},
     },
@@ -116,6 +117,11 @@ impl<V: Variant, D: Digest> Snapshot<V, D> {
         let projection = ViewSnapshot::from_durable::<H>(self.epoch, self.role, &self.state)
             .map_err(|_| invalid(SnapshotReason::View))?;
         self.check_bounds::<H>(profile)?;
+        if self.retained_artifacts().any(|artifact| {
+            !extension::verify_artifact::<H, V>(profile.proposal_extension.as_deref(), &artifact)
+        }) {
+            return Err(invalid(SnapshotReason::ProposalExtension));
+        }
         self.check_local_artifacts::<H>(profile)?;
         self.check_certified_tips::<H>(profile)?;
         self.check_effects::<H>(profile)?;
@@ -417,6 +423,9 @@ impl<V: Variant, D: Digest> Snapshot<V, D> {
 /// The snapshot check a restored state failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SnapshotReason {
+    /// A retained proposal extension is unsupported or invalid under the epoch's rules.
+    #[error("invalid proposal extension")]
+    ProposalExtension,
     /// The view projection derived from the state is inconsistent.
     #[error("view projection is inconsistent")]
     View,

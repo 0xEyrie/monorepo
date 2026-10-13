@@ -305,6 +305,7 @@ impl NodeBuilder {
             genesis: committee.config.genesis().clone(),
             tuning: tuning(),
             automaton: application,
+            proposal_extension: None,
             relay,
             reporter,
             strategy: Sequential,

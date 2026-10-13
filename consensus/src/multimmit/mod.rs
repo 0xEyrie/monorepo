@@ -64,6 +64,14 @@
 //! [`crate::CertifiableAutomaton`] is deliberately incompatible with it. [`types::PathLimits`]
 //! bounds how far a producer pipelines above its DA-certified anchor.
 //!
+//! [`ProposalExtension`] separately constructs and validates bounded opaque data in leader
+//! proposals. [`Config::with_proposal_extension`] installs it; `None` uses empty extensions.
+//! Configure the byte bound in [`config::Parameters::with_proposal_extension_bound`]. Extension
+//! bytes participate in the leader digest and remain inside proposals, V-QCs, L-QCs and their
+//! durable records, so a receiver needs no prior local copy. This does not replace native
+//! finality or select Marshal's ordering policy. See
+//! [Application proposal extensions](docs::state_machine#application-proposal-extensions).
+//!
 //! # Fault Model and Recovery
 //!
 //! For a committee of `n` validators, Multimmit derives `f = floor((n - 1) / 5)` and assumes at
@@ -107,6 +115,8 @@
 //! - [`scheme`]: the aggregate and threshold signatures behind votes and certificates.
 
 pub mod config;
+mod extension;
+pub use extension::{ProposalChain, ProposalContext, ProposalExtension};
 #[cfg(any(test, feature = "mocks"))]
 pub(crate) mod fuzz;
 pub mod scheme;

@@ -51,6 +51,98 @@ use std::{
 
 type TestBlocker = NoopBlocker<ed25519::PublicKey>;
 
+struct RoundExtension;
+
+impl crate::multimmit::ProposalExtension<Sha256Digest> for RoundExtension {
+    fn propose(
+        &self,
+        context: &crate::multimmit::ProposalContext<'_, Sha256Digest>,
+    ) -> Option<bytes::Bytes> {
+        Some(context.round().encode())
+    }
+    fn verify(
+        &self,
+        context: &crate::multimmit::ProposalContext<'_, Sha256Digest>,
+        extension: &bytes::Bytes,
+    ) -> bool {
+        *extension == context.round().encode()
+    }
+}
+
+#[rstest]
+#[case::none(false)]
+#[case::custom(true)]
+fn proposal_extensions_travel_with_finalized_view_proofs(#[case] enabled: bool) {
+    DeterministicRunner::timed(Duration::from_secs(30)).start(|context| async move {
+        let committee = Committee::<MinPk>::builder(93, 6)
+            .proposal_extension_bound(32)
+            .build();
+        let oracle = start_network(&context, committee.identities.clone(), 4 * 1024 * 1024).await;
+        link_all(&oracle, &committee.identities).await;
+        let mut nodes = Vec::new();
+        let mut servers: Vec<resolver::Server<MinPk, Sha256Digest>> = Vec::new();
+        let labels = [
+            "extension_node_0",
+            "extension_node_1",
+            "extension_node_2",
+            "extension_node_3",
+            "extension_node_4",
+            "extension_node_5",
+        ];
+        for (index, label) in labels.into_iter().enumerate() {
+            if index == 5 {
+                loop {
+                    if servers[0]
+                        .serve(View::new(1))
+                        .await
+                        .unwrap()
+                        .is_some_and(|proof| matches!(proof.as_ref(), ViewProof::Lqc(_)))
+                    {
+                        break;
+                    }
+                    context.sleep(Duration::from_millis(10)).await;
+                }
+            }
+            let planes = register_planes(&oracle, &committee.identities[index]).await;
+            let mut config = config(&context, &committee, index, "proposal_extensions");
+            config.automaton.pause_building();
+            if enabled {
+                config = config.with_proposal_extension(RoundExtension);
+            }
+            let engine = Engine::open(context.child(label), config).await.unwrap();
+            servers.push(engine.proofs());
+            let mut running = engine.start(planes);
+            running.ready().await.unwrap();
+            nodes.push(running);
+        }
+        for server in servers {
+            let proof = loop {
+                if let Some(proof) = server.serve(View::new(1)).await.unwrap()
+                    && matches!(proof.as_ref(), ViewProof::Lqc(_))
+                {
+                    break proof;
+                }
+                context.sleep(Duration::from_millis(10)).await;
+            };
+            let ViewProof::Lqc(certificate) = proof.as_ref() else {
+                unreachable!()
+            };
+            let expected = if enabled {
+                certificate.leader().round().encode()
+            } else {
+                bytes::Bytes::new()
+            };
+            assert_eq!(certificate.leader().extension(), &expected);
+        }
+        for node in &nodes {
+            node.abort();
+        }
+        for node in nodes {
+            let _ = node.join().await;
+        }
+    });
+}
+
 type TestPlanes = Planes<
     SimulatedSender<ed25519::PublicKey, deterministic::Context>,
     SimulatedReceiver<ed25519::PublicKey>,
@@ -103,6 +195,7 @@ fn config(
         genesis: committee.config.genesis().clone(),
         tuning: tuning(),
         automaton: application.clone(),
+        proposal_extension: None,
         relay: application,
         reporter: NoopReporter::default(),
         strategy: Sequential,

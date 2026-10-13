@@ -555,7 +555,7 @@ mod tests {
             let encoded = record.encode();
             let config = RecordCodecConfig {
                 event: DomainEventCodecConfig::new(
-                    CodecConfig::new(6, 6, PathLimits::new(2, 2).unwrap()).unwrap(),
+                    crate::multimmit::types::arbitrary_codec_config(),
                     1024 * 1024,
                     16,
                     16,

@@ -402,6 +402,49 @@ conditions without moving signing authority into the chain plane.
    requires transmitting it.
 5. A proposal becomes externally visible only after its signing reservation is durable.
 
+#### Application proposal extensions
+
+`Config::proposal_extension` defaults to `None` in application assembly: leaders construct empty
+extensions and nodes reject nonempty extensions. `Parameters::with_proposal_extension_bound`
+sets the epoch's byte bound, zero by default. An application installs `ProposalExtension` with
+`Config::with_proposal_extension` to construct and validate bounded opaque data such as a Baton
+direction. It receives the native round, parent V-QC identifier, history commitment and chain
+anchors/body digests through `ProposalContext`.
+
+```mermaid
+flowchart TD
+    P["Native proposal context"] --> A["ProposalExtension::propose(context)"]
+    A -->|"None"| T["Existing view timeout remains active"]
+    A -->|"Some(Bytes)"| V["Byte bound + ProposalExtension::verify"]
+    V -->|"valid"| S["Durably reserve full LeaderBlock, then sign"]
+    V -->|"invalid"| X["Reject"]
+    S --> R["Proposal / V-QC / L-QC carries extension bytes"]
+    R --> C["Authenticate native evidence, then verify extension"]
+    C -->|"valid"| N["Native consensus admission"]
+    C -->|"invalid"| X
+    N --> D["Existing journal, snapshot and resolver custody"]
+```
+
+The extension participates in the leader digest, so leader signatures and votes bind its exact
+bytes and context. Both certificate forms retain that LeaderBlock. Receiving a QC therefore
+provides the extension even when the node missed the proposal or earlier reports. A V-QC remains
+view-exit evidence; its presence alone does not finalize an application direction.
+
+Callbacks are bounded and synchronous, without I/O or execution. A leader may decline while its
+prepared data is unavailable, and the ordinary timeout/nullification path continues. Validation
+uses complete supplied data and immutable epoch rules, never local report arrival or speculative
+progress. Persisted signing requests retain the original extension; recovery reissues that exact
+subject and rejects stored extensions unsupported by the configured rules.
+
+This interface authenticates application data; it does not invoke Marshal's `Ordering` policy.
+Baton still implements direction semantics, prefix continuity and the mapping from an authenticated
+proposal to the exact immutable ordering context. Once selected, every node and replay must use
+the same direction for that context. No new application ACK or execution gate is introduced.
+
+LeaderBlock encoding includes a length-delimited extension, including a zero length when unused.
+This ALPHA wire/storage format change requires a fresh deployment namespace and storage; old
+proposal encodings are not accepted. Extension rules and bounds are epoch protocol settings.
+
 Leaders follow the deterministic `LeaderSchedule`. Randomized election is not supported: an
 unpredictable election needs a unique per-view value, and the ordinary exit path produces none. A
 V-QC is an aggregate of ordinary signatures, which is not unique and can be ground by its assembler;

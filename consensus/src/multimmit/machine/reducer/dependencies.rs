@@ -8,6 +8,7 @@ use crate::{
     Epochable, Viewable,
     multimmit::{
         algebra::{CertificateDerivations, ValidatedLqc, ValidatedVqc},
+        extension,
         machine::{
             artifact::Dependency,
             capability::Capability,
@@ -179,7 +180,12 @@ impl<H: Hasher, V: Variant> Machine<H, V> {
         if !current {
             return Ok(None);
         }
-        if verdict.valid() {
+        if verdict.valid()
+            && extension::verify_artifact::<H, V>(
+                self.profile.proposal_extension.as_deref(),
+                &self.store.artifacts[&ticket.artifact()].artifact,
+            )
+        {
             let (observation, artifact) = {
                 let entry = &self.store.artifacts[&ticket.artifact()];
                 (entry.observation, Arc::clone(&entry.artifact))

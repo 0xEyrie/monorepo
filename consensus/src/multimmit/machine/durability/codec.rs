@@ -1798,7 +1798,7 @@ mod tests {
 
     #[cfg(feature = "arbitrary")]
     fn conformance_protocol_config() -> CodecConfig {
-        CodecConfig::new(6, 6, PathLimits::new(2, 2).unwrap()).unwrap()
+        crate::multimmit::types::arbitrary_codec_config()
     }
 
     #[cfg(feature = "arbitrary")]

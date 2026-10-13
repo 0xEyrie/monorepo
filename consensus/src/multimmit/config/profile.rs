@@ -2,12 +2,13 @@
 
 use super::{Error, ProposalPolicy, Protocol};
 use crate::{
-    multimmit::{machine::max_lane_artifacts, types::CodecConfig},
+    multimmit::{ProposalExtension, machine::max_lane_artifacts, types::CodecConfig},
     types::{Participant, View, ViewDelta},
 };
 use commonware_cryptography::{Digest, Hasher, bls12381::primitives::variant::Variant};
 use commonware_utils::{Faults as _, N5f1};
 use core::{num::NonZeroUsize, time::Duration};
+use std::sync::Arc;
 
 /// Cache slots held back for one self-certifying view proof, which no other work may consume.
 const VIEW_PROOF_SLOTS: usize = 1;
@@ -464,6 +465,7 @@ pub struct Profile<D: Digest> {
     role: Role,
     tuning: ResolvedTuning,
     resources: ResourceLimits,
+    pub(crate) proposal_extension: Option<Arc<dyn ProposalExtension<D>>>,
 }
 
 impl<D: Digest> Profile<D> {
@@ -588,6 +590,7 @@ impl<D: Digest> Profile<D> {
             role,
             tuning,
             resources,
+            proposal_extension: None,
         })
     }
 
@@ -657,7 +660,16 @@ impl<D: Digest> Profile<D> {
             role,
             tuning,
             resources,
+            proposal_extension: None,
         })
+    }
+
+    pub(crate) fn with_proposal_extension(
+        mut self,
+        extension: Option<Arc<dyn ProposalExtension<D>>>,
+    ) -> Self {
+        self.proposal_extension = extension;
+        self
     }
 
     /// Returns the validated protocol configuration.
