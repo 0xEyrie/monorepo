@@ -61,6 +61,55 @@ sequence to an application reporter that must acknowledge each block. In termina
 reporter keeps each block's coordinates and digest for the total-order pane; headless mode
 acknowledges without keeping them.
 
+### Custom Ordering
+
+[`Marshal configuration`](src/marshal.rs) installs [`ReverseLanes`](src/ordering.rs) from this
+example crate directly with `Config::with_ordering(ReverseLanes)`. It uses only the public
+`Ordering::order(&OrderingContext<D>) -> Vec<BlockRef<D>>` interface. Marshal supplies the
+authenticated prefixes; the policy visits lanes in descending chain-ID order and keeps each
+lane's oldest block first. For inputs `A: [A1]` and `B: [B1, B2]`, it returns `B1, B2, A1`.
+No position is reserved for an absent `A2`.
+
+Without `with_ordering`, marshal uses proposed-first, offset-major traversal and immediate
+final sweeps. This example's custom ordering waits until a subsequent finalized leader
+authenticates the history range, so application delivery can be later than with the default. Larger ranges
+are split into deterministic contexts of at most 1,024 blocks; the policy orders each context
+separately. Consensus voting and finality continue independently.
+
+Keep the same policy on every node for the entire epoch and when restarting from its storage.
+Start with fresh storage if previously running the example with native ordering. Marshal
+validates complete membership, exact digests, increasing height on each lane, and compatibility
+with the published prefix.
+A policy that uses application reports must read the same frozen, retained direction for the
+exact context on every node; this hook does not authenticate or distribute those reports.
+
+From the workspace root, run six nodes with two producers in a Bash script:
+
+```bash
+cargo build --release -p commonware-log-multimmit
+storage=/tmp/commonware-log-multimmit-reverse-lanes
+mkdir -p "$storage"
+pids=()
+trap 'kill "${pids[@]}" 2>/dev/null; wait' EXIT
+for node in 0 1 2 3 4 5; do
+  bootstrap=()
+  if [ "$node" -ne 0 ]; then
+    bootstrap=(--bootstrappers 0@127.0.0.1:3000)
+  fi
+  target/release/commonware-log-multimmit \
+    --me "$node@$((3000 + node))" --participants 0,1,2,3,4,5 --producers 0,1 \
+    --storage-dir "$storage/$node" "${bootstrap[@]}" \
+    --production-interval-ms 250 --headless \
+    >"$storage/$node.jsonl" 2>&1 &
+  pids+=("$!")
+done
+wait
+```
+
+Stop the script with Ctrl-C. To inspect delivery order in the terminal UI, run each node in
+its own terminal without `--headless`, using the same storage directories.
+The total-order pane shows actual deliveries, newest first.
+
 ## Network
 
 Every node runs one authenticated `commonware-p2p` network. Separate channels carry data

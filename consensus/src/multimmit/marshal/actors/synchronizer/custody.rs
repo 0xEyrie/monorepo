@@ -12,6 +12,7 @@ use crate::{
     multimmit::{
         marshal::{
             actors::{backfill::CustodiedBlock, metrics::FetchReason},
+            ordering::{self, MAX_ORDERING_BLOCKS, OrderingContext},
             protocol::{order::Slot, paths::Branch},
             storage::{
                 commit::CustodyRef,
@@ -439,7 +440,8 @@ where
     /// `batch` in order.
     ///
     /// `forward` gives each chain's authenticated path where the walk found one; other chains
-    /// read their references from the block stack, which must be empty afterwards.
+    /// read their references from the block stack, which must be empty afterwards. Custom policies
+    /// receive complete contexts authenticated by `history`, before replay duplicates are removed.
     #[tracing::instrument(
         name = "multimmit.marshal.synchronizer.resolve_custody",
         level = "info",
@@ -451,6 +453,7 @@ where
     )]
     pub(super) async fn drive<J>(
         &mut self,
+        history: H::Digest,
         stream: &mut J,
         emitted: &[BlockRef<H::Digest>],
         forward: &[Option<Branch<H::Digest>>],
@@ -459,89 +462,153 @@ where
     where
         J: Iterator<Item = Slot<H::Digest>>,
     {
-        let mut window = CustodyWindow::new(
-            self.epoch,
-            WindowBounds {
-                capacity: self.bounds.custody_window_outputs,
-                batch: self.bounds.custody_batch_outputs,
-                max_fetch: self.bounds.max_fetch_blocks,
-                max_fetches: self.bounds.backfill_concurrency,
-            },
-        );
-        self.metrics.windows.inc();
+        let policy = self.ordering.clone();
+        let mut cursor = policy
+            .as_ref()
+            .map(|_| self.state.ordered().to_vec())
+            .unwrap_or_default();
         loop {
-            let mut planned = 0u64;
-            while window.has_room() {
-                match self.next_staged(stream, emitted, forward).await? {
-                    Some(StagedSlot { slot, reference }) => {
-                        window.push(slot, reference)?;
-                        planned += 1;
+            let mut preordered = if let Some(policy) = &policy {
+                let mut staged = Vec::with_capacity(MAX_ORDERING_BLOCKS);
+                while staged.len() < MAX_ORDERING_BLOCKS {
+                    let Some(next) = self.next_staged(stream, &cursor, forward).await? else {
+                        break;
+                    };
+                    staged.push(next);
+                }
+                if staged.is_empty() {
+                    break;
+                }
+                let mut prefixes = vec![Vec::new(); cursor.len()];
+                let mut slots = vec![Vec::new(); cursor.len()];
+                for next in staged {
+                    let chain = next.reference.chain().index();
+                    prefixes[chain].push(next.reference);
+                    slots[chain].push(next.slot);
+                }
+                let context = OrderingContext::new(self.epoch, history, cursor.clone(), prefixes);
+                let ordered = policy.order(&context);
+                ordering::validate(&context, &ordered)?;
+                let mut planned = VecDeque::with_capacity(ordered.len());
+                let mut new_output_seen = false;
+                for reference in ordered {
+                    let chain = reference.chain().index();
+                    let duplicate = reference.height() <= emitted[chain].height();
+                    if duplicate && new_output_seen {
+                        return Err(Error::Invalid("ordering policy changed a published prefix"));
                     }
-                    None => window.finish(),
+                    new_output_seen |= !duplicate;
+                    let offset = usize::try_from(
+                        reference.height().get() - cursor[chain].height().get() - 1,
+                    )
+                    .map_err(|_| Error::OutputExhausted)?;
+                    if !duplicate {
+                        let slot = *slots[chain]
+                            .get(offset)
+                            .ok_or(Error::Invalid("ordering input has a chain-local gap"))?;
+                        planned.push_back(StagedSlot { slot, reference });
+                    }
                 }
-            }
-            self.metrics.planned_outputs.inc_by(planned);
-            window.schedule_lookups(|references| {
-                let lookup = self.catalog.wait_for_custody(references);
-                async move { lookup.await.map_err(Error::from) }
-            })?;
-            window.schedule_fetches(|references| {
-                let mut fetcher = self.fetcher.clone();
-                async move {
-                    fetcher
-                        .blocks(FetchReason::FinalizedBody, references)
-                        .await
-                        .map_err(Error::from)
+                for (chain, prefix) in context.prefixes().iter().enumerate() {
+                    if let Some(last) = prefix.last() {
+                        cursor[chain] = *last;
+                    }
                 }
-            });
+                Some(planned)
+            } else {
+                None
+            };
+            let mut window = CustodyWindow::new(
+                self.epoch,
+                WindowBounds {
+                    capacity: self.bounds.custody_window_outputs,
+                    batch: self.bounds.custody_batch_outputs,
+                    max_fetch: self.bounds.max_fetch_blocks,
+                    max_fetches: self.bounds.backfill_concurrency,
+                },
+            );
+            self.metrics.windows.inc();
+            loop {
+                let mut planned = 0u64;
+                while window.has_room() {
+                    let next = match &mut preordered {
+                        Some(planned) => planned.pop_front(),
+                        None => self.next_staged(stream, emitted, forward).await?,
+                    };
+                    match next {
+                        Some(StagedSlot { slot, reference }) => {
+                            window.push(slot, reference)?;
+                            planned += 1;
+                        }
+                        None => window.finish(),
+                    }
+                }
+                self.metrics.planned_outputs.inc_by(planned);
+                window.schedule_lookups(|references| {
+                    let lookup = self.catalog.wait_for_custody(references);
+                    async move { lookup.await.map_err(Error::from) }
+                })?;
+                window.schedule_fetches(|references| {
+                    let mut fetcher = self.fetcher.clone();
+                    async move {
+                        fetcher
+                            .blocks(FetchReason::FinalizedBody, references)
+                            .await
+                            .map_err(Error::from)
+                    }
+                });
 
-            let mut emitted_any = false;
-            while let Some(ready) = window.pop_ready() {
-                self.emit_output(ready.slot, ready.custody, ready.block, batch)
-                    .await?;
-                emitted_any = true;
+                let mut emitted_any = false;
+                while let Some(ready) = window.pop_ready() {
+                    self.emit_output(ready.slot, ready.custody, ready.block, batch)
+                        .await?;
+                    emitted_any = true;
+                }
+                if emitted_any {
+                    continue;
+                }
+                if window.is_done() {
+                    break;
+                }
+                if window.is_stalled() {
+                    return Err(Error::Invalid("planned output custody is missing"));
+                }
+                if window.block() {
+                    self.metrics.blocked_prefixes.inc();
+                }
+                self.metrics
+                    .pressure(window.lookups(), window.fetches(), window.ready());
+
+                select! {
+                    completion = window.next_completion() => match completion {
+                        Completion::Lookup(lookup) => {
+                            let local = window.on_lookup(lookup)?;
+                            self.metrics
+                                .local_outputs
+                                .inc_by(u64::try_from(local).unwrap_or(u64::MAX));
+                        }
+                        Completion::Fetch(fetch) => {
+                            let fetched = window.on_fetch(fetch)?;
+                            self.metrics
+                                .fetched_outputs
+                                .inc_by(u64::try_from(fetched).unwrap_or(u64::MAX));
+                        }
+                    },
+                    absorbed = self.inbox.absorb() => {
+                        if let Some(absorbed) = absorbed? {
+                            self.apply(absorbed);
+                        }
+                        if self.inbox.preempted() {
+                            return Err(Error::Preempted);
+                        }
+                    },
+                }
             }
-            if emitted_any {
-                continue;
-            }
-            if window.is_done() {
+            self.metrics.pressure(0, 0, 0);
+            if policy.is_none() {
                 break;
             }
-            if window.is_stalled() {
-                return Err(Error::Invalid("planned output custody is missing"));
-            }
-            if window.block() {
-                self.metrics.blocked_prefixes.inc();
-            }
-            self.metrics
-                .pressure(window.lookups(), window.fetches(), window.ready());
-
-            select! {
-                completion = window.next_completion() => match completion {
-                    Completion::Lookup(lookup) => {
-                        let local = window.on_lookup(lookup)?;
-                        self.metrics
-                            .local_outputs
-                            .inc_by(u64::try_from(local).unwrap_or(u64::MAX));
-                    }
-                    Completion::Fetch(fetch) => {
-                        let fetched = window.on_fetch(fetch)?;
-                        self.metrics
-                            .fetched_outputs
-                            .inc_by(u64::try_from(fetched).unwrap_or(u64::MAX));
-                    }
-                },
-                absorbed = self.inbox.absorb() => {
-                    if let Some(absorbed) = absorbed? {
-                        self.apply(absorbed);
-                    }
-                    if self.inbox.preempted() {
-                        return Err(Error::Preempted);
-                    }
-                },
-            }
         }
-        self.metrics.pressure(0, 0, 0);
         for chain in 0..emitted.len() {
             if self.block_stack.read_oldest(chain).await?.is_some() {
                 return Err(Error::Invalid(

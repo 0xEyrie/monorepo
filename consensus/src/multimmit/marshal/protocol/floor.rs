@@ -16,8 +16,8 @@ pub(crate) enum Error {
     /// The floor's emitted frontier is below the current one on some chain.
     #[error("floor emitted frontier regresses")]
     EmittedRegression,
-    /// The floor's emitted frontier is not where the anchor's final sweep ends.
-    #[error("floor emitted frontier is not the anchor's final sweep")]
+    /// The floor's emitted frontier is neither the complete history nor the final-sweep boundary.
+    #[error("floor emitted frontier is not an authenticated checkpoint boundary")]
     Sweep,
     /// The floor's frontiers or final sweep are malformed.
     #[error(transparent)]
@@ -30,7 +30,7 @@ pub(crate) struct Frontiers<D: Digest> {
     pub history: D,
     /// Ordered frontier: the tips of the floor's tip-history record.
     pub ordered: Vec<BlockRef<D>>,
-    /// Final tips of the anchor's final sweep.
+    /// Target frontier against which the caller authenticates the emitted ancestry.
     pub target: Vec<BlockRef<D>>,
 }
 
@@ -38,8 +38,9 @@ pub(crate) struct Frontiers<D: Digest> {
 /// `emitted` against `state`.
 ///
 /// The history must be the one the anchor commits to, neither frontier may regress, and
-/// `emitted` must end the anchor's final sweep from the ordered frontier. The ancestry between
-/// `emitted` and the returned target is left to the caller.
+/// `emitted` must end either the complete history or the anchor's final sweep. These boundaries
+/// are independent of the delivery policy. The ancestry between `emitted` and the returned
+/// target is left to the caller.
 pub(crate) fn validate<H, V>(
     state: &HistoryState<H::Digest>,
     anchor: &Lqc<V, H::Digest>,
@@ -70,19 +71,21 @@ where
         .final_sweep::<H, V>(anchor, codec, &ordered)?
         .into_stream();
     let target = sweep.target().to_vec();
-    let mut expected = ordered.clone();
-    for slot in sweep {
-        expected[slot.tip().chain().get() as usize] =
-            BlockRef::new(slot.tip().chain(), slot.height(), slot.tip().digest());
-    }
-    for (((ordered, target), expected), emitted) in
-        ordered.iter().zip(&target).zip(&expected).zip(emitted)
-    {
-        if expected.height() != emitted.height()
-            || (emitted.height() == ordered.height() && emitted != ordered)
-            || (emitted.height() == target.height() && emitted != target)
+    if emitted != ordered {
+        let mut expected = ordered.clone();
+        for slot in sweep {
+            expected[slot.tip().chain().get() as usize] =
+                BlockRef::new(slot.tip().chain(), slot.height(), slot.tip().digest());
+        }
+        for (((ordered, target), expected), emitted) in
+            ordered.iter().zip(&target).zip(&expected).zip(emitted)
         {
-            return Err(Error::Sweep);
+            if expected.height() != emitted.height()
+                || (emitted.height() == ordered.height() && emitted != ordered)
+                || (emitted.height() == target.height() && emitted != target)
+            {
+                return Err(Error::Sweep);
+            }
         }
     }
     Ok(Frontiers {

@@ -319,11 +319,13 @@ pub type Custody = Completion<Error>;
 
 /// A state-sync floor from which marshal can resume ordering.
 ///
-/// The application snapshot is assumed to contain every block through `emitted`. Producer chains
-/// start at height zero and every output advances one chain by one height, so the floor's index
-/// is the sum of `emitted`'s heights, and delivery resumes at the index after it.
+/// The application snapshot must contain the output prefix through `emitted` under the configured
+/// delivery policy. Its frontier ends either the complete history or the anchor's final sweep.
+/// Producer chains start at height zero and every output advances one chain by one height, so
+/// the floor's index is the sum of `emitted`'s heights, and delivery resumes at the index after it.
 ///
-/// Decoding checks only the floor's shape. Marshal authenticates a floor when it is installed.
+/// Decoding checks only the floor's shape. Marshal authenticates the checkpoint boundary when it
+/// is installed; the application authenticates and installs the matching snapshot state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Floor<V: Variant, D: Digest> {
     pub(super) anchor: Arc<Lqc<V, D>>,

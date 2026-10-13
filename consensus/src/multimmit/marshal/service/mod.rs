@@ -39,6 +39,7 @@ use super::{
     config::{ActorBounds, Capacities, Config, Limits},
     mailbox::Mailbox,
     open::{self, OpenError, Opened},
+    ordering::Policy,
     relay::{Relay, Staged},
     storage::scratch::{BlockScratch, HistoryScratch},
     types::{LqcVerifier, Update},
@@ -87,6 +88,7 @@ where
     capacities: Capacities,
     limits: Limits,
     codec: CodecConfig,
+    ordering: Policy<H::Digest>,
     bounds: ActorBounds,
 }
 
@@ -178,6 +180,7 @@ where
             capacities: config.capacities,
             limits: config.limits,
             codec: config.codec_config,
+            ordering: config.ordering,
             bounds,
         },
         bridge,
@@ -255,6 +258,7 @@ where
                 block_stack: self.block_scratch,
                 verifier,
                 codec: self.codec,
+                ordering: self.ordering,
                 mailbox_size: self.bounds.synchronizer_mailbox,
                 header_cache_capacity: self.capacities.header_cache_capacity,
                 backfill_concurrency: self.bounds.synchronizer_fetches,

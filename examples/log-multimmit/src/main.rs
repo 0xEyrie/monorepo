@@ -8,6 +8,7 @@ mod deploy;
 mod gui;
 mod marshal;
 mod node;
+mod ordering;
 mod progress;
 mod trace_file;
 

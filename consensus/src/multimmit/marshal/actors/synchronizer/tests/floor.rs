@@ -3,6 +3,97 @@
 use super::*;
 use crate::types::View;
 
+struct NoFloorOrdering;
+
+impl crate::multimmit::marshal::Ordering<Sha256Digest> for NoFloorOrdering {
+    fn order(
+        &self,
+        _: &crate::multimmit::marshal::OrderingContext<Sha256Digest>,
+    ) -> Vec<BlockRef<Sha256Digest>> {
+        panic!("floor installation must not invoke the delivery policy")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Cut {
+    History,
+    Sweep,
+    Mixed,
+    Beyond,
+}
+
+#[rstest]
+#[case::history_native(false, Cut::History, Some(2))]
+#[case::history_custom(true, Cut::History, Some(2))]
+#[case::sweep_native(false, Cut::Sweep, Some(4))]
+#[case::sweep_custom(true, Cut::Sweep, Some(4))]
+#[case::mixed_native(false, Cut::Mixed, None)]
+#[case::mixed_custom(true, Cut::Mixed, None)]
+#[case::beyond_native(false, Cut::Beyond, None)]
+#[case::beyond_custom(true, Cut::Beyond, None)]
+fn floor_boundaries_are_independent_of_delivery_policy(
+    #[case] custom: bool,
+    #[case] cut: Cut,
+    #[case] index: Option<u64>,
+) {
+    deterministic::Runner::default().start(|context| async move {
+        let committee = committee(175, 2, PathLimits::new(2, 1).unwrap());
+        let genesis = committee.config.genesis();
+        let epoch = genesis.epoch();
+        let bases = genesis.tips().to_vec();
+        let blocks = vec![chain(epoch, bases[0], 3), chain(epoch, bases[1], 3)];
+        let parent = genesis_history::<Sha256>(genesis);
+        let history = Arc::new(
+            TipRecord::at_tips(
+                parent,
+                vec![blocks[0][0].reference(), blocks[1][0].reference()],
+            )
+            .unwrap(),
+        );
+        let anchor = anchored_lqc(
+            &committee,
+            1,
+            history.commitment::<Sha256>(),
+            vec![blocks[0][1].reference(), blocks[1][1].reference()],
+            vec![Vec::new(), Vec::new()],
+        );
+        let heights = match cut {
+            Cut::History => [0, 0],
+            Cut::Sweep => [1, 1],
+            Cut::Mixed => [1, 0],
+            Cut::Beyond => [2, 1],
+        };
+        let emitted = vec![
+            blocks[0][heights[0]].reference(),
+            blocks[1][heights[1]].reference(),
+        ];
+        let current = checkpoint(epoch, parent, bases.clone(), bases);
+        let mut actor = actor(&context, current.clone(), blocks, committee.codec(), 4).await;
+        if custom {
+            actor.ordering = Some(Arc::new(NoFloorOrdering));
+        }
+        let result = actor
+            .install_floor(Floor::new(anchor, history, emitted.clone()))
+            .await;
+        match index {
+            Some(index) => {
+                result.unwrap();
+                assert_eq!(actor.catalog.installed, 1);
+                assert_eq!(
+                    actor.catalog.checkpoint.committed(),
+                    OutputIndex::new(index)
+                );
+                assert_eq!(actor.state.emitted(), emitted);
+            }
+            None => {
+                assert!(matches!(result, Err(Error::Floor(FloorError::Sweep))));
+                assert_eq!(actor.catalog.installed, 0);
+                assert_eq!(actor.catalog.checkpoint, current);
+            }
+        }
+    });
+}
+
 fn floor_fixture(
     committee: &Committee<MinPk>,
 ) -> (Checkpoint<Sha256Digest>, Floor<MinPk, Sha256Digest>) {
@@ -22,7 +113,7 @@ fn floor_fixture(
 
 /// Returns an L-QC for `history` whose voters leave every chain at its anchor. Each chain proposes
 /// `payloads`, so a chain with any falls short and halts the final sweep.
-fn anchored_lqc(
+pub(super) fn anchored_lqc(
     committee: &Committee<MinPk>,
     view: u64,
     history: Sha256Digest,
