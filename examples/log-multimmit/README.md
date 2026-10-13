@@ -98,17 +98,16 @@ for node in 0 1 2 3 4 5; do
   target/release/commonware-log-multimmit \
     --me "$node@$((3000 + node))" --participants 0,1,2,3,4,5 --producers 0,1 \
     --storage-dir "$storage/$node" "${bootstrap[@]}" \
-    --ordering reverse-lanes --production-interval-ms 250 --headless --debug \
+    --ordering reverse-lanes --production-interval-ms 250 --headless \
     >"$storage/$node.jsonl" 2>&1 &
   pids+=("$!")
 done
 wait
 ```
 
-Stop the script with Ctrl-C. Debug logs contain `custom ordering` events with each context's
-planned `(chain, height)` sequence and `ordered block` events with the actual output index,
-chain, height, and digest. Compare nodes by output index, allowing for replay after a restart.
-In terminal mode the total-order pane shows the same deliveries, newest first.
+Stop the script with Ctrl-C. To inspect delivery order in the terminal UI, run each node in
+its own terminal without `--headless`, using the same ordering mode and storage directories.
+The total-order pane shows actual deliveries, newest first.
 
 ## Network
 
