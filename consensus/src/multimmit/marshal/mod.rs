@@ -36,6 +36,8 @@
 //! `Ordering<D, T>` receives `Option<T>` from the proposal extension committed in each history
 //! link. Both configuration builders use the existing codec for the same `T`; callbacks do not
 //! implement or call serialization. Missing extension data appears as `None`.
+//! Local pools can reuse that same implementation through [`OrderingContext::speculative`].
+//! Those contexts have no authenticated epoch, history or base and grant no finality authority.
 //!
 //! # Actors
 //!

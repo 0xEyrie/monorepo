@@ -26,9 +26,9 @@ struct Policy {
 impl FinalOrdering<Sha256Digest> for Policy {
     fn order(&self, context: &OrderingContext<Sha256Digest>) -> Vec<BlockRef<Sha256Digest>> {
         self.contexts.lock().push(Snapshot {
-            epoch: context.epoch(),
-            history: context.history(),
-            base: context.base().to_vec(),
+            epoch: context.epoch().expect("authenticated epoch"),
+            history: context.history().expect("authenticated history"),
+            base: context.base().expect("authenticated frontier").to_vec(),
             prefixes: context.prefixes().to_vec(),
         });
         match self.merge {
