@@ -12,16 +12,16 @@ use std::sync::Arc;
 /// independent of storage, delivery, and acknowledgement batch sizes.
 pub const MAX_ORDERING_BLOCKS: usize = 1024;
 
-/// An authenticated history range's next bounded set of producer-chain prefixes.
+/// Producer-chain inputs and typed policy data shared by local and canonical ordering.
 ///
-/// Prefixes are in chain-ID order, oldest first within each chain. Empty prefixes are permitted.
-/// All blocks are authenticated ancestors of the history's tips. `base` is the frontier before
-/// this context, including blocks in earlier contexts of the same history, not the node's local
-/// acknowledgement or speculative execution position. This makes contexts identical on replay.
+/// Marshal supplies authenticated history metadata and chain-indexed, oldest-first prefixes.
+/// Speculative contexts contain locally known blocks grouped by chain, without history metadata.
+/// Matching prefixes and policy data use the same Ordering implementation; missing local inputs
+/// can still change the speculative order. A local context grants no finality or storage authority.
 pub struct OrderingContext<D: Digest, T = [u8; 0]> {
-    epoch: Epoch,
-    history: D,
-    base: Arc<[BlockRef<D>]>,
+    epoch: Option<Epoch>,
+    history: Option<D>,
+    base: Option<Arc<[BlockRef<D>]>>,
     prefixes: Arc<[Vec<BlockRef<D>>]>,
     proposal_extension: Option<T>,
 }
@@ -34,9 +34,9 @@ impl<D: Digest> OrderingContext<D> {
         prefixes: Vec<Vec<BlockRef<D>>>,
     ) -> Self {
         Self {
-            epoch,
-            history,
-            base: base.into(),
+            epoch: Some(epoch),
+            history: Some(history),
+            base: Some(base.into()),
             prefixes: prefixes.into(),
             proposal_extension: None,
         }
@@ -44,49 +44,85 @@ impl<D: Digest> OrderingContext<D> {
 }
 
 impl<D: Digest, T> OrderingContext<D, T> {
+    /// Groups local blocks by chain and height without claiming authenticated history.
+    ///
+    /// Only nonempty prefixes are retained, in ascending chain-ID order. Callers bound the input
+    /// size and supply any already-validated typed policy data. No codec or consensus I/O runs.
+    pub fn speculative(mut blocks: Vec<BlockRef<D>>, extension: Option<T>) -> Self {
+        blocks.sort_by_key(|reference| (reference.chain(), reference.height(), reference.digest()));
+        let mut prefixes: Vec<Vec<BlockRef<D>>> = Vec::new();
+        for reference in blocks {
+            if prefixes
+                .last()
+                .is_none_or(|prefix| prefix[0].chain() != reference.chain())
+            {
+                prefixes.push(Vec::new());
+            }
+            prefixes
+                .last_mut()
+                .expect("nonempty prefix list")
+                .push(reference);
+        }
+        Self {
+            epoch: None,
+            history: None,
+            base: None,
+            prefixes: prefixes.into(),
+            proposal_extension: extension,
+        }
+    }
+
+    /// Checks a complete lane-order-preserving permutation, without authenticating the inputs.
+    pub fn is_valid_order(&self, ordered: &[BlockRef<D>]) -> bool {
+        validate(self, ordered).is_ok()
+    }
+
     pub(crate) fn with_proposal_extension<U>(&self, extension: Option<U>) -> OrderingContext<D, U> {
         OrderingContext {
             epoch: self.epoch,
             history: self.history,
-            base: Arc::clone(&self.base),
+            base: self.base.as_ref().map(Arc::clone),
             prefixes: Arc::clone(&self.prefixes),
             proposal_extension: extension,
         }
     }
 
-    /// Returns the typed application data authenticated by this history link.
+    /// Returns the supplied typed policy data.
     ///
-    /// `None` denotes a record without proposal extension data, including genesis.
+    /// Marshal authenticates this data through the history link; local callers provide their view.
+    /// `None` denotes absent data, including genesis.
     pub const fn proposal_extension(&self) -> Option<&T> {
         self.proposal_extension.as_ref()
     }
 
-    /// Returns the producer epoch.
-    pub const fn epoch(&self) -> Epoch {
+    /// Returns the authenticated producer epoch, absent for speculative inputs.
+    pub const fn epoch(&self) -> Option<Epoch> {
         self.epoch
     }
 
-    /// Returns the history commitment authenticating this range.
-    pub const fn history(&self) -> D {
+    /// Returns the history commitment, absent for speculative inputs.
+    pub const fn history(&self) -> Option<D> {
         self.history
     }
 
-    /// Returns the per-chain frontier immediately before this context.
-    pub fn base(&self) -> &[BlockRef<D>] {
-        &self.base
+    /// Returns the authenticated per-chain frontier, absent for speculative inputs.
+    pub fn base(&self) -> Option<&[BlockRef<D>]> {
+        self.base.as_deref()
     }
 
-    /// Returns the certified inputs, in chain-ID order and increasing height on each chain.
+    /// Returns inputs grouped by chain ID, oldest first within each chain.
+    /// Marshal prefixes are chain-indexed; speculative prefixes omit empty chains.
     pub fn prefixes(&self) -> &[Vec<BlockRef<D>>] {
         &self.prefixes
     }
 }
 
-/// Selects the final cross-chain order of an authenticated history context.
+/// Selects the cross-chain order of the supplied inputs.
 ///
 /// Return every input block exactly once, preserving increasing height on each chain. There is
 /// no required cross-chain order and no reservation for a block outside the context. Marshal
-/// validates the complete result before admitting any of its outputs.
+/// validates the complete result before admitting any canonical outputs.
+/// Local pools can call the same policy with speculative contexts and validate its permutation.
 ///
 /// # Protocol contract
 ///
@@ -172,7 +208,14 @@ pub(crate) fn validate<D: Digest, T>(
     }
     let mut next = vec![0; context.prefixes.len()];
     for reference in ordered {
-        let chain = reference.chain().index();
+        let chain = if context.history.is_some() {
+            reference.chain().index()
+        } else {
+            context
+                .prefixes
+                .binary_search_by_key(&reference.chain(), |prefix| prefix[0].chain())
+                .map_err(|_| InvalidOrder::Chain)?
+        };
         let prefix = context.prefixes.get(chain).ok_or(InvalidOrder::Chain)?;
         if prefix.get(next[chain]) != Some(reference) {
             return Err(InvalidOrder::Block);
@@ -237,5 +280,52 @@ mod tests {
             Sha256::hash(&[b"another branch"]),
         );
         assert_eq!(validate(&context, &[substituted]), Err(InvalidOrder::Block));
+    }
+    #[rstest]
+    #[case::plain(None, vec![block(0, 1), block(7, 1), block(7, 2)])]
+    #[case::directed(Some(true), vec![block(7, 1), block(7, 2), block(0, 1)])]
+    fn local_inputs_reuse_typed_ordering_without_claiming_native_history(
+        #[case] extension: Option<bool>,
+        #[case] expected: Vec<BlockRef<Sha256Digest>>,
+    ) {
+        struct Policy;
+        impl Ordering<Sha256Digest, bool> for Policy {
+            fn order(
+                &self,
+                context: &OrderingContext<Sha256Digest, bool>,
+            ) -> Vec<BlockRef<Sha256Digest>> {
+                if context.proposal_extension().copied().unwrap_or(false) {
+                    context.prefixes().iter().rev().flatten().copied().collect()
+                } else {
+                    context.prefixes().iter().flatten().copied().collect()
+                }
+            }
+        }
+        let local =
+            OrderingContext::speculative(vec![block(7, 2), block(0, 1), block(7, 1)], extension);
+        assert_eq!(local.epoch(), None);
+        assert_eq!(local.history(), None);
+        assert_eq!(local.base(), None);
+        let ordered = Policy.order(&local);
+        assert_eq!(ordered, expected);
+        assert!(local.is_valid_order(&ordered));
+        assert!(!local.is_valid_order(&ordered[..2]));
+        let bases = (0..8).map(|chain| block(chain, 0)).collect::<Vec<_>>();
+        let mut prefixes = vec![Vec::new(); 8];
+        prefixes[0] = vec![block(0, 1)];
+        prefixes[7] = vec![block(7, 1), block(7, 2)];
+        let authenticated = OrderingContext::new(
+            Epoch::new(1),
+            Sha256::hash(&[b"history"]),
+            bases.clone(),
+            prefixes,
+        )
+        .with_proposal_extension(extension);
+        assert_eq!(authenticated.epoch(), Some(Epoch::new(1)));
+        assert_eq!(authenticated.history(), Some(Sha256::hash(&[b"history"])));
+        assert_eq!(authenticated.base(), Some(bases.as_slice()));
+        let canonical = Policy.order(&authenticated);
+        assert_eq!(canonical, expected);
+        assert!(authenticated.is_valid_order(&canonical));
     }
 }
