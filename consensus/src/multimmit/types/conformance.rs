@@ -55,6 +55,7 @@ codec_cases!(config => {
     CertificateId<Sha256Digest> => ((), 1024),
     BlockRef<Sha256Digest> => ((), 1024),
     TipRecord<Sha256Digest> => (config, 128),
+    VoteReports<Sha256Digest> => (config, 128),
     EpochGenesis<Sha256Digest> => (config, 128),
     TransactionBlockHeader<Sha256Digest> => ((), 128),
     TransactionBlock<Sha256, MockBody> => ((), 128),

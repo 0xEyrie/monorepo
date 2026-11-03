@@ -288,7 +288,7 @@ where
         let plan = self.stage(stream.maxima(), &target, &emitted).await?;
         self.state.validate_reconciliation(&target, &plan.common)?;
         self.drive(
-            self.state.history(),
+            (self.state.history(), None),
             None,
             &mut stream,
             &emitted,
@@ -371,8 +371,8 @@ where
             common.as_deref().unwrap_or(&plan.common),
         )?;
         self.drive(
-            link.commitment,
-            link.record.proposal_extension(),
+            (link.commitment, Some(link.record.parent())),
+            Some(&link.record),
             &mut stream,
             &emitted,
             &plan.forward,
@@ -425,7 +425,7 @@ where
         }
 
         self.drive(
-            self.state.history(),
+            (self.state.history(), None),
             None,
             &mut stream,
             &emitted,

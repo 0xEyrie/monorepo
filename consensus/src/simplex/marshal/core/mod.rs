@@ -6,6 +6,13 @@
 //! the [`super::standard`] and [`super::coding`] variants through
 //! the [`Variant`] and [`Buffer`] trait abstractions.
 //!
+//! The certificate archive selects the existing Simplex phase-two representation
+//! through [`super::store::Certificates::Mode`]. Plain archives retain stock
+//! finalizations; Extended archives retain the original signed interpretation.
+//! The actor uses that same mode for its mailbox, cache, floors and resolver
+//! verification. Recovery witnesses are not finalization inputs. Applications
+//! must retain and verify ancestor interpretation material before execution.
+//!
 //! # Components
 //!
 //! - [`Actor`]: The main marshal actor that orders finalized blocks, manages caching,

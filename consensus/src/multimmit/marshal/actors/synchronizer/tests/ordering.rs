@@ -14,6 +14,7 @@ enum Merge {
 struct Snapshot {
     epoch: Epoch,
     history: Sha256Digest,
+    parent_history: Sha256Digest,
     base: Vec<BlockRef<Sha256Digest>>,
     prefixes: Vec<Vec<BlockRef<Sha256Digest>>>,
 }
@@ -28,6 +29,9 @@ impl FinalOrdering<Sha256Digest> for Policy {
         self.contexts.lock().push(Snapshot {
             epoch: context.epoch().expect("authenticated epoch"),
             history: context.history().expect("authenticated history"),
+            parent_history: context
+                .parent_history()
+                .expect("authenticated parent history"),
             base: context.base().expect("authenticated frontier").to_vec(),
             prefixes: context.prefixes().to_vec(),
         });
@@ -40,6 +44,196 @@ impl FinalOrdering<Sha256Digest> for Policy {
 }
 
 struct Directed;
+
+struct ReportDirected;
+
+impl FinalOrdering<Sha256Digest, bool> for ReportDirected {
+    fn order(&self, context: &OrderingContext<Sha256Digest, bool>) -> Vec<BlockRef<Sha256Digest>> {
+        let reports = context.vote_reports().expect("authenticated vote reports");
+        assert_eq!(reports.round().epoch(), context.epoch().unwrap());
+        assert_eq!(reports.reports().len(), 2);
+        assert!(reports.reports()[0].1.is_empty());
+        assert_eq!(reports.reports()[1].1.as_ref(), b"reverse");
+        context.prefixes().iter().rev().flatten().copied().collect()
+    }
+}
+
+#[rstest]
+#[case::fresh(0)]
+#[case::replayed_prefix(1)]
+fn vote_reports_determine_the_same_order_after_history_decode_and_restart(
+    #[case] published: usize,
+) {
+    use crate::{
+        multimmit::types::VoteReports,
+        types::{Round, View},
+    };
+    use commonware_codec::{Decode as _, Encode as _, Write as _};
+    use commonware_utils::Participant;
+    deterministic::Runner::default().start(|context| async move {
+        let committee = committee(177, 2, PathLimits::new(2, 1).unwrap());
+        let codec = committee.codec().with_proposal_extension_bound(16);
+        let epoch = committee.config.epoch();
+        let bases = vec![base(0, 0), base(1, 0)];
+        let blocks = vec![chain(epoch, bases[0], 1), chain(epoch, bases[1], 2)];
+        let parent = digest(b"report history", 0);
+        let mut reports = bytes::BytesMut::new();
+        Round::new(epoch, View::new(1)).write(&mut reports);
+        digest(b"report leader", 0).write(&mut reports);
+        vec![
+            (Participant::new(0), bytes::Bytes::new()),
+            (Participant::new(1), bytes::Bytes::from_static(b"reverse")),
+        ]
+        .write(&mut reports);
+        let reports = VoteReports::<Sha256Digest>::decode_cfg(reports.freeze(), &codec).unwrap();
+        let mut encoded = bytes::BytesMut::new();
+        parent.write(&mut encoded);
+        vec![tip(&blocks[0]), tip(&blocks[1])].write(&mut encoded);
+        vec![tip(&blocks[0]).height(), tip(&blocks[1]).height()].write(&mut encoded);
+        None::<bytes::Bytes>.write(&mut encoded);
+        Some(reports).write(&mut encoded);
+        let record = TipRecord::<Sha256Digest>::decode_cfg(encoded.freeze(), &codec).unwrap();
+        let record = Arc::new(TipRecord::decode_cfg(record.encode(), &codec).unwrap());
+        let expected = [
+            blocks[1][0].reference(),
+            blocks[1][1].reference(),
+            blocks[0][0].reference(),
+        ];
+        let mut emitted = bases.clone();
+        for reference in &expected[..published] {
+            emitted[reference.chain().index()] = *reference;
+        }
+        let mut actor = actor(
+            &context,
+            checkpoint(epoch, parent, bases, emitted),
+            blocks,
+            codec,
+            1,
+        )
+        .await;
+        actor.ordering = Some(crate::multimmit::marshal::ordering::policy(
+            ReportDirected,
+            (),
+        ));
+        commit_opening(
+            &mut actor,
+            HistoryLink {
+                commitment: record.commitment::<Sha256>(),
+                record,
+            },
+        )
+        .await;
+        assert_eq!(actor.catalog.outputs, expected[published..]);
+    });
+}
+
+// A policy's authenticated prefix cannot be projected onto a smaller input set.
+struct GuardedPrefix;
+
+impl FinalOrdering<Sha256Digest, (Sha256Digest, BlockRef<Sha256Digest>)> for GuardedPrefix {
+    fn validate_context(
+        &self,
+        context: &OrderingContext<Sha256Digest, (Sha256Digest, BlockRef<Sha256Digest>)>,
+    ) -> bool {
+        context.proposal_extension().is_some_and(|(parent, first)| {
+            context.parent_history() == Some(*parent)
+                && context
+                    .prefixes()
+                    .iter()
+                    .flatten()
+                    .any(|block| block == first)
+        })
+    }
+
+    fn order(
+        &self,
+        context: &OrderingContext<Sha256Digest, (Sha256Digest, BlockRef<Sha256Digest>)>,
+    ) -> Vec<BlockRef<Sha256Digest>> {
+        assert!(
+            self.validate_context(context),
+            "rejected policies must not reach ordering"
+        );
+        let first = context.proposal_extension().unwrap().1;
+        let mut ordered = vec![first];
+        ordered.extend(
+            context
+                .prefixes()
+                .iter()
+                .flatten()
+                .filter(|r| **r != first)
+                .copied(),
+        );
+        ordered
+    }
+}
+
+#[rstest]
+#[case::fresh(0, false, false)]
+#[case::replay(1, false, false)]
+#[case::wrong_parent(0, true, false)]
+#[case::wrong_parent_on_replay(1, true, false)]
+#[case::missing_prefix(0, false, true)]
+#[case::missing_prefix_on_replay(1, false, true)]
+fn frozen_prefix_checks_parent_and_membership_before_publication(
+    #[case] published: usize,
+    #[case] wrong_parent: bool,
+    #[case] missing: bool,
+) {
+    use commonware_codec::Encode as _;
+    deterministic::Runner::default().start(|context| async move {
+        let committee = committee(179, 2, PathLimits::new(2, 1).unwrap());
+        let codec = committee.codec().with_proposal_extension_bound(256);
+        let epoch = committee.config.epoch();
+        let bases = vec![base(0, 0), base(1, 0)];
+        let blocks = vec![chain(epoch, bases[0], 1), chain(epoch, bases[1], 1)];
+        let parent = digest(b"prefix parent", 0);
+        let expected = [blocks[1][0].reference(), blocks[0][0].reference()];
+        let subject = if wrong_parent {
+            digest(b"other parent", 0)
+        } else {
+            parent
+        };
+        let prefix = if missing { base(1, 99) } else { expected[0] };
+        let record = Arc::new(
+            TipRecord::at_tips(parent, vec![tip(&blocks[0]), tip(&blocks[1])])
+                .unwrap()
+                .with_proposal_extension(Some(Some((subject, prefix)).encode()), codec)
+                .unwrap(),
+        );
+        let mut emitted = bases.clone();
+        for reference in &expected[..published] {
+            emitted[reference.chain().index()] = *reference;
+        }
+        let mut actor = actor(
+            &context,
+            checkpoint(epoch, parent, bases, emitted),
+            blocks,
+            codec,
+            1,
+        )
+        .await;
+        actor.ordering = Some(crate::multimmit::marshal::ordering::policy(
+            GuardedPrefix,
+            ((), ()),
+        ));
+        let link = HistoryLink {
+            commitment: record.commitment::<Sha256>(),
+            record,
+        };
+        if wrong_parent || missing {
+            let mut batch = PublicationBatch::new(1, 0);
+            assert!(matches!(
+                actor.open(link, &mut batch).await,
+                Err(Error::Extension(_))
+            ));
+            assert!(actor.catalog.outputs.is_empty());
+            assert!(batch.outputs.is_empty());
+        } else {
+            commit_opening(&mut actor, link).await;
+            assert_eq!(actor.catalog.outputs, expected[published..]);
+        }
+    });
+}
 
 impl FinalOrdering<Sha256Digest, bool> for Directed {
     fn order(&self, context: &OrderingContext<Sha256Digest, bool>) -> Vec<BlockRef<Sha256Digest>> {
@@ -211,6 +405,7 @@ fn receives_the_same_certified_prefixes_after_partial_publication(#[case] publis
             vec![Snapshot {
                 epoch,
                 history: commitment,
+                parent_history: parent,
                 base: bases,
                 prefixes: blocks
                     .iter()

@@ -1,276 +1,25 @@
+pub use crate::simplex::phase2::aggregation::Batch;
 use crate::{
     simplex::{
+        phase2::{
+            Plain,
+            aggregation::{Aggregation, Certification, FinalBuffer},
+        },
         scheme::Scheme,
         types::{
-            Certificate, Finalization, Kind, Notarization, Notarize, Nullification, Proposal,
-            Subject, Vote,
+            CertificateWith, Kind, Notarization, Notarize, Nullification, Proposal, Subject,
+            VoteWith,
         },
     },
     types::{Attributable, Participant, Round as Rnd},
 };
-use commonware_cryptography::{
-    Digest,
-    certificate::{Attestation, Scheme as CertificateScheme},
-};
+use commonware_cryptography::Digest;
 use commonware_parallel::Strategy;
 use commonware_runtime::telemetry::traces::TracedExt as _;
-use commonware_utils::{non_empty, ordered::Set};
-use rand::rngs::StdRng;
-use rand_core::{CryptoRng, SeedableRng};
-use std::{future::Future, mem, sync::Arc};
-use tracing::{Instrument as _, Span, info_span};
-
-/// Runs a CPU-bound job through [Strategy::spawn], entering `span` on the worker thread and
-/// instrumenting the returned future so the offloaded work stays attributed to the caller's trace.
-fn offload<P, F, T>(len: usize, span: Span, strategy: &P, job: F) -> impl Future<Output = T> + Send
-where
-    P: Strategy,
-    F: FnOnce(P) -> T + Send + 'static,
-    T: Send + 'static,
-{
-    let worker_span = span.clone();
-    strategy
-        .spawn(len, move |strategy| worker_span.in_scope(|| job(strategy)))
-        .instrument(span)
-}
-
-/// The outcome of processing one vote kind.
-pub struct Batch<C> {
-    /// Pending votes processed, whether individually or through a certificate.
-    pub processed: usize,
-    /// Signers identified as invalid by attestation verification.
-    ///
-    /// An empty result does not mean every input vote was individually verified:
-    /// successful optimistic assembly returns no per-vote results.
-    pub invalid: Vec<Participant>,
-    /// A certificate authenticated from the buffered votes.
-    pub certificate: Option<C>,
-    /// Whether `optimistic_assemble` returned pending attestation verification results.
-    pub fallback: bool,
-}
-
-/// Certification progress for one kind of vote.
-///
-/// Each kind certifies independently: a view can legitimately certify both
-/// a notarization and a nullification.
-struct Certification<C, S: CertificateScheme> {
-    /// Votes required to construct a certificate.
-    quorum: usize,
-    /// Progress toward a certificate.
-    state: State<C, S>,
-}
-
-/// The state of a [Certification].
-enum State<C, S: CertificateScheme> {
-    /// No certificate yet. Votes accumulate toward a quorum.
-    Incomplete {
-        /// Votes awaiting signature verification.
-        pending: Vec<(C, Attestation<S>)>,
-        /// Votes with verified signatures, held for certificate construction.
-        verified: Vec<(C, Attestation<S>)>,
-    },
-    /// A certificate exists. Further votes are dropped.
-    Complete,
-}
-
-impl<C, S: CertificateScheme> Certification<C, S> {
-    /// Creates an empty [State::Incomplete] whose vote buffers allocate lazily.
-    const fn new(quorum: usize) -> Self {
-        Self {
-            quorum,
-            state: State::Incomplete {
-                pending: Vec::new(),
-                verified: Vec::new(),
-            },
-        }
-    }
-
-    /// Buffers a vote for verification (or, if already verified, for
-    /// certificate construction). The caller owns signer uniqueness. Votes that
-    /// arrive after completion are dropped.
-    fn add(&mut self, context: C, attestation: Attestation<S>, is_verified: bool) {
-        let State::Incomplete { pending, verified } = &mut self.state else {
-            return;
-        };
-
-        // Verified votes may accumulate to quorum. A batchable pending buffer
-        // only needs the remaining unverified slots, while a non-batchable
-        // pending buffer is consumed after each vote.
-        let initial_capacity = if is_verified || S::is_batchable() {
-            self.quorum.saturating_sub(verified.len()).max(1)
-        } else {
-            1
-        };
-        let votes = if is_verified { verified } else { pending };
-        if votes.capacity() == 0 {
-            votes.reserve_exact(initial_capacity);
-        }
-        votes.push((context, attestation));
-    }
-
-    /// Whether an unfinished kind has a verified quorum, allowing construction
-    /// before proposal selection.
-    const fn has_constructable_quorum(&self) -> bool {
-        matches!(&self.state, State::Incomplete { verified, .. } if verified.len() >= self.quorum)
-    }
-
-    /// Whether to attempt construction: a verified quorum exists, or pending
-    /// votes exist and (for batchable schemes) the buffers together could reach one.
-    fn should_construct(&self) -> bool {
-        match &self.state {
-            State::Incomplete { pending, verified } => {
-                verified.len() >= self.quorum
-                    || (!pending.is_empty()
-                        && (!S::is_batchable() || verified.len() + pending.len() >= self.quorum))
-            }
-            State::Complete => false,
-        }
-    }
-
-    /// Processes pending votes and assembles any resulting quorum in one worker.
-    /// Pending verification requires one context, retained with every attestation so
-    /// proposal changes can filter both buffers. An existing verified quorum skips
-    /// pending votes and can complete before proposal selection.
-    async fn try_construct<R, D, F, G>(
-        &mut self,
-        scheme: &Arc<S>,
-        rng: &mut R,
-        strategy: &impl Strategy,
-        span: impl FnOnce() -> Span,
-        subject: F,
-        wrap: G,
-    ) -> Option<Batch<Certificate<S, D>>>
-    where
-        R: CryptoRng,
-        D: Digest,
-        S: Scheme<D>,
-        C: Clone + Send + Sync + 'static,
-        F: for<'a> Fn(&'a C) -> Subject<'a, D> + Send + 'static,
-        G: FnOnce(C, S::Certificate) -> Certificate<S, D> + Send + 'static,
-    {
-        if !self.should_construct() {
-            return None;
-        }
-        let State::Incomplete { pending, verified } = &mut self.state else {
-            unreachable!("complete certification cannot require construction");
-        };
-
-        // A verified quorum can construct the certificate without processing pending votes.
-        if verified.len() >= self.quorum {
-            pending.clear();
-        }
-
-        // Move the inputs into one worker for assembly and any fallback verification.
-        let processed = pending.len();
-        let len = processed + verified.len();
-        let quorum = self.quorum;
-        let (pending, mut verified) = (mem::take(pending), mem::take(verified));
-        let scheme = Arc::clone(scheme);
-        let mut rng = StdRng::from_rng(rng);
-        let (votes, result) = offload(len, span(), strategy, move |strategy| {
-            let context = verified
-                .first()
-                .or_else(|| pending.first())
-                .expect("construction attempt requires votes")
-                .0
-                .clone();
-
-            // A candidate quorum can authenticate the certificate without establishing
-            // individual vote validity. Failure returns verification results for pending votes.
-            // Below quorum, non-batchable schemes verify pending votes directly.
-            let (result, fallback) = if len >= quorum {
-                match scheme.optimistic_assemble::<_, D, _, _>(
-                    &mut rng,
-                    subject(&context),
-                    pending.into_iter().map(|(_, attestation)| attestation),
-                    verified.iter().map(|(_, attestation)| attestation),
-                    &strategy,
-                ) {
-                    Ok(certificate) => {
-                        return (
-                            Vec::new(),
-                            Batch {
-                                processed,
-                                invalid: Vec::new(),
-                                certificate: Some(wrap(context, certificate)),
-                                fallback: false,
-                            },
-                        );
-                    }
-                    Err(result) => (result, true),
-                }
-            } else {
-                (
-                    scheme.verify_attestations::<_, D, _>(
-                        &mut rng,
-                        subject(&context),
-                        pending.into_iter().map(|(_, attestation)| attestation),
-                        &strategy,
-                    ),
-                    false,
-                )
-            };
-
-            // A quorum of prior and newly verified votes must assemble. Otherwise retain
-            // them with their context so proposal changes can filter them.
-            let certificate = if verified.len() + result.verified.len() >= quorum {
-                let prior = verified.drain(..).map(|(_, attestation)| attestation);
-                let certificate = scheme
-                    .assemble(non_empty![@prior.chain(result.verified)], &strategy)
-                    .expect("verified quorum must assemble");
-                Some(wrap(context, certificate))
-            } else {
-                verified.extend(
-                    result
-                        .verified
-                        .into_iter()
-                        .map(|attestation| (context.clone(), attestation)),
-                );
-                None
-            };
-            (
-                verified,
-                Batch {
-                    processed,
-                    invalid: result.invalid,
-                    certificate,
-                    fallback,
-                },
-            )
-        })
-        .await;
-
-        // Only verified votes survive an incomplete attempt. A certificate completes
-        // this kind and releases its buffers.
-        if result.certificate.is_some() {
-            self.complete();
-        } else {
-            let State::Incomplete { verified, .. } = &mut self.state else {
-                unreachable!("certification completed mid-construction");
-            };
-            *verified = votes;
-        }
-        Some(result)
-    }
-
-    /// Completes, dropping all buffered votes.
-    fn complete(&mut self) {
-        self.state = State::Complete;
-    }
-
-    /// Returns true if a certificate exists.
-    const fn is_complete(&self) -> bool {
-        matches!(self.state, State::Complete)
-    }
-
-    /// Retains only the votes matching `f`.
-    fn retain(&mut self, f: impl Fn(&C) -> bool) {
-        if let State::Incomplete { pending, verified } = &mut self.state {
-            pending.retain(|(context, _)| f(context));
-            verified.retain(|(context, _)| f(context));
-        }
-    }
-}
+use commonware_utils::ordered::Set;
+use rand_core::CryptoRng;
+use std::sync::Arc;
+use tracing::info_span;
 
 /// How the selected proposal changed after an update.
 pub(super) struct ProposalUpdate {
@@ -339,7 +88,10 @@ impl<D: Digest> ProposalState<D> {
 /// [bls12381_multisig]: crate::simplex::scheme::bls12381_multisig
 /// [bls12381_threshold]: crate::simplex::scheme::bls12381_threshold
 /// [secp256r1]: crate::simplex::scheme::secp256r1
-pub struct Verifier<S: Scheme<D>, D: Digest> {
+pub type Verifier<S, D> = VerifierWith<S, D, Plain>;
+
+/// Native batcher verification with a statically selected final-vote accumulator.
+pub struct VerifierWith<S: Scheme<D>, D: Digest, M: Aggregation<S, D>> {
     /// Signing scheme used to verify votes and assemble certificates.
     scheme: Arc<S>,
 
@@ -361,22 +113,24 @@ pub struct Verifier<S: Scheme<D>, D: Digest> {
     /// Nullify certification progress.
     nullify: Certification<Rnd, S>,
     /// Finalize certification progress.
-    finalize: Certification<Proposal<D>, S>,
+    finalize: M::FinalBuffer,
 }
 
-impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
+impl<S: Scheme<D>, D: Digest, M: Aggregation<S, D>> VerifierWith<S, D, M> {
     /// Creates a new `Verifier`.
     ///
     /// # Arguments
     ///
     /// * `round` - The round being certified.
     /// * `scheme` - Scheme handle used to verify and aggregate votes.
-    /// * `quorum` - Number of votes (2f+1) required to reach a quorum.
+    /// * `quorum` - Native n-f quorum required for certificate assembly.
     pub fn new(round: Rnd, scheme: impl Into<Arc<S>>, quorum: u32) -> Self {
         // Hold quorum as usize to simplify comparisons against queue lengths.
         let quorum = quorum as usize;
+        let scheme = scheme.into();
+        let finalize = M::FinalBuffer::new(quorum, scheme.participants().len());
         Self {
-            scheme: scheme.into(),
+            scheme,
 
             round,
 
@@ -385,7 +139,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
 
             notarize: Certification::new(quorum),
             nullify: Certification::new(quorum),
-            finalize: Certification::new(quorum),
+            finalize,
         }
     }
 
@@ -405,7 +159,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
     }
 
     /// Returns true if a certificate of `kind` exists.
-    pub(super) const fn has_certificate(&self, kind: Kind) -> bool {
+    pub(super) fn has_certificate(&self, kind: Kind) -> bool {
         match kind {
             Kind::Notarization => self.notarize.is_complete(),
             Kind::Nullification => self.nullify.is_complete(),
@@ -450,21 +204,21 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
             };
         };
         self.notarize.retain(|context| context == proposal);
-        self.finalize.retain(|context| context == proposal);
+        self.finalize.retain_proposal(proposal);
         ProposalUpdate {
             changed: true,
             replaced,
         }
     }
 
-    /// Adds a [Vote] message to the batch for later verification.
+    /// Adds a [VoteWith] message to the batch for later verification.
     ///
     /// If the message has already been verified (e.g., we built it), it is stored
     /// directly for certificate recovery. Otherwise, it is added to the appropriate
     /// pending queue. Notarize and finalize votes for a proposal other than the
     /// known proposal are dropped since they cannot contribute to a certificate.
     ///
-    /// If a leader is known and the message is a [Vote::Notarize] from that leader,
+    /// If a leader is known and the message is a [VoteWith::Notarize] from that leader,
     /// this method may reveal the leader proposal.
     ///
     /// Callers must add at most one vote of each kind per signer. The batcher's
@@ -472,11 +226,12 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
     ///
     /// # Arguments
     ///
-    /// * `msg` - The [Vote] message to add.
+    /// * `msg` - The [VoteWith] message to add.
     /// * `verified` - A boolean indicating if the message has already been verified.
-    pub fn add(&mut self, msg: Vote<S, D>, verified: bool) {
+    pub fn add(&mut self, msg: VoteWith<S, D, M>, verified: bool) {
         match msg {
-            Vote::Notarize(notarize) => {
+            VoteWith::Notarize(notarize) => {
+                let notarize = M::into_notarize(notarize);
                 self.try_set_proposal_from_leader(&notarize);
 
                 // If the proposal is known and the message is not for it, drop it
@@ -488,19 +243,18 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                 self.notarize
                     .add(notarize.proposal, notarize.attestation, verified);
             }
-            Vote::Nullify(nullify) => {
+            VoteWith::Nullify(nullify) => {
                 self.nullify
                     .add(nullify.round, nullify.attestation, verified);
             }
-            Vote::Finalize(finalize) => {
+            VoteWith::Finalize(finalize) => {
                 // If the proposal is known and the message is not for it, drop it
                 if let Some(proposal) = self.proposal()
-                    && proposal != &finalize.proposal
+                    && proposal != M::finalize_proposal(&finalize)
                 {
                     return;
                 }
-                self.finalize
-                    .add(finalize.proposal, finalize.attestation, verified);
+                self.finalize.push(finalize, verified);
             }
         }
     }
@@ -535,7 +289,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
         &mut self,
         rng: &mut R,
         strategy: &impl Strategy,
-    ) -> Option<Batch<Certificate<S, D>>> {
+    ) -> Option<Batch<CertificateWith<S, D, M>>> {
         if matches!(self.proposal, ProposalState::Unknown)
             && !self.notarize.has_constructable_quorum()
         {
@@ -555,7 +309,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                 },
                 |proposal| Subject::Notarize { proposal },
                 |proposal, certificate| {
-                    Certificate::Notarization(Notarization {
+                    CertificateWith::Notarization(Notarization {
                         proposal,
                         certificate,
                     })
@@ -569,7 +323,7 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
         &mut self,
         rng: &mut R,
         strategy: &impl Strategy,
-    ) -> Option<Batch<Certificate<S, D>>> {
+    ) -> Option<Batch<CertificateWith<S, D, M>>> {
         self.nullify
             .try_construct(
                 &self.scheme,
@@ -584,44 +338,33 @@ impl<S: Scheme<D>, D: Digest> Verifier<S, D> {
                 },
                 |round| Subject::Nullify { round: *round },
                 |round, certificate| {
-                    Certificate::Nullification(Nullification { round, certificate })
+                    CertificateWith::Nullification(Nullification { round, certificate })
                 },
             )
             .await
     }
 
     /// Attempts to construct a finalization from buffered votes.
-    pub async fn try_construct_finalization<R: CryptoRng>(
+    pub async fn try_construct_finalization<R: CryptoRng + Send>(
         &mut self,
         rng: &mut R,
         strategy: &impl Strategy,
-    ) -> Option<Batch<Certificate<S, D>>> {
+    ) -> Option<Batch<CertificateWith<S, D, M>>> {
         if matches!(self.proposal, ProposalState::Unknown)
             && !self.finalize.has_constructable_quorum()
         {
             return None;
         }
-        self.finalize
-            .try_construct(
-                &self.scheme,
-                rng,
-                strategy,
-                || {
-                    info_span!(
-                        "simplex.batcher.construct.finalization",
-                        epoch = self.round.epoch().traced(),
-                        view = self.round.view().traced(),
-                    )
-                },
-                |proposal| Subject::Finalize { proposal },
-                |proposal, certificate| {
-                    Certificate::Finalization(Finalization {
-                        proposal,
-                        certificate,
-                    })
-                },
-            )
-            .await
+        let batch = self
+            .finalize
+            .construct(&self.scheme, self.round, rng, strategy)
+            .await?;
+        Some(Batch {
+            processed: batch.processed,
+            invalid: batch.invalid,
+            certificate: batch.certificate.map(CertificateWith::Finalization),
+            fallback: batch.fallback,
+        })
     }
 }
 
@@ -631,6 +374,7 @@ mod tests {
     use crate::{
         simplex::{
             mocks::wrapped,
+            phase2::aggregation::State,
             scheme::{
                 bls12381_multisig,
                 bls12381_threshold::{
@@ -638,13 +382,13 @@ mod tests {
                 },
                 ed25519, secp256r1,
             },
-            types::{Finalize, Nullify},
+            types::{Certificate, Finalize, Nullify, Vote},
         },
         types::{Epoch, Round, View},
     };
     use commonware_cryptography::{
         bls12381::primitives::variant::{MinPk, MinSig},
-        certificate::mocks::Fixture,
+        certificate::{Attestation, Scheme as CertificateScheme, mocks::Fixture},
         ed25519::PublicKey,
         sha256::Digest as Sha256,
     };

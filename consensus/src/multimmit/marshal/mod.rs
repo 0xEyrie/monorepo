@@ -105,7 +105,7 @@ pub use config::{
 };
 pub use mailbox::Mailbox;
 pub use open::OpenError;
-pub use ordering::{Ordering, OrderingContext};
+pub use ordering::{MAX_ORDERING_BLOCKS, Ordering, OrderingContext};
 #[cfg(any(test, feature = "mocks"))]
 pub(crate) use protocol::fuzz;
 pub use relay::Relay;

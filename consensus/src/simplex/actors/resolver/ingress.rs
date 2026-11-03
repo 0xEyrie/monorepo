@@ -2,7 +2,8 @@ use crate::{
     Epochable, Viewable,
     simplex::{
         actors::{Ask, Kind},
-        types::Certificate,
+        phase2::{Mode, Plain},
+        types::CertificateWith,
     },
     types::View,
 };
@@ -16,13 +17,13 @@ use std::collections::VecDeque;
 use tracing::{Span, info_span};
 
 /// Messages sent to the resolver actor from the voter.
-pub enum MailboxMessage<S: Scheme, D: Digest> {
+pub enum MailboxMessage<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
     /// A certificate was received or produced.
     Certificate {
         /// The span carried with this message.
         span: Span,
         /// The certificate.
-        certificate: Certificate<S, D>,
+        certificate: CertificateWith<S, D, M>,
     },
     /// Certification result for a view.
     Certified {
@@ -48,7 +49,7 @@ pub enum MailboxMessage<S: Scheme, D: Digest> {
     },
 }
 
-impl<S: Scheme, D: Digest> MailboxMessage<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> MailboxMessage<S, D, M> {
     /// Returns the message view used for pruning and deduplication.
     pub(crate) fn view(&self) -> View {
         match self {
@@ -78,12 +79,12 @@ impl<S: Scheme, D: Digest> MailboxMessage<S, D> {
 }
 
 /// Pending resolver messages retained after the mailbox fills.
-pub struct Pending<S: Scheme, D: Digest> {
-    finalization: Option<MailboxMessage<S, D>>,
-    messages: VecDeque<MailboxMessage<S, D>>,
+pub struct Pending<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
+    finalization: Option<MailboxMessage<S, D, M>>,
+    messages: VecDeque<MailboxMessage<S, D, M>>,
 }
 
-impl<S: Scheme, D: Digest> Default for Pending<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Default for Pending<S, D, M> {
     fn default() -> Self {
         Self {
             finalization: None,
@@ -92,14 +93,14 @@ impl<S: Scheme, D: Digest> Default for Pending<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Overflow<MailboxMessage<S, D>> for Pending<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Overflow<MailboxMessage<S, D, M>> for Pending<S, D, M> {
     fn is_empty(&self) -> bool {
         self.finalization.is_none() && self.messages.is_empty()
     }
 
     fn drain<F>(&mut self, mut push: F)
     where
-        F: FnMut(MailboxMessage<S, D>) -> Option<MailboxMessage<S, D>>,
+        F: FnMut(MailboxMessage<S, D, M>) -> Option<MailboxMessage<S, D, M>>,
     {
         if let Some(finalization) = self.finalization.take()
             && let Some(finalization) = push(finalization)
@@ -117,8 +118,8 @@ impl<S: Scheme, D: Digest> Overflow<MailboxMessage<S, D>> for Pending<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Policy for MailboxMessage<S, D> {
-    type Overflow = Pending<S, D>;
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Policy for MailboxMessage<S, D, M> {
+    type Overflow = Pending<S, D, M>;
 
     fn handle(overflow: &mut Self::Overflow, message: Self) {
         // Ignore the message if there exists a queued finalization
@@ -126,7 +127,7 @@ impl<S: Scheme, D: Digest> Policy for MailboxMessage<S, D> {
         let new_view = message.view();
         if matches!(
             overflow.finalization.as_ref(),
-            Some(Self::Certificate { certificate: Certificate::Finalization(old_finalized), .. })
+            Some(Self::Certificate { certificate: CertificateWith::Finalization(old_finalized), .. })
                 if old_finalized.view() >= new_view
         ) {
             return;
@@ -136,7 +137,7 @@ impl<S: Scheme, D: Digest> Policy for MailboxMessage<S, D> {
         if matches!(
             &message,
             Self::Certificate {
-                certificate: Certificate::Finalization(_),
+                certificate: CertificateWith::Finalization(_),
                 ..
             }
         ) {
@@ -168,9 +169,16 @@ impl<S: Scheme, D: Digest> Policy for MailboxMessage<S, D> {
                     new_certificate.view() == old_certificate.view()
                         && matches!(
                             (new_certificate, old_certificate),
-                            (Certificate::Notarization(_), Certificate::Notarization(_))
-                                | (Certificate::Nullification(_), Certificate::Nullification(_))
-                                | (Certificate::Finalization(_), Certificate::Finalization(_))
+                            (
+                                CertificateWith::Notarization(_),
+                                CertificateWith::Notarization(_)
+                            ) | (
+                                CertificateWith::Nullification(_),
+                                CertificateWith::Nullification(_)
+                            ) | (
+                                CertificateWith::Finalization(_),
+                                CertificateWith::Finalization(_)
+                            )
                         )
                 }
                 (
@@ -211,18 +219,18 @@ impl<S: Scheme, D: Digest> Policy for MailboxMessage<S, D> {
 }
 
 #[derive(Clone)]
-pub struct Mailbox<S: Scheme, D: Digest> {
-    sender: Sender<MailboxMessage<S, D>>,
+pub struct Mailbox<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
+    sender: Sender<MailboxMessage<S, D, M>>,
 }
 
-impl<S: Scheme, D: Digest> Mailbox<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Mailbox<S, D, M> {
     /// Create a new mailbox.
-    pub const fn new(sender: Sender<MailboxMessage<S, D>>) -> Self {
+    pub const fn new(sender: Sender<MailboxMessage<S, D, M>>) -> Self {
         Self { sender }
     }
 
     /// Send a certificate.
-    pub fn updated(&mut self, certificate: Certificate<S, D>) {
+    pub fn updated(&mut self, certificate: CertificateWith<S, D, M>) {
         let _ = self.sender.enqueue(MailboxMessage::Certificate {
             span: info_span!(
                 "simplex.resolver.mailbox.updated",

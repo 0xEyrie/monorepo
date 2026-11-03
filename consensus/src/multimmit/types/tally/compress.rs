@@ -43,7 +43,10 @@ impl<D: Digest> Tally<D> {
         {
             return Err(Error::Participants);
         }
-        if votes.iter().any(|(_, body)| !body.valid_for(leader)) {
+        if votes
+            .iter()
+            .any(|(_, body)| !body.valid_for(leader) || body.validate(config).is_err())
+        {
             return Err(Error::Transcript);
         }
 
@@ -89,6 +92,10 @@ impl<D: Digest> Tally<D> {
             signers,
             deviations,
             extension_paths,
+            applications: votes
+                .iter()
+                .map(|(_, body)| body.application().clone())
+                .collect(),
         })
     }
 }

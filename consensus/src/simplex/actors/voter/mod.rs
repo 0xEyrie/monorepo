@@ -1,15 +1,23 @@
 mod actor;
 mod ingress;
+pub(crate) mod participation;
 mod round;
 mod slot;
 mod state;
 
 use crate::{
     CertifiableAutomaton, Relay, Reporter,
-    simplex::{Floor, Plan, elector::Elector, types::Activity},
+    simplex::{
+        FloorWith, Plan,
+        elector::Elector,
+        phase2::{Mode, Plain},
+        types::ActivityWith,
+    },
     types::{Epoch, ViewDelta},
 };
+#[cfg(test)]
 pub use actor::Actor;
+pub use actor::ActorWith;
 use commonware_cryptography::{Digest, certificate::Scheme};
 use commonware_p2p::Blocker;
 use commonware_runtime::buffer::paged::CacheRef;
@@ -17,6 +25,8 @@ use core::num::NonZeroUsize;
 pub use ingress::Mailbox;
 #[cfg(test)]
 pub use ingress::Message;
+pub use round::{Round as VoterRound, RoundWith};
+pub use state::{Config as StateConfig, StateWith};
 use std::time::Duration;
 
 pub struct Config<
@@ -26,7 +36,8 @@ pub struct Config<
     D: Digest,
     A: CertifiableAutomaton,
     R: Relay<Digest = D, PublicKey = S::PublicKey, Plan = Plan<S::PublicKey>>,
-    F: Reporter<Activity = Activity<S, D>>,
+    F: Reporter<Activity = ActivityWith<S, D, M>>,
+    M: Mode<S, D> = Plain,
 > {
     pub scheme: S,
     pub elector: L,
@@ -37,7 +48,7 @@ pub struct Config<
 
     pub partition: String,
     pub epoch: Epoch,
-    pub floor: Floor<S, D>,
+    pub floor: FloorWith<S, D, M>,
     pub mailbox_size: NonZeroUsize,
     pub leader_timeout: Duration,
     pub certification_timeout: Duration,
@@ -55,6 +66,7 @@ mod tests {
     use crate::{
         Viewable,
         simplex::{
+            Floor,
             actors::{
                 batcher,
                 resolver::{self, MailboxMessage},

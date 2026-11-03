@@ -1,13 +1,14 @@
-use super::{super::Kind, round::Round};
+use super::{super::Kind, round::RoundWith};
 use crate::{
     Viewable,
     simplex::{
-        Floor, Lookahead, Viewport,
+        FloorWith, Lookahead, Viewport,
         elector::Elector,
         metrics::{Leader, Timeout, TimeoutReason},
+        phase2::{Plain, voting::Voting},
         scheme::Scheme,
         types::{
-            Artifact, Certificate, Context, Finalization, Finalize, Notarization, Notarize,
+            ArtifactWith, CertificateWith, Context, Finalize, Notarization, Notarize,
             Nullification, Nullify, Proposal,
         },
     },
@@ -83,7 +84,7 @@ impl ParentPayloadError {
 }
 
 /// Outcome of [State::try_verify].
-pub enum Verify<S: Scheme<D>, D: Digest> {
+pub(crate) enum Verify<S: Scheme<D>, D: Digest> {
     Ready(Context<D, S::PublicKey>, Proposal<D>),
     Resolve {
         proposal: View,
@@ -119,7 +120,20 @@ pub struct Config<S: certificate::Scheme, L: Elector<S>> {
 ///
 /// Tracks proposals and certificates for each view. Vote aggregation and verification
 /// is handled by the [crate::simplex::actors::batcher].
-pub struct State<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> {
+#[cfg(test)]
+pub type State<E, S, L, D> = StateWith<E, S, L, D, Plain>;
+
+/// Native epoch state retaining mode-specific final decisions and certificates.
+/// Certificate intake requires authenticated application and ancestry checks by
+/// the actor before calling `add_finalization`.
+pub struct StateWith<
+    E: Clock + CryptoRng + Metrics,
+    S: Scheme<D>,
+    L: Elector<S>,
+    D: Digest,
+    M: Voting<S, D>,
+> {
+    mode_context: M::Context,
     context: E,
     scheme: S,
     elector: L,
@@ -135,7 +149,8 @@ pub struct State<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D:
     view: View,
     last_finalized: View,
     genesis: Option<D>,
-    views: BTreeMap<View, Round<S, D>>,
+    views: BTreeMap<View, RoundWith<S, D, M>>,
+    recovered: BTreeMap<View, M::Recovered>,
 
     /// Monotone cursor for the oldest entered, unfinalized view (the anchor of
     /// the stall timeout). See [`Self::next_stall_timeout`].
@@ -168,7 +183,9 @@ pub struct State<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D:
     nullifications: CounterFamily<Leader<S::PublicKey>>,
 }
 
-impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> State<E, S, L, D> {
+impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: Voting<S, D>>
+    StateWith<E, S, L, D, M>
+{
     /// Returns true when `view` is within the optimistic *issuance* window:
     /// a directly-notarized anchor exists and `view` sits at most
     /// `optimistic_views` hops above the anchor's child (see
@@ -214,7 +231,8 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         self.views.range(from..).next().map(|(&view, _)| view)
     }
 
-    pub fn new(context: E, cfg: Config<S, L>) -> Self {
+    /// Constructs an epoch state with trusted mode-specific deployment context.
+    pub fn new_with(context: E, cfg: Config<S, L>, mode_context: M::Context) -> Self {
         let current_view = context.gauge("current_view", "current view");
         let tracked_views = context.gauge("tracked_views", "tracked views");
         let issuance_window_probes = context.counter(
@@ -226,6 +244,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
 
         let lookahead = Lookahead::new(&cfg.elector.terms());
         Self {
+            mode_context,
             context,
             scheme: cfg.scheme,
             elector: cfg.elector,
@@ -240,6 +259,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
             last_finalized: GENESIS_VIEW,
             genesis: None,
             views: BTreeMap::new(),
+            recovered: BTreeMap::new(),
             stall_anchor: GENESIS_VIEW,
             nullify_views: BTreeSet::new(),
             nullification_views: BTreeSet::new(),
@@ -262,18 +282,32 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     }
 
     /// Seeds the state machine from the configured floor.
-    pub fn set_floor(&mut self, floor: Floor<S, D>) -> Option<Finalization<S, D>> {
+    pub fn set_floor(&mut self, floor: FloorWith<S, D, M>) -> Option<M::Certificate> {
         match floor {
-            Floor::Genesis(genesis) => {
+            FloorWith::Genesis(genesis) => {
                 self.set_genesis(genesis);
                 None
             }
-            Floor::Finalized(finalization) => {
+            FloorWith::Finalized(finalization) => {
+                assert!(
+                    M::matches_context(&self.mode_context, &M::finalization_subject(&finalization)),
+                    "floor belongs to another interpretation domain"
+                );
                 let returned = finalization.clone();
                 self.add_finalization(finalization);
                 Some(returned)
             }
         }
+    }
+
+    /// Signs an already synchronized recovery decision; the actor owns the durability barrier.
+    pub fn sign_recovery(&self, record: &M::Recovery) -> Option<M::RecoveryResponse> {
+        M::sign_recovery(&self.scheme, &self.mode_context, record)
+    }
+
+    /// Trusted interpretation context fixed when this epoch state was created.
+    pub const fn interpretation_context(&self) -> &M::Context {
+        &self.mode_context
     }
 
     /// Returns the epoch managed by this state machine.
@@ -387,10 +421,10 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     }
 
     /// Ensures a round exists for the given view.
-    fn create_round(&mut self, view: View) -> &mut Round<S, D> {
+    fn create_round(&mut self, view: View) -> &mut RoundWith<S, D, M> {
         self.views
             .entry(view)
-            .or_insert_with(|| Round::new(self.scheme.clone(), Rnd::new(self.epoch, view)))
+            .or_insert_with(|| RoundWith::new(self.scheme.clone(), Rnd::new(self.epoch, view)))
     }
 
     /// Returns the root span for `view`, or a disabled span if the view is not
@@ -424,7 +458,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         let allow_latched_timeout = self.has_skip_budget();
         let round_timeout = {
             // The current round always has a pending timeout:
-            // `Round::next_timeout` only returns `None` for rounds that are
+            // `RoundWith::next_timeout` only returns `None` for rounds that are
             // finalized, broadcast a finalize, or are certified with a
             // proposal, and `certified` and `add_finalization` enter the next
             // view before a round reaches any of those states.
@@ -530,7 +564,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     /// The nullification is what proves the skipped views were abandoned, which
     /// is the evidence peers need to align on the same fork and enter the new
     /// term without timing out again while searching for skipped-view evidence.
-    pub fn get_best_certificate(&self) -> Option<Certificate<S, D>> {
+    pub fn get_best_certificate(&self) -> Option<CertificateWith<S, D, M>> {
         let prev = self
             .view
             .previous()
@@ -543,7 +577,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
 
         // Check if there was a finalization in the previous view
         if let Some(finalization) = self.finalization(prev).cloned() {
-            return Some(Certificate::Finalization(finalization));
+            return Some(CertificateWith::Finalization(finalization));
         }
 
         // At a term boundary, prefer the highest nullification from the previous
@@ -553,12 +587,12 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
                 .highest_nullification_in_term(prev)
                 .and_then(|v| self.nullification(v).cloned())
         {
-            return Some(Certificate::Nullification(nullification));
+            return Some(CertificateWith::Nullification(nullification));
         }
 
         // Check if there was a notarization in the previous view
         if let Some(notarization) = self.notarization(prev).cloned() {
-            return Some(Certificate::Notarization(notarization));
+            return Some(CertificateWith::Notarization(notarization));
         }
 
         warn!(%prev, "entry certificate not found");
@@ -620,8 +654,13 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     /// Inserts a finalization certificate, updates the finalized height, and advances the view.
     pub fn add_finalization(
         &mut self,
-        finalization: Finalization<S, D>,
+        finalization: M::Certificate,
     ) -> (bool, Option<S::PublicKey>) {
+        if !M::matches_context(&self.mode_context, &M::finalization_subject(&finalization))
+            || !self.matches_recovered(finalization.view(), &M::finalization_subject(&finalization))
+        {
+            return (false, None);
+        }
         let view = finalization.view();
         if view > self.last_finalized {
             self.last_finalized = view;
@@ -644,7 +683,10 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         }
 
         self.enter_view(view.next());
-        self.set_leader(view.next(), Some(&finalization.certificate));
+        self.set_leader(
+            view.next(),
+            Some(M::finalization_certificate(&finalization)),
+        );
         let result = self.create_round(view).add_finalization(finalization);
         if result.0 {
             self.wake_certification_child(view);
@@ -705,6 +747,113 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         Notarize::sign(&self.scheme, candidate)
     }
 
+    /// Proposal retained by a native tracked round.
+    pub(crate) fn proposal(&self, view: View) -> Option<&Proposal<D>> {
+        self.views.get(&view)?.proposal()
+    }
+
+    /// Tracked children that may become eligible after an interpretation arrives.
+    pub(crate) fn interpretation_children(&self, parent: View) -> Vec<View> {
+        if !M::REQUIRE_PARENT_INTERPRETATION {
+            return Vec::new();
+        }
+        self.views
+            .range(self.last_finalized.next()..)
+            .filter_map(|(view, round)| {
+                round
+                    .proposal()
+                    .filter(|p| p.parent == parent)
+                    .map(|_| *view)
+            })
+            .collect()
+    }
+
+    /// Retained later-ballot parent witness. Its presence does not imply finality.
+    pub fn recovered_interpretation(&self, view: View) -> Option<&M::Recovered> {
+        self.recovered.get(&view)
+    }
+
+    fn matches_recovered(&self, view: View, subject: &M::FinalSubject) -> bool {
+        self.recovered.get(&view).is_none_or(|certificate| {
+            M::same_interpretation(&M::recovered_subject(certificate), subject)
+        })
+    }
+
+    /// Stages an authenticated interpretation without advancing native view or finality.
+    /// Some(true) needs journal sync before ACK or dependent voting; Some(false)
+    /// is an idempotent value already retained. None rejects the witness.
+    /// Historical backfill below finality is not supported by this live gate.
+    pub fn stage_recovered(
+        &mut self,
+        certificate: M::Recovered,
+        accepts: impl FnOnce(&M::Recovered) -> bool,
+    ) -> Option<bool> {
+        let proposal = M::recovered_proposal(&certificate);
+        let view = proposal.view();
+        let subject = M::recovered_subject(&certificate);
+        if proposal.round.epoch() != self.epoch
+            || !M::matches_context(&self.mode_context, &subject)
+            || !self.matches_recovered(view, &subject)
+            || !M::verify_recovered(
+                &certificate,
+                &mut self.context,
+                &self.scheme,
+                &commonware_parallel::Sequential,
+            )
+        {
+            return None;
+        }
+        if self.recovered.contains_key(&view) {
+            return accepts(&certificate).then_some(false);
+        }
+        if view <= self.last_finalized
+            || self
+                .notarization(view)
+                .is_none_or(|n| n.proposal != *proposal)
+            || !self.views.get(&view).is_some_and(|r| r.is_certified())
+            || self.parent_payload(proposal).is_err()
+            || !M::matches_parent(
+                &self.mode_context,
+                &subject,
+                self.finalization(proposal.parent),
+                self.recovered.get(&proposal.parent),
+                proposal.parent == GENESIS_VIEW && self.genesis.is_some(),
+            )
+            || !accepts(&certificate)
+        {
+            return None;
+        }
+        self.recovered.insert(view, certificate);
+        Some(true)
+    }
+
+    /// Ancestry and exact parent binding for an authenticated original QC.
+    ///
+    /// Quorum finality settles the proposal's intermediate nullifications, which
+    /// the resolver may already have retired. It does not supply the retained
+    /// parent interpretation or application evidence. Local vote construction
+    /// still uses the full proposal-admission checks in `parent_payload`.
+    pub(crate) fn accepts_finalization_parent(&self, certificate: &M::Certificate) -> bool {
+        if !M::REQUIRE_PARENT_INTERPRETATION {
+            return true;
+        }
+        let proposal = M::finalization_proposal(certificate);
+        let subject = M::finalization_subject(certificate);
+        proposal.round.epoch() == self.epoch
+            && M::matches_context(&self.mode_context, &subject)
+            && M::matches_subject(proposal, &subject)
+            && self.matches_recovered(proposal.view(), &subject)
+            && self.validate_parent_structure(proposal).is_ok()
+            && self.explicit_ancestry_payload(proposal.parent).is_some()
+            && M::matches_parent(
+                &self.mode_context,
+                &subject,
+                self.finalization(proposal.parent),
+                self.recovered.get(&proposal.parent),
+                proposal.parent == GENESIS_VIEW && self.genesis.is_some(),
+            )
+    }
+
     /// Construct a finalize vote if the round provides a candidate and it is safe to do so.
     ///
     /// The term safety rule applies: a prior same-term nullify vote blocks the
@@ -713,7 +862,11 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     ///
     /// Indirect notarization can make a view usable as ancestry, but does not
     /// replace the local certification requirement for finalization.
-    pub fn construct_finalize(&mut self, view: View) -> Option<Finalize<S, D>> {
+    pub fn construct_finalize_with(
+        &mut self,
+        view: View,
+        subject: M::FinalSubject,
+    ) -> Option<M::Vote> {
         // We don't need to finalize views that are already finalized.
         if view <= self.last_finalized {
             return None;
@@ -745,11 +898,38 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         if !self.explicit_parent_ready(view) {
             return None;
         }
-        let candidate = self.views.get_mut(&view)?.construct_finalize()?.clone();
+        let proposal = self.views.get(&view)?.proposal()?;
+        if !M::matches_context(&self.mode_context, &subject)
+            || !M::matches_subject(proposal, &subject)
+            || !self.matches_recovered(view, &subject)
+        {
+            return None;
+        }
+        if M::REQUIRE_PARENT_INTERPRETATION {
+            if proposal.round.epoch() != self.epoch {
+                return None;
+            }
+            self.parent_payload(proposal).ok()?;
+            let genesis = proposal.parent == GENESIS_VIEW && self.genesis.is_some();
+            if !M::matches_parent(
+                &self.mode_context,
+                &subject,
+                self.finalization(proposal.parent),
+                self.recovered.get(&proposal.parent),
+                genesis,
+            ) {
+                return None;
+            }
+        }
+        let candidate = self
+            .views
+            .get_mut(&view)?
+            .construct_finalize_with(subject.clone())?
+            .clone();
 
         // Signing can only fail if we are a verifier, so we don't need to worry about
         // unwinding our broadcast toggle.
-        Finalize::sign(&self.scheme, candidate)
+        M::sign_finalize(&self.scheme, candidate, subject)
     }
 
     /// Construct a notarization certificate once the round has quorum.
@@ -772,12 +952,12 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     }
 
     /// Return a finalization certificate, if one exists.
-    pub fn finalization(&self, view: View) -> Option<&Finalization<S, D>> {
+    pub fn finalization(&self, view: View) -> Option<&M::Certificate> {
         self.views.get(&view).and_then(|round| round.finalization())
     }
 
     /// Returns the proposal for `view` if it is eligible for forwarding
-    /// (see [`Round::forwardable_proposal`]).
+    /// (see [`RoundWith::forwardable_proposal`]).
     pub fn forwardable_proposal(&self, view: View) -> Option<Proposal<D>> {
         self.views.get(&view)?.forwardable_proposal().cloned()
     }
@@ -790,7 +970,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     }
 
     /// Construct a finalization certificate once the round has quorum.
-    pub fn broadcast_finalization(&mut self, view: View) -> Option<Finalization<S, D>> {
+    pub fn broadcast_finalization(&mut self, view: View) -> Option<M::Certificate> {
         self.views
             .get_mut(&view)
             .and_then(|round| round.broadcast_finalization())
@@ -798,7 +978,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
 
     /// Replays a journaled artifact into the appropriate round during recovery.
     ///
-    /// Restores round-level broadcast flags (via [`Round::replay`]) and
+    /// Restores round-level broadcast flags (via [`RoundWith::replay`]) and
     /// tracking sets (`nullify_views`, `nullification_views`, and
     /// `failed_certifications`) so that term-safety and ancestry checks work
     /// correctly after a restart. Replaying a local notarize vote also restores
@@ -806,20 +986,39 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     /// [`Self::add_nullification`] (which the actor's replay loop also calls,
     /// making the `nullification_views` insert idempotent on that path), this
     /// never advances the view.
-    pub fn replay(&mut self, artifact: &Artifact<S, D>) {
-        if let Artifact::Nullify(n) = artifact {
+    pub fn replay(&mut self, artifact: &ArtifactWith<S, D, M>) {
+        if let ArtifactWith::Recovered(certificate) = artifact {
+            assert!(
+                self.stage_recovered(certificate.clone(), |_| true)
+                    .is_some(),
+                "invalid recovered interpretation on replay"
+            );
+        }
+        if let ArtifactWith::Recovery(record) = artifact {
+            assert!(
+                M::recovery_context(&self.mode_context, record),
+                "replayed recovery decision belongs to another interpretation domain"
+            );
+        }
+        if let ArtifactWith::Finalize(vote) = artifact {
+            assert!(
+                M::matches_context(&self.mode_context, &M::final_subject(vote)),
+                "replayed final vote belongs to another interpretation domain"
+            );
+        }
+        if let ArtifactWith::Nullify(n) = artifact {
             self.nullify_views.insert(n.view());
         }
-        if let Artifact::Nullification(n) = artifact {
+        if let ArtifactWith::Nullification(n) = artifact {
             self.nullification_views.insert(n.view());
         }
-        if matches!(artifact, Artifact::Certification(_, false))
+        if matches!(artifact, ArtifactWith::Certification(_, false))
             && artifact.view() > self.last_finalized
         {
             self.failed_certifications.insert(artifact.view());
         }
         self.create_round(artifact.view()).replay(artifact);
-        if matches!(artifact, Artifact::Notarize(_)) {
+        if matches!(artifact, ArtifactWith::Notarize(_)) {
             self.prepare_optimistic_successor(artifact.view());
         }
     }
@@ -832,7 +1031,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     }
 
     /// Returns how long ago the local node started work on `view` (see
-    /// [`Round::elapsed_since_start`]), or None if the view is untracked or
+    /// [`RoundWith::elapsed_since_start`]), or None if the view is untracked or
     /// was never started.
     pub fn elapsed_since_start(&self, view: View) -> Option<Duration> {
         let now = self.context.current();
@@ -849,7 +1048,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     /// retry schedule.
     ///
     /// This only latches the first timeout for the view (see
-    /// [`Round::latch_timeout`]); the latched reason is delivered back through
+    /// [`RoundWith::latch_timeout`]); the latched reason is delivered back through
     /// [`Self::next_timeout`] when the timeout fires.
     ///
     /// [`Self::next_timeout`] only polls the current round, so views already
@@ -976,7 +1175,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     ///
     /// Missing ancestry is requested from the proposal's elected leader
     /// (see [`Self::resolve_ancestry`] for when an error justifies a fetch).
-    pub fn try_verify(&mut self) -> Verify<S, D> {
+    pub(crate) fn try_verify(&mut self) -> Verify<S, D> {
         // Bound the scan as in [`Self::try_propose`].
         // Ascending order gives the current view precedence over optimistic work.
         let limit = self.view.next_term_start(self.term_length());
@@ -1119,10 +1318,10 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         let child = parent.next();
         if self.previous_in_term(child) != Some(parent)
             || child <= self.last_finalized
-            || !self
+            || self
                 .views
                 .get(&child)
-                .is_some_and(|round| round.notarization().is_some())
+                .is_none_or(|round| round.notarization().is_none())
         {
             return;
         }
@@ -1257,6 +1456,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         let min = self.min_active();
         let kept = self.views.split_off(&min);
         let removed = replace(&mut self.views, kept).into_keys().collect();
+        self.recovered = self.recovered.split_off(&min);
         self.nullification_views = self.nullification_views.split_off(&min);
         self.nullify_views = self.nullify_views.split_off(&min);
 
@@ -1566,8 +1766,8 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
         Ok(())
     }
 
-    /// Validates the structural link between a proposal and its parent view.
-    fn validate_parent_span(&self, proposal: &Proposal<D>) -> Result<(), ParentPayloadError> {
+    /// Validates the structural link independently of retained voting evidence.
+    fn validate_parent_structure(&self, proposal: &Proposal<D>) -> Result<(), ParentPayloadError> {
         let (view, parent) = (proposal.view(), proposal.parent);
         Self::ensure_parent_precedes(view, parent)?;
 
@@ -1588,6 +1788,14 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
             });
         }
 
+        Ok(())
+    }
+
+    /// Validates a proposal's parent link and the evidence required to vote on it.
+    fn validate_parent_span(&self, proposal: &Proposal<D>) -> Result<(), ParentPayloadError> {
+        self.validate_parent_structure(proposal)?;
+        let (view, parent) = (proposal.view(), proposal.parent);
+
         // Check that required nullifications exist between the parent and proposal views.
         if let Some(missing_view) = self.first_unnullified_view(parent, view) {
             return Err(ParentPayloadError::MissingNullification {
@@ -1601,13 +1809,30 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest> Sta
     }
 }
 
+impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest>
+    StateWith<E, S, L, D, Plain>
+{
+    /// Constructs the stock epoch state without interpretation configuration.
+    pub fn new(context: E, cfg: Config<S, L>) -> Self {
+        Self::new_with(context, cfg, ())
+    }
+
+    /// Constructs the stock final vote using the unchanged native eligibility checks.
+    pub fn construct_finalize(&mut self, view: View) -> Option<Finalize<S, D>> {
+        self.construct_finalize_with(view, ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::simplex::{
         elector::{Config as _, RoundRobin, RoundRobinElector, Terms},
         scheme::ed25519,
-        types::{Finalization, Finalize, Notarization, Notarize, Nullification, Nullify, Proposal},
+        types::{
+            Artifact, Certificate, Finalization, Finalize, Notarization, Notarize, Nullification,
+            Nullify, Proposal,
+        },
     };
     use commonware_cryptography::{
         certificate::{Scheme as _, mocks::Fixture},
@@ -8074,3 +8299,5 @@ mod tests {
         });
     }
 }
+
+commonware_macros::stability_mod!(ALPHA, mod recovery);

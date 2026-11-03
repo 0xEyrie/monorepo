@@ -116,7 +116,7 @@
 
 pub mod config;
 mod extension;
-pub use extension::{ProposalChain, ProposalContext, ProposalExtension};
+pub use extension::{ProposalChain, ProposalContext, ProposalExtension, ProposalPlan};
 #[cfg(any(test, feature = "mocks"))]
 pub(crate) mod fuzz;
 pub mod scheme;

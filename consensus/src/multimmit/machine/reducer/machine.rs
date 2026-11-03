@@ -805,7 +805,7 @@ impl<H: Hasher, V: Variant> Machine<H, V> {
         let view = self.durable.state.view;
         self.scheduler.peek() == Some(WorkKey::Drive(ProtocolComponent::View))
             && self.views.timeout_cutoff(view).is_none()
-            && self.views.vote_pass_begins(view).unwrap_or(false)
+            && self.views.vote_pass_begins::<H>(view).unwrap_or(false)
     }
 
     fn project_chain_progress(&self, finality: &[FinalityFact<H::Digest>]) -> Vec<ChainProgress> {

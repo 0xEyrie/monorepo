@@ -226,6 +226,11 @@ where
         arbitrary_extensions(u, config)?,
         config,
     )
+    .map_err(|_| ::arbitrary::Error::IncorrectFormat)?
+    .with_application(
+        Bytes::from(arbitrary_vec::<u8>(u, config.proposal_extension_bound())?),
+        config,
+    )
     .map_err(|_| ::arbitrary::Error::IncorrectFormat)
 }
 
@@ -272,7 +277,12 @@ where
         arbitrary_extensions(u, config)?,
         config,
     )
-    .expect("generated ballot respects codec limits"))
+    .expect("generated ballot respects codec limits")
+    .with_application(
+        Bytes::from(arbitrary_vec::<u8>(u, config.proposal_extension_bound())?),
+        config,
+    )
+    .expect("generated application report respects codec limits"))
 }
 
 fn arbitrary_conflicting_vote_for<D>(
@@ -347,7 +357,8 @@ where
         Ok(Self::new(u.arbitrary()?, tips, proposed)
             .expect("generated tip record is canonical")
             .with_proposal_extension(extension, codec_config())
-            .expect("generated history extension respects its bound"))
+            .expect("generated history extension respects its bound")
+            .with_arbitrary_reports(u.arbitrary()?))
     }
 }
 

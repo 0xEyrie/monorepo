@@ -1,7 +1,8 @@
 use crate::{
     simplex::{
         marshal::core::Variant,
-        types::{Finalization, Notarization},
+        phase2::{Mode, Plain},
+        types::Notarization,
     },
     types::{Epoch, Height, Round, View},
 };
@@ -41,11 +42,12 @@ pub(crate) struct Config {
 
 /// Prunable archives for a single epoch.
 #[allow(clippy::type_complexity)]
-struct Cache<R, V, S>
+struct Cache<R, V, S, M = Plain>
 where
     R: BufferPooler + Rng + Spawner + Metrics + Clock + Storage,
     V: Variant,
     S: Scheme,
+    M: Mode<S, V::Commitment>,
 {
     /// Verified blocks stored by view
     verified_blocks: prunable::Archive<TwoCap, R, <V::Block as Digestible>::Digest, V::StoredBlock>,
@@ -65,19 +67,15 @@ where
         Notarization<S, V::Commitment>,
     >,
     /// Finalizations stored by view
-    finalizations: prunable::Archive<
-        TwoCap,
-        R,
-        <V::Block as Digestible>::Digest,
-        Finalization<S, V::Commitment>,
-    >,
+    finalizations: prunable::Archive<TwoCap, R, <V::Block as Digestible>::Digest, M::Certificate>,
 }
 
-impl<R, V, S> Cache<R, V, S>
+impl<R, V, S, M> Cache<R, V, S, M>
 where
     R: BufferPooler + Rng + Spawner + Metrics + Clock + Storage,
     V: Variant,
     S: Scheme,
+    M: Mode<S, V::Commitment>,
 {
     /// Prune view-indexed archives to the given view.
     async fn prune_by_view(mut self, min_view: View) -> Self {
@@ -109,11 +107,12 @@ where
 }
 
 /// Manages prunable caches and their metadata.
-pub(crate) struct Manager<R, V, S>
+pub(crate) struct Manager<R, V, S, M = Plain>
 where
     R: BufferPooler + Rng + Spawner + Metrics + Clock + Storage,
     V: Variant,
     S: Scheme,
+    M: Mode<S, V::Commitment>,
 {
     /// Context
     context: R,
@@ -129,14 +128,15 @@ where
     metadata: Metadata<R, u8, (Epoch, Epoch)>,
 
     /// A map from epoch to its cache
-    caches: BTreeMap<Epoch, Cache<R, V, S>>,
+    caches: BTreeMap<Epoch, Cache<R, V, S, M>>,
 }
 
-impl<R, V, S> Manager<R, V, S>
+impl<R, V, S, M> Manager<R, V, S, M>
 where
     R: BufferPooler + Rng + Spawner + Metrics + Clock + Storage,
     V: Variant,
     S: Scheme,
+    M: Mode<S, V::Commitment>,
 {
     /// Initialize the cache manager and its metadata store.
     #[boxed]
@@ -207,10 +207,10 @@ where
     async fn with_epoch<T, Fut>(
         mut self,
         epoch: Epoch,
-        op: impl FnOnce(Cache<R, V, S>) -> Fut,
+        op: impl FnOnce(Cache<R, V, S, M>) -> Fut,
     ) -> (Self, Option<T>)
     where
-        Fut: Future<Output = (Cache<R, V, S>, T)>,
+        Fut: Future<Output = (Cache<R, V, S, M>, T)>,
     {
         let cache = if let Some(cache) = self.caches.remove(&epoch) {
             cache
@@ -497,7 +497,7 @@ where
         mut self,
         round: Round,
         digest: <V::Block as Digestible>::Digest,
-        finalization: &Finalization<S, V::Commitment>,
+        finalization: &M::Certificate,
     ) -> Self {
         let view = round.view().get();
         (self, _) = self
@@ -584,7 +584,7 @@ where
     pub(crate) async fn get_finalization_for(
         &self,
         digest: <V::Block as Digestible>::Digest,
-    ) -> Option<Finalization<S, V::Commitment>> {
+    ) -> Option<M::Certificate> {
         for cache in self.caches.values().rev() {
             match cache.finalizations.get(Identifier::Key(&digest)).await {
                 Ok(Some(finalization)) => return Some(finalization),

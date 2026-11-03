@@ -1,4 +1,6 @@
-use super::{Config, Mailbox, Message, Round, verifier::Batch};
+use super::{Config, Mailbox, Message, RoundWith, verifier::Batch};
+#[cfg(test)]
+use crate::simplex::phase2::Plain;
 use crate::{
     Epochable, Relay, Reporter, Viewable,
     simplex::{
@@ -6,8 +8,9 @@ use crate::{
         actors::voter,
         config::{ForwardPolicy, SkipPolicy},
         metrics::{Inbound, Peer, TimeoutReason},
+        phase2::aggregation::Aggregation,
         scheme::Scheme,
-        types::{Activity, Certificate, Proposal, Vote},
+        types::{ActivityWith, CertificateWith, Proposal, VoteWith},
     },
     types::{Epoch, Participant, Round as Rnd, View, ViewDelta},
 };
@@ -47,13 +50,18 @@ struct Current {
     leader_nullify_hinted: bool,
 }
 
-pub struct Actor<E, S, B, D, Re, Rl, T>
+#[cfg(test)]
+pub type Actor<E, S, B, D, Re, Rl, T> = ActorWith<E, S, B, D, Re, Rl, T, Plain>;
+
+/// Native batcher with statically selected vote and certificate representations.
+pub struct ActorWith<E, S, B, D, Re, Rl, T, M>
 where
     E: Spawner + Metrics + Clock + CryptoRng,
     S: Scheme<D>,
     B: Blocker<PublicKey = S::PublicKey>,
     D: Digest,
-    Re: Reporter<Activity = Activity<S, D>>,
+    Re: Reporter<Activity = ActivityWith<S, D, M>>,
+    M: Aggregation<S, D>,
     Rl: Relay,
     T: Strategy,
 {
@@ -84,7 +92,7 @@ where
     /// ourselves as live by construction.
     required_active: usize,
 
-    mailbox_receiver: mailbox::Receiver<Message<S, D>>,
+    mailbox_receiver: mailbox::Receiver<Message<S, D, M>>,
 
     added: Counter,
     processed: Counter,
@@ -95,17 +103,18 @@ where
     construct_fallback: Counter,
 }
 
-impl<E, S, B, D, Re, Rl, T> Actor<E, S, B, D, Re, Rl, T>
+impl<E, S, B, D, Re, Rl, T, M> ActorWith<E, S, B, D, Re, Rl, T, M>
 where
     E: Spawner + Metrics + Clock + CryptoRng,
     S: Scheme<D>,
     B: Blocker<PublicKey = S::PublicKey>,
     D: Digest,
-    Re: Reporter<Activity = Activity<S, D>>,
+    Re: Reporter<Activity = ActivityWith<S, D, M>>,
+    M: Aggregation<S, D>,
     Rl: Relay<Digest = D, PublicKey = S::PublicKey, Plan = Plan<S::PublicKey>>,
     T: Strategy,
 {
-    pub fn new(context: E, cfg: Config<S, B, Re, Rl, T>) -> (Self, Mailbox<S, D>) {
+    pub fn new(context: E, cfg: Config<S, B, Re, Rl, T>) -> (Self, Mailbox<S, D, M>) {
         let scheme = Arc::new(cfg.scheme);
         let participants = scheme.participants();
         let added = context.counter("added", "number of messages added to the verifier");
@@ -174,8 +183,8 @@ where
         )
     }
 
-    fn new_round(&self, view: View) -> Round<S, B, D, Re> {
-        Round::new(
+    fn new_round(&self, view: View) -> RoundWith<S, B, D, Re, M> {
+        RoundWith::new(
             Rnd::new(self.epoch, view),
             Arc::clone(&self.scheme),
             self.blocker.clone(),
@@ -247,7 +256,7 @@ where
     /// Selects forwarding targets for a forwardable proposal under the active policy.
     fn forward_targets(
         &self,
-        round: &Round<S, B, D, Re>,
+        round: &RoundWith<S, B, D, Re, M>,
         proposal: &Proposal<D>,
         next_leader: Participant,
     ) -> Vec<Participant> {
@@ -279,7 +288,10 @@ where
 
     /// Returns true if the leader has nullified the current view
     /// and we have not yet notified the voter.
-    fn leader_nullified(current: &Current, work: &BTreeMap<View, Round<S, B, D, Re>>) -> bool {
+    fn leader_nullified(
+        current: &Current,
+        work: &BTreeMap<View, RoundWith<S, B, D, Re, M>>,
+    ) -> bool {
         if current.leader_nullify_hinted {
             return false;
         }
@@ -295,9 +307,9 @@ where
     fn round_for_view<'a>(
         &self,
         current: &Current,
-        work: &'a mut BTreeMap<View, Round<S, B, D, Re>>,
+        work: &'a mut BTreeMap<View, RoundWith<S, B, D, Re, M>>,
         view: View,
-    ) -> &'a mut Round<S, B, D, Re> {
+    ) -> &'a mut RoundWith<S, B, D, Re, M> {
         let round = work.entry(view).or_insert_with(|| self.new_round(view));
         self.stamp_leader(current, view, round);
         round
@@ -305,7 +317,7 @@ where
 
     /// Stamps the current term's stable leader on `view`'s round when the
     /// view is current or inside the admission window.
-    fn stamp_leader(&self, current: &Current, view: View, round: &mut Round<S, B, D, Re>) {
+    fn stamp_leader(&self, current: &Current, view: View, round: &mut RoundWith<S, B, D, Re, M>) {
         let Some(leader) = current.leader else {
             return;
         };
@@ -319,9 +331,9 @@ where
     /// them to the voter.
     async fn process_view(
         &mut self,
-        voter: &mut voter::Mailbox<S, D>,
+        voter: &mut voter::Mailbox<S, D, M>,
         view: View,
-        round: &mut Round<S, B, D, Re>,
+        round: &mut RoundWith<S, B, D, Re, M>,
     ) {
         loop {
             let timer = self.construct_latency.timer(self.context.as_ref());
@@ -369,7 +381,7 @@ where
 
     pub fn start(
         mut self,
-        voter: voter::Mailbox<S, D>,
+        voter: voter::Mailbox<S, D, M>,
         vote_receiver: impl Receiver<PublicKey = S::PublicKey>,
         certificate_receiver: impl Receiver<PublicKey = S::PublicKey>,
     ) -> Handle<()> {
@@ -381,14 +393,14 @@ where
 
     pub async fn run(
         mut self,
-        mut voter: voter::Mailbox<S, D>,
+        mut voter: voter::Mailbox<S, D, M>,
         vote_receiver: impl Receiver<PublicKey = S::PublicKey>,
         certificate_receiver: impl Receiver<PublicKey = S::PublicKey>,
     ) {
         // Wrap channels
-        let mut vote_receiver: WrappedReceiver<_, Vote<S, D>> =
+        let mut vote_receiver: WrappedReceiver<_, VoteWith<S, D, M>> =
             WrappedReceiver::new((), vote_receiver);
-        let mut certificate_receiver: WrappedReceiver<_, Certificate<S, D>> =
+        let mut certificate_receiver: WrappedReceiver<_, CertificateWith<S, D, M>> =
             WrappedReceiver::new(self.scheme.certificate_codec_config(), certificate_receiver);
 
         // Initialize view data structures
@@ -398,7 +410,7 @@ where
             leader_nullify_hinted: false,
         };
         let mut finalized = self.floor;
-        let mut work: BTreeMap<View, Round<S, B, D, Re>> = BTreeMap::new();
+        let mut work: BTreeMap<View, RoundWith<S, B, D, Re, M>> = BTreeMap::new();
 
         // Views whose rounds may have become actionable. Capacity is reused
         // across select-loop iterations.
@@ -543,9 +555,9 @@ where
 
                 // Update metrics
                 let label = match &message {
-                    Certificate::Notarization(_) => Inbound::notarization(&sender),
-                    Certificate::Nullification(_) => Inbound::nullification(&sender),
-                    Certificate::Finalization(_) => Inbound::finalization(&sender),
+                    CertificateWith::Notarization(_) => Inbound::notarization(&sender),
+                    CertificateWith::Nullification(_) => Inbound::nullification(&sender),
+                    CertificateWith::Finalization(_) => Inbound::finalization(&sender),
                 };
                 self.inbound_messages.get_or_create(&label).inc();
 
@@ -608,9 +620,9 @@ where
 
                 // Update metrics
                 let label = match &message {
-                    Vote::Notarize(_) => Inbound::notarize(&sender),
-                    Vote::Nullify(_) => Inbound::nullify(&sender),
-                    Vote::Finalize(_) => Inbound::finalize(&sender),
+                    VoteWith::Notarize(_) => Inbound::notarize(&sender),
+                    VoteWith::Nullify(_) => Inbound::nullify(&sender),
+                    VoteWith::Finalize(_) => Inbound::finalize(&sender),
                 };
                 self.inbound_messages.get_or_create(&label).inc();
 

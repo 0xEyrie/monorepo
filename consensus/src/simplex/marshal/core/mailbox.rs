@@ -1,12 +1,13 @@
 use super::{Processed, Variant, durability::Durable as _};
 use crate::{
-    Reporter,
+    Reporter, Roundable,
     simplex::{
         marshal::{
             Identifier,
             ancestry::{AncestorStream, Ancestry, BlockProvider},
         },
-        types::{Activity, Finalization, Notarization},
+        phase2::{Mode, Plain},
+        types::{ActivityWith, Notarization},
     },
     types::{Height, Round},
 };
@@ -32,7 +33,7 @@ use tracing::{Span, info_span};
 ///
 /// These messages are sent from the consensus engine and other parts of the
 /// system to drive the state of the marshal.
-pub(crate) enum Message<S: Scheme, V: Variant> {
+pub(crate) enum Message<S: Scheme, V: Variant, M: Mode<S, V::Commitment> = Plain> {
     /// A request to retrieve the `(height, digest)` of a block by its identifier.
     /// The block must be finalized; returns `None` if the block is not finalized.
     GetInfo {
@@ -63,7 +64,7 @@ pub(crate) enum Message<S: Scheme, V: Variant> {
         /// The height of the finalization to retrieve.
         height: Height,
         /// A channel to send the retrieved finalization.
-        response: oneshot::Sender<Option<Finalization<S, V::Commitment>>>,
+        response: oneshot::Sender<Option<M::Certificate>>,
     },
     /// A request to retrieve the latest processed position.
     GetProcessed {
@@ -205,7 +206,7 @@ pub(crate) enum Message<S: Scheme, V: Variant> {
         /// The span carried with this request.
         span: Span,
         /// The candidate floor finalization, verified by the actor before use.
-        finalization: Finalization<S, V::Commitment>,
+        finalization: M::Certificate,
     },
     /// Requests pruning finalized blocks and certificates below the given height.
     ///
@@ -230,7 +231,7 @@ pub(crate) enum Message<S: Scheme, V: Variant> {
         /// The span carried with this request.
         span: Span,
         /// The finalization.
-        finalization: Finalization<S, V::Commitment>,
+        finalization: M::Certificate,
     },
     /// A certification from the consensus engine.
     Certification {
@@ -296,7 +297,7 @@ pub enum CommitmentFallback {
     FetchByCommitment { height: Height },
 }
 
-impl<S: Scheme, V: Variant> Message<S, V> {
+impl<S: Scheme, V: Variant, M: Mode<S, V::Commitment>> Message<S, V, M> {
     /// Returns the span carried with this message.
     pub(crate) const fn span(&self) -> &Span {
         match self {
@@ -413,19 +414,19 @@ impl<S: Scheme, V: Variant> Message<S, V> {
     }
 }
 
-pub(crate) struct Pending<S: Scheme, V: Variant> {
-    floor: Option<(Span, Finalization<S, V::Commitment>)>,
+pub(crate) struct Pending<S: Scheme, V: Variant, M: Mode<S, V::Commitment> = Plain> {
+    floor: Option<(Span, M::Certificate)>,
     prune: Option<(Span, Height)>,
     hints: BTreeMap<Height, (Span, NonEmptyVec<S::PublicKey>)>,
-    messages: VecDeque<PendingMessage<S, V>>,
+    messages: VecDeque<PendingMessage<S, V, M>>,
 }
 
-enum PendingMessage<S: Scheme, V: Variant> {
-    Message(Message<S, V>),
+enum PendingMessage<S: Scheme, V: Variant, M: Mode<S, V::Commitment> = Plain> {
+    Message(Message<S, V, M>),
     HintFinalized(Height),
 }
 
-impl<S: Scheme, V: Variant> Default for Pending<S, V> {
+impl<S: Scheme, V: Variant, M: Mode<S, V::Commitment>> Default for Pending<S, V, M> {
     fn default() -> Self {
         Self {
             floor: None,
@@ -436,7 +437,7 @@ impl<S: Scheme, V: Variant> Default for Pending<S, V> {
     }
 }
 
-impl<S: Scheme, V: Variant> Pending<S, V> {
+impl<S: Scheme, V: Variant, M: Mode<S, V::Commitment>> Pending<S, V, M> {
     // Only prune advances are usable for height staleness checks. A pending
     // floor finalization does not carry the block height until the block is decoded.
     fn height(&self) -> Option<Height> {
@@ -456,7 +457,7 @@ impl<S: Scheme, V: Variant> Pending<S, V> {
         });
     }
 
-    fn set_floor(&mut self, span: Span, finalization: Finalization<S, V::Commitment>) {
+    fn set_floor(&mut self, span: Span, finalization: M::Certificate) {
         let round = finalization.round();
         if self
             .floor
@@ -522,9 +523,9 @@ impl<S: Scheme, V: Variant> Pending<S, V> {
             .push_front(PendingMessage::HintFinalized(height));
     }
 
-    fn drain_one<F>(&mut self, message: Message<S, V>, push: &mut F) -> bool
+    fn drain_one<F>(&mut self, message: Message<S, V, M>, push: &mut F) -> bool
     where
-        F: FnMut(Message<S, V>) -> Option<Message<S, V>>,
+        F: FnMut(Message<S, V, M>) -> Option<Message<S, V, M>>,
     {
         // Receiver accepted; the message is consumed
         let Some(message) = push(message) else {
@@ -546,7 +547,9 @@ impl<S: Scheme, V: Variant> Pending<S, V> {
     }
 }
 
-impl<S: Scheme, V: Variant> Overflow<Message<S, V>> for Pending<S, V> {
+impl<S: Scheme, V: Variant, M: Mode<S, V::Commitment>> Overflow<Message<S, V, M>>
+    for Pending<S, V, M>
+{
     fn is_empty(&self) -> bool {
         self.floor.is_none()
             && self.prune.is_none()
@@ -556,7 +559,7 @@ impl<S: Scheme, V: Variant> Overflow<Message<S, V>> for Pending<S, V> {
 
     fn drain<F>(&mut self, mut push: F)
     where
-        F: FnMut(Message<S, V>) -> Option<Message<S, V>>,
+        F: FnMut(Message<S, V, M>) -> Option<Message<S, V, M>>,
     {
         // Drain floor and prune first so the actor advances its floor before
         // it sees the height-bounded reads that follow
@@ -602,8 +605,8 @@ impl<S: Scheme, V: Variant> Overflow<Message<S, V>> for Pending<S, V> {
 
 /// Coalesces `HintFinalized`, `SetFloor`, and `Prune`. Other overflowed messages
 /// retain FIFO order.
-impl<S: Scheme, V: Variant> Policy for Message<S, V> {
-    type Overflow = Pending<S, V>;
+impl<S: Scheme, V: Variant, M: Mode<S, V::Commitment>> Policy for Message<S, V, M> {
+    type Overflow = Pending<S, V, M>;
 
     fn handle(overflow: &mut Self::Overflow, message: Self) {
         // A closed responder cannot be served
@@ -641,14 +644,17 @@ impl<S: Scheme, V: Variant> Policy for Message<S, V> {
 
 /// A mailbox for sending messages to the marshal [Actor](super::Actor).
 #[derive(Clone)]
-pub struct Mailbox<S: Scheme, V: Variant> {
-    sender: Sender<Message<S, V>>,
+pub struct Mailbox<S: Scheme, V: Variant, M: Mode<S, V::Commitment> = Plain> {
+    sender: Sender<Message<S, V, M>>,
     max_pending_acks: usize,
 }
 
-impl<S: Scheme, V: Variant> Mailbox<S, V> {
+impl<S: Scheme, V: Variant, M: Mode<S, V::Commitment>> Mailbox<S, V, M> {
     /// Creates a new mailbox.
-    pub(crate) const fn new(sender: Sender<Message<S, V>>, max_pending_acks: NonZeroUsize) -> Self {
+    pub(crate) const fn new(
+        sender: Sender<Message<S, V, M>>,
+        max_pending_acks: NonZeroUsize,
+    ) -> Self {
         Self {
             sender,
             max_pending_acks: max_pending_acks.get(),
@@ -674,7 +680,7 @@ impl<S: Scheme, V: Variant> Mailbox<S, V> {
         clock: Arc<C>,
         initial: I,
         fetch_duration: Timed,
-    ) -> impl Ancestry<V::ApplicationBlock> + use<S, V, I, C>
+    ) -> impl Ancestry<V::ApplicationBlock> + use<S, V, M, I, C>
     where
         Self: BlockProvider<Block = V::ApplicationBlock>,
         I: IntoIterator<Item = Arc<V::ApplicationBlock>>,
@@ -714,9 +720,9 @@ impl<S: Scheme, V: Variant> Mailbox<S, V> {
         receiver.await.ok().flatten()
     }
 
-    /// A best-effort attempt to retrieve a given [Finalization] from local
-    /// storage. It is not an indication to go fetch the [Finalization] from the network.
-    pub async fn get_finalization(&self, height: Height) -> Option<Finalization<S, V::Commitment>> {
+    /// A best-effort attempt to retrieve a given finalization certificate from local
+    /// storage. It is not an indication to go fetch the certificate from the network.
+    pub async fn get_finalization(&self, height: Height) -> Option<M::Certificate> {
         let (response, receiver) = oneshot::channel();
         let _ = self.sender.enqueue(Message::GetFinalization {
             span: info_span!("marshal.mailbox.get_finalization", height = height.traced()),
@@ -880,7 +886,7 @@ impl<S: Scheme, V: Variant> Mailbox<S, V> {
         clock: Arc<C>,
         (fallback, start_digest): (DigestFallback, <V::Block as Digestible>::Digest),
         fetch_duration: Timed,
-    ) -> Option<impl Ancestry<V::ApplicationBlock> + use<S, V, C>>
+    ) -> Option<impl Ancestry<V::ApplicationBlock> + use<S, V, M, C>>
     where
         Self: BlockProvider<Block = V::ApplicationBlock>,
         C: Clock,
@@ -1001,7 +1007,7 @@ impl<S: Scheme, V: Variant> Mailbox<S, V> {
     /// To prune data without changing the sync starting point, use
     /// [Self::prune] instead.
     /// Use [`crate::simplex::marshal::Config::start`] to provide the startup anchor.
-    pub fn set_floor(&self, finalization: Finalization<S, V::Commitment>) {
+    pub fn set_floor(&self, finalization: M::Certificate) {
         let _ = self.sender.enqueue(Message::SetFloor {
             span: info_span!("marshal.mailbox.set_floor", round = %finalization.round()),
             finalization,
@@ -1036,20 +1042,20 @@ impl<S: Scheme, V: Variant> Mailbox<S, V> {
     }
 }
 
-impl<S: Scheme, V: Variant> Reporter for Mailbox<S, V> {
-    type Activity = Activity<S, V::Commitment>;
+impl<S: Scheme, V: Variant, M: Mode<S, V::Commitment>> Reporter for Mailbox<S, V, M> {
+    type Activity = ActivityWith<S, V::Commitment, M>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         let message = match activity {
-            Activity::Notarization(notarization) => Message::Notarization {
+            ActivityWith::Notarization(notarization) => Message::Notarization {
                 span: info_span!("marshal.mailbox.notarization", round = %notarization.round()),
                 notarization,
             },
-            Activity::Finalization(finalization) => Message::Finalization {
+            ActivityWith::Finalization(finalization) => Message::Finalization {
                 span: info_span!("marshal.mailbox.finalization", round = %finalization.round()),
                 finalization,
             },
-            Activity::Certification(notarization) => Message::Certification {
+            ActivityWith::Certification(notarization) => Message::Certification {
                 span: info_span!("marshal.mailbox.certification", round = %notarization.round()),
                 notarization,
             },
@@ -1067,7 +1073,7 @@ mod tests {
         simplex::{
             marshal::{mocks::harness, standard::Standard},
             scheme::bls12381_threshold::vrf as bls12381_threshold_vrf,
-            types::Proposal,
+            types::{Finalization, Proposal},
         },
         types::{Epoch, View},
     };

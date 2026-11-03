@@ -1,6 +1,9 @@
 use crate::{
     Viewable,
-    simplex::types::{Proposal, Vote},
+    simplex::{
+        phase2::{Mode, Plain},
+        types::{Proposal, VoteWith},
+    },
     types::{Participant, View},
 };
 use commonware_actor::mailbox::{Overflow, Policy, Sender};
@@ -8,8 +11,8 @@ use commonware_cryptography::{Digest, certificate::Scheme};
 use std::collections::VecDeque;
 use tracing::Span;
 
-/// Messages sent to the [super::actor::Actor].
-pub enum Message<S: Scheme, D: Digest> {
+/// Messages sent to the [super::actor::ActorWith].
+pub enum Message<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
     /// View update with leader info.
     Update {
         span: Span,
@@ -19,10 +22,10 @@ pub enum Message<S: Scheme, D: Digest> {
         forwardable_proposal: Option<Proposal<D>>,
     },
     /// A durable locally constructed vote for certificate assembly.
-    Constructed(Vote<S, D>),
+    Constructed(VoteWith<S, D, M>),
 }
 
-impl<S: Scheme, D: Digest> Message<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Message<S, D, M> {
     /// Returns the message view used for pruning and span attribution.
     pub(crate) fn view(&self) -> View {
         match self {
@@ -40,35 +43,40 @@ impl<S: Scheme, D: Digest> Message<S, D> {
     }
 
     // Return whether the retained update makes a constructed vote stale.
-    fn prunes(current: View, finalized: View, vote: &Vote<S, D>) -> bool {
+    fn prunes(current: View, finalized: View, vote: &VoteWith<S, D, M>) -> bool {
         let view = vote.view();
         match vote {
             // Notarize and nullify votes are only useful for the current view
-            Vote::Notarize(_) | Vote::Nullify(_) => view < current || view <= finalized,
+            VoteWith::Notarize(_) | VoteWith::Nullify(_) => view < current || view <= finalized,
             // Finalize votes are useful in any view that isn't yet finalized
-            Vote::Finalize(_) => view <= finalized,
+            VoteWith::Finalize(_) => view <= finalized,
         }
     }
 
     // Return whether two votes would produce the same retained actor action.
-    fn similar(a: &Vote<S, D>, b: &Vote<S, D>) -> bool {
+    fn similar(a: &VoteWith<S, D, M>, b: &VoteWith<S, D, M>) -> bool {
+        if M::RETAIN_INTERPRETATION {
+            // Different reports or final interpretations are different actions.
+            // The receiving actor must observe them rather than silently erase one.
+            return a == b;
+        }
         a.view() == b.view()
             && matches!(
                 (a, b),
-                (Vote::Notarize(_), Vote::Notarize(_))
-                    | (Vote::Nullify(_), Vote::Nullify(_))
-                    | (Vote::Finalize(_), Vote::Finalize(_))
+                (VoteWith::Notarize(_), VoteWith::Notarize(_))
+                    | (VoteWith::Nullify(_), VoteWith::Nullify(_))
+                    | (VoteWith::Finalize(_), VoteWith::Finalize(_))
             )
     }
 }
 
 /// Pending batcher messages retained after the mailbox fills.
-pub struct Pending<S: Scheme, D: Digest> {
-    update: Option<Message<S, D>>,
-    constructed: VecDeque<Vote<S, D>>,
+pub struct Pending<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
+    update: Option<Message<S, D, M>>,
+    constructed: VecDeque<VoteWith<S, D, M>>,
 }
 
-impl<S: Scheme, D: Digest> Default for Pending<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Default for Pending<S, D, M> {
     fn default() -> Self {
         Self {
             update: None,
@@ -77,14 +85,14 @@ impl<S: Scheme, D: Digest> Default for Pending<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Overflow<Message<S, D>> for Pending<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Overflow<Message<S, D, M>> for Pending<S, D, M> {
     fn is_empty(&self) -> bool {
         self.update.is_none() && self.constructed.is_empty()
     }
 
     fn drain<F>(&mut self, mut push: F)
     where
-        F: FnMut(Message<S, D>) -> Option<Message<S, D>>,
+        F: FnMut(Message<S, D, M>) -> Option<Message<S, D, M>>,
     {
         if let Some(update) = self.update.take()
             && let Some(update) = push(update)
@@ -105,8 +113,8 @@ impl<S: Scheme, D: Digest> Overflow<Message<S, D>> for Pending<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Policy for Message<S, D> {
-    type Overflow = Pending<S, D>;
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Policy for Message<S, D, M> {
+    type Overflow = Pending<S, D, M>;
 
     fn handle(overflow: &mut Self::Overflow, message: Self) {
         match message {
@@ -160,13 +168,13 @@ impl<S: Scheme, D: Digest> Policy for Message<S, D> {
 }
 
 #[derive(Clone)]
-pub struct Mailbox<S: Scheme, D: Digest> {
-    sender: Sender<Message<S, D>>,
+pub struct Mailbox<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
+    sender: Sender<Message<S, D, M>>,
 }
 
-impl<S: Scheme, D: Digest> Mailbox<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Mailbox<S, D, M> {
     /// Create a new mailbox.
-    pub const fn new(sender: Sender<Message<S, D>>) -> Self {
+    pub const fn new(sender: Sender<Message<S, D, M>>) -> Self {
         Self { sender }
     }
 
@@ -189,7 +197,7 @@ impl<S: Scheme, D: Digest> Mailbox<S, D> {
     }
 
     /// Sends a locally constructed vote after its journal entry is durable.
-    pub fn constructed(&mut self, message: Vote<S, D>) {
+    pub fn constructed(&mut self, message: VoteWith<S, D, M>) {
         let _ = self.sender.enqueue(Message::Constructed(message));
     }
 }
@@ -465,5 +473,91 @@ mod tests {
             overflow.pop_front(),
             Some(Message::Update { current, .. }) if current == View::new(5)
         ));
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    use super::*;
+    use crate::{
+        simplex::{
+            extension::{
+                certificate::Finalize,
+                report::Notarize,
+                vote::{Statement, Vote},
+            },
+            phase2::Extended,
+            scheme::ed25519,
+            types::Notarize as BaseNotarize,
+        },
+        types::{Epoch, Round},
+    };
+    use bytes::Bytes;
+    use commonware_cryptography::sha256::Digest as Sha256;
+    use commonware_utils::TestRng;
+
+    #[test]
+    fn mailbox_overflow_retains_exact_extended_votes_and_prunes_by_native_view() {
+        let f = ed25519::fixture(
+            &mut TestRng::new(49),
+            b"_COMMONWARE_CONSENSUS_INGRESS_EXTENSION_TEST",
+            6,
+        );
+        let round = Round::new(Epoch::new(1), View::new(2));
+        let proposal = Proposal::new(round, View::new(1), Sha256::from([1; 32]));
+        type Msg = Message<ed25519::Scheme, Sha256, Extended>;
+        let mut pending = Pending::default();
+        for report in [b"first".as_slice(), b"different", b"first"] {
+            let vote = Notarize::new(
+                BaseNotarize::sign(&f.schemes[0], proposal.clone()).unwrap(),
+                Some(Bytes::copy_from_slice(report)),
+            )
+            .unwrap();
+            Msg::handle(&mut pending, Msg::Constructed(VoteWith::Notarize(vote)));
+        }
+        for extension in [4, 5, 4] {
+            let statement = Statement {
+                proposal: proposal.clone(),
+                domain: Sha256::from([2; 32]),
+                ballot: round,
+                parent: Sha256::from([3; 32]),
+                extension: Sha256::from([extension; 32]),
+            };
+            let vote = Finalize::new(Vote::sign(&f.schemes[0], statement).unwrap()).unwrap();
+            Msg::handle(&mut pending, Msg::Constructed(VoteWith::Finalize(vote)));
+        }
+        assert_eq!(pending.constructed.len(), 4); // exact retransmits coalesce only
+        let before = pending.constructed.iter().cloned().collect::<Vec<_>>();
+        pending.drain(Some); // mailbox remains full: preserve bytes and order
+        assert_eq!(
+            pending.constructed.iter().cloned().collect::<Vec<_>>(),
+            before
+        );
+        Msg::handle(
+            &mut pending,
+            Msg::Update {
+                span: Span::none(),
+                current: View::new(3),
+                leader: Participant::new(1),
+                finalized: View::new(1),
+                forwardable_proposal: None,
+            },
+        );
+        assert_eq!(pending.constructed.len(), 2); // old notarizes pruned, finals retained
+        let mut delivered = Vec::new();
+        pending.drain(|message| {
+            delivered.push(message);
+            None
+        });
+        assert!(pending.is_empty());
+        assert!(matches!(delivered.first(), Some(Msg::Update { .. })));
+        let values = delivered
+            .into_iter()
+            .filter_map(|message| match message {
+                Msg::Constructed(VoteWith::Finalize(v)) => Some(v.vote().statement.extension),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![Sha256::from([4; 32]), Sha256::from([5; 32])]);
     }
 }

@@ -472,7 +472,9 @@
 //! certification is to keep the request pending until Simplex drops it after finalizing the block
 //! or a descendant.
 
+commonware_macros::stability_mod!(ALPHA, pub mod extension);
 pub mod elector;
+pub mod phase2;
 pub mod scheme;
 pub mod types;
 
@@ -568,9 +570,10 @@ cfg_if::cfg_if! {
 
         mod actors;
         pub mod config;
-        pub use config::{Config, Floor, ForwardPolicy, SkipBudget, SkipPolicy};
+        pub use config::{Config, Floor, FloorWith, ForwardPolicy, SkipBudget, SkipPolicy};
         mod engine;
         pub use engine::Engine;
+        commonware_macros::stability_scope!(ALPHA { pub use engine::{AdmittedRecovery, Readiness}; });
         pub mod marshal;
         mod metrics;
 

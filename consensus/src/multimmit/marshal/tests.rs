@@ -3764,3 +3764,57 @@ fn verified_floor_continues_and_current_generation_prunes_across_reopen() {
         runner(seed).start(move |context| run_floor_case(context, seed, archive_modes));
     }
 }
+
+#[test]
+fn advisory_parent_candidates_cannot_fill_canonical_hint_queue_or_deliver() {
+    runner(165).start(|context| async move {
+        let mut harness = Harness::new(context, 165, [true, true]).await;
+        harness.start(0).await;
+        let mailbox = harness.mailbox(0);
+        let history = initial_history(&harness.committee);
+        let batch = certify(
+            &harness.committee,
+            1,
+            history,
+            harness.committee.config.genesis().tips(),
+            vec![vec![body(1_650)], Vec::new()],
+        );
+        let mut reporter = mailbox.clone();
+        for _ in 0..10_000 {
+            assert_eq!(
+                reporter.report(Activity::ParentPrepared {
+                    round: batch.proof.leader().round(),
+                    artifact_id: ArtifactId::new(digest(b"advisory parent", 0)),
+                    commitment: batch.history.commitment::<Sha256>(),
+                    record: Arc::clone(&batch.history),
+                }),
+                Feedback::Ok
+            );
+        }
+        harness.context.sleep(Duration::from_millis(10)).await;
+        mailbox.progress().await.unwrap();
+        assert!(harness.reporter(0).delivered().is_empty());
+        batch.submit(&mailbox).await;
+        let artifact = Arc::new(Artifact::Lqc(batch.proof.as_ref().clone()));
+        assert_eq!(
+            reporter.report(Activity::ProtocolAccepted {
+                artifact_id: artifact.id::<Sha256>(),
+                artifact,
+            }),
+            Feedback::Ok
+        );
+        assert_eq!(
+            reporter.report(Activity::HistoryAccepted {
+                view: batch.proof.view(),
+                commitment: batch.history.commitment::<Sha256>(),
+                record: Arc::clone(&batch.history),
+            }),
+            Feedback::Ok
+        );
+        assert_eq!(
+            harness.wait_updates(0, 1).await[0].block,
+            batch.blocks[0][0]
+        );
+        harness.shutdown().await;
+    });
+}

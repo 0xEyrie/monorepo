@@ -23,7 +23,7 @@ use crate::{
     multimmit::types::{CodecConfig, LeaderBlock},
     types::{Attributable, Round},
 };
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 use commonware_codec::{Buf, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
 use commonware_cryptography::{
     Digest, bls12381::primitives::variant::Variant, certificate::Signers,
@@ -221,6 +221,7 @@ pub struct Tally<D: Digest> {
     signers: Signers,
     deviations: Vec<Deviation>,
     extension_paths: Vec<Extension<D>>,
+    applications: Vec<Bytes>,
 }
 
 impl<D: Digest> Tally<D> {
@@ -244,6 +245,11 @@ impl<D: Digest> Tally<D> {
     /// Returns the non-standard vote records in signer order.
     pub fn deviations(&self) -> &[Deviation] {
         &self.deviations
+    }
+
+    /// Returns one original application report per signer, in ascending signer order.
+    pub fn applications(&self) -> &[Bytes] {
+        &self.applications
     }
 
     /// Returns the payloads a deviation's replacement selects: empty when it clears the chain.
@@ -285,11 +291,19 @@ impl<D: Digest> Tally<D> {
                 extension_paths.len(),
             )?);
         }
+        let applications = Vec::<Bytes>::read_cfg(
+            reader,
+            &(
+                RangeCfg::exact(signers.count()),
+                (0..=config.proposal_extension_bound()).into(),
+            ),
+        )?;
         let tally = Self {
             reference_extensions,
             signers,
             deviations,
             extension_paths,
+            applications,
         };
         tally
             .validate(leader, config)
@@ -329,6 +343,7 @@ impl<D: Digest> Tally<D> {
             encoded_len(votes)?,
             checked_product(votes, checked_sum(&[position_deviation, 1])?)?,
             checked_product(replaced, replacements)?,
+            encoded_vec(votes, encoded_vec(codec.proposal_extension_bound(), 1)?)?,
         ])
     }
 
@@ -350,6 +365,7 @@ impl<D: Digest> Write for Tally<D> {
         self.signers.write(writer);
         self.extension_paths.write(writer);
         self.deviations.write(writer);
+        self.applications.write(writer);
     }
 }
 
@@ -359,6 +375,7 @@ impl<D: Digest> EncodeSize for Tally<D> {
             + self.signers.encode_size()
             + self.extension_paths.encode_size()
             + self.deviations.encode_size()
+            + self.applications.encode_size()
     }
 }
 

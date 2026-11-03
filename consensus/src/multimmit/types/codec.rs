@@ -91,7 +91,7 @@ impl CodecConfig {
         })
     }
 
-    /// Sets the maximum application-extension bytes in a leader proposal.
+    /// Sets the maximum application bytes in a leader proposal or an individual vote.
     ///
     /// Every participant must use the same bound for the epoch. Zero disables extensions.
     pub const fn with_proposal_extension_bound(mut self, bytes: u32) -> Self {
@@ -99,7 +99,7 @@ impl CodecConfig {
         self
     }
 
-    /// Returns the maximum application-extension bytes in a leader proposal.
+    /// Returns the maximum application bytes in a leader proposal or an individual vote.
     pub const fn proposal_extension_bound(self) -> usize {
         self.proposal_extension_bound as usize
     }

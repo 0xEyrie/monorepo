@@ -57,6 +57,7 @@ pub(crate) struct ValidatedVqc<D: Digest> {
     tips: Arc<Tips<D>>,
     commitments: SelectedCommitments<D>,
     child_history: Option<D>,
+    history_opening: Option<Arc<TipRecord<D>>>,
     votes: Vec<VerifiedVote<D>>,
 }
 
@@ -77,6 +78,7 @@ impl<D: Digest> ValidatedVqc<D> {
             tips: self.tips,
             commitments: self.commitments,
             child_history: self.child_history,
+            history_opening: self.history_opening,
         }
     }
 
@@ -107,6 +109,19 @@ impl<D: Digest> ValidatedVqc<D> {
                 bytes = bytes.checked_add(size_of_val(extension.payloads()))?;
             }
         }
+        if let Some(record) = &self.history_opening {
+            bytes = bytes
+                .checked_add(size_of::<TipRecord<D>>() + 2 * size_of::<usize>())?
+                .checked_add(size_of_val(record.tips()))?
+                .checked_add(size_of_val(record.proposed()))?
+                .checked_add(record.proposal_extension().map_or(0, Bytes::len))?;
+            if let Some(reports) = record.vote_reports() {
+                bytes = bytes.checked_add(size_of_val(reports.reports()))?;
+                for (_, report) in reports.reports() {
+                    bytes = bytes.checked_add(report.len())?;
+                }
+            }
+        }
         Some(bytes)
     }
 }
@@ -125,6 +140,8 @@ pub(crate) struct ValidatedVqcParts<D: Digest> {
     /// The history commitment a leader block extending this certificate names, or `None` when the
     /// safe tips and proposed heights do not form a tip record.
     pub(crate) child_history: Option<D>,
+    /// Shared opening reconstructed during validation, with its original vote reports.
+    pub(crate) history_opening: Option<Arc<TipRecord<D>>>,
 }
 
 /// One immutable V-QC and the derivations established for that allocation.
@@ -292,30 +309,34 @@ where
         certificate.leader().round().epoch(),
         tips.blocks().iter().copied(),
     );
+    let history_opening = history_opening::<H, V, D>(certificate, &tips);
     Ok(ValidatedVqc {
         id,
         leader,
         canonical,
-        child_history: child_history::<H, V, D>(certificate.leader(), &tips),
+        child_history: history_opening
+            .as_ref()
+            .map(|record| record.commitment::<H>()),
+        history_opening,
         tips: Arc::new(tips),
         commitments,
         votes: Vec::new(),
     })
 }
 
-/// Returns the history commitment a leader block extending `leader`'s certified tips names.
+/// Reconstructs the history opening a child leader commits to, retaining its vote reports.
 ///
 /// Validation computes it once, off the voter's thread, so every proposal validity check compares
-/// against the retained value instead of hashing the tips again.
-fn child_history<H, V, D>(leader: &LeaderBlock<V, D>, tips: &Tips<D>) -> Option<D>
+/// against the retained commitment and borrows the opening without rebuilding the reports.
+fn history_opening<H, V, D>(certificate: &Vqc<V, D>, tips: &Tips<D>) -> Option<Arc<TipRecord<D>>>
 where
     H: Hasher<Digest = D>,
     V: Variant,
     D: Digest,
 {
-    TipRecord::from_leader(leader, tips.blocks().to_vec())
+    TipRecord::from_vqc::<H, V>(certificate, tips.blocks().to_vec())
         .ok()
-        .map(|record| record.commitment::<H>())
+        .map(Arc::new)
 }
 
 /// Returns a V-QC's canonical encoding and the certificate identifier hashed from it.
@@ -366,13 +387,18 @@ where
     );
     let vqc = certificate.derive_vqc(config).map_err(|_| Error::Vote)?;
     let (canonical, id) = canonical_identity::<H, V, D>(&vqc);
+    let history_opening = history_opening::<H, V, D>(&vqc, &safe_tips);
+    let child_history = history_opening
+        .as_ref()
+        .map(|record| record.commitment::<H>());
     let derived = DerivedVqc::new::<H>(
         vqc,
         ValidatedVqc {
             id,
             leader: leader_digest,
             canonical,
-            child_history: child_history::<H, V, D>(leader, &safe_tips),
+            child_history,
+            history_opening,
             tips: Arc::new(safe_tips),
             commitments,
             votes: Vec::new(),

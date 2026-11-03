@@ -1,7 +1,8 @@
 use super::Variant;
 use crate::simplex::{
+    phase2::{Mode, Plain},
     scheme::Scheme,
-    types::{Finalization, Notarization},
+    types::Notarization,
 };
 use commonware_cryptography::certificate::{Scheme as CertificateScheme, Scoped};
 use commonware_utils::channel::oneshot;
@@ -10,8 +11,11 @@ use commonware_utils::channel::oneshot;
 ///
 /// Each item carries the scope it was admitted under so verification does not
 /// depend on the provider still serving that epoch.
-pub(super) enum PendingVerification<S: CertificateScheme, V: Variant>
-where
+pub(super) enum PendingVerification<
+    S: CertificateScheme,
+    V: Variant,
+    M: Mode<S, V::Commitment> = Plain,
+> where
     S: Scheme<V::Commitment>,
 {
     Notarized {
@@ -22,13 +26,13 @@ where
     },
     Finalized {
         scoped: Scoped<S>,
-        finalization: Finalization<S, V::Commitment>,
+        finalization: M::Certificate,
         block: V::ApplicationBlock,
         response: oneshot::Sender<bool>,
     },
 }
 
-impl<S: CertificateScheme, V: Variant> PendingVerification<S, V>
+impl<S: CertificateScheme, V: Variant, M: Mode<S, V::Commitment>> PendingVerification<S, V, M>
 where
     S: Scheme<V::Commitment>,
 {

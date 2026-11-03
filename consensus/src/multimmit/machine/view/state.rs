@@ -93,6 +93,7 @@ pub(crate) struct RetireFloors<D: Digest> {
 /// marks, the in-flight proposal or vote pass, and the proposal frontier.
 pub(crate) struct ViewState<V: Variant, D: Digest> {
     pub(super) config: CodecConfig,
+    pub(super) proposal_extension: Option<Arc<dyn crate::multimmit::ProposalExtension<D>>>,
     /// This node's participant when it validates, or `None` when it observes.
     pub(super) me: Option<Participant>,
     pub(super) epoch: Epoch,
@@ -232,16 +233,18 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
             .iter()
             .map(|tip| tip.height())
             .collect::<Vec<_>>();
+        let history_opening = TipRecord::new(history, tips.blocks().to_vec(), proposed)
+            .ok()
+            .map(Arc::new);
         let parent = ParentRecord {
             id: genesis.vqc(),
             view: View::zero(),
-            history,
             canonical: Bytes::new(),
             proof: ParentProof::Genesis,
-            child_history: TipRecord::new(history, tips.blocks().to_vec(), proposed.clone())
-                .ok()
+            child_history: history_opening
+                .as_ref()
                 .map(|record| record.commitment::<H>()),
-            proposed,
+            history_opening,
             tips: Arc::new(tips),
             commitments: SelectedCommitments::new(genesis.epoch(), Vec::new()),
             messages: 0,
@@ -252,6 +255,7 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
         };
         Self {
             config: profile.codec(),
+            proposal_extension: profile.proposal_extension.clone(),
             me,
             epoch: profile.protocol().epoch(),
             retired_transitions: View::zero(),
@@ -287,17 +291,8 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
         artifact: &Arc<Artifact<V, D>>,
     ) -> Option<&SelectedCommitments<D>> {
         match artifact.as_ref() {
-            Artifact::Vqc(certificate) => self
-                .parents_by_view
-                .get(&certificate.view())?
-                .iter()
-                .filter_map(|id| self.parents.get(id))
-                .find(|parent| {
-                    matches!(
-                        &parent.proof,
-                        ParentProof::Vqc(retained) if Arc::ptr_eq(retained.arc(), artifact)
-                    )
-                })
+            Artifact::Vqc(_) => self
+                .retained_vqc_parent(artifact)
                 .map(|parent| &parent.commitments),
             Artifact::LeaderBlock(block) => self
                 .parents
@@ -307,8 +302,34 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
         }
     }
 
-    /// Reconstructs the safe-tip opening committed by a leader from its retained parent.
-    pub(crate) fn leader_history<H: Hasher<Digest = D>>(
+    fn retained_vqc_parent(&self, artifact: &Arc<Artifact<V, D>>) -> Option<&ParentRecord<V, D>> {
+        let Artifact::Vqc(certificate) = artifact.as_ref() else {
+            return None;
+        };
+        self.parents_by_view
+            .get(&certificate.view())?
+            .iter()
+            .filter_map(|id| self.parents.get(id))
+            .find(|parent| {
+                matches!(&parent.proof,
+                    ParentProof::Vqc(retained) if Arc::ptr_eq(retained.arc(), artifact))
+            })
+    }
+
+    /// Returns a candidate opening only for this exact contextually validated allocation.
+    pub(crate) fn prepared_history(
+        &self,
+        artifact: &Arc<Artifact<V, D>>,
+    ) -> Option<(D, Arc<TipRecord<D>>)> {
+        let parent = self.retained_vqc_parent(artifact)?;
+        Some((
+            parent.child_history().ok()?,
+            Arc::clone(parent.tip_record().ok()?),
+        ))
+    }
+
+    /// Shares the validated safe-tip opening committed by a leader from its retained parent.
+    pub(crate) fn leader_history(
         &self,
         leader: &LeaderBlock<V, D>,
     ) -> Result<Arc<TipRecord<D>>, ViewError> {
@@ -316,10 +337,10 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
             .parents
             .get(&leader.parent())
             .ok_or(ViewError::MissingParent)?;
-        let history = Arc::new(parent.tip_record()?);
-        (history.commitment::<H>() == leader.history())
-            .then_some(history)
-            .ok_or(ViewError::Proposal)
+        if parent.child_history()? != leader.history() {
+            return Err(ViewError::Proposal);
+        }
+        Ok(Arc::clone(parent.tip_record()?))
     }
 
     /// Applies every retirement floor in dependency order and returns the retired proposal

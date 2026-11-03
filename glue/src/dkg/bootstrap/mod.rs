@@ -467,7 +467,12 @@ where
             backfill,
         );
 
-        let finalizations = prunable::Archive::init(
+        let finalizations = prunable::Archive::<
+            _,
+            _,
+            Sha256Digest,
+            commonware_consensus::simplex::types::Finalization<ConsensusScheme, Sha256Digest>,
+        >::init(
             context.child("finalizations"),
             archive_config(
                 &self.config.partition_prefix,

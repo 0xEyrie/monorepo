@@ -1,7 +1,8 @@
 use crate::{
+    Roundable as _,
     simplex::{
         marshal::resolver::handler::{Annotation, Key, Request},
-        types::Finalization,
+        phase2::{Mode, Plain},
     },
     types::{Height, Round},
 };
@@ -66,23 +67,23 @@ impl Floor {
 /// A floor finalization awaiting its anchor block.
 ///
 /// Dropping the pending floor aborts its buffer waiter, if one exists.
-struct Pending<S: Scheme, C: Digest> {
-    finalization: Finalization<S, C>,
+struct Pending<S: Scheme, C: Digest, M: Mode<S, C> = Plain> {
+    finalization: M::Certificate,
     _aborter: Option<Aborter>,
 }
 
 /// Durable floor state, the configured floor until startup takes it, and any update
 /// awaiting its anchor block.
-pub(super) struct State<S: Scheme, C: Digest> {
+pub(super) struct State<S: Scheme, C: Digest, M: Mode<S, C> = Plain> {
     processed: Option<Processed>,
     round: Round,
-    configured: Option<Finalization<S, C>>,
-    pending: Option<Pending<S, C>>,
+    configured: Option<M::Certificate>,
+    pending: Option<Pending<S, C, M>>,
 }
 
-impl<S: Scheme, C: Digest> State<S, C> {
+impl<S: Scheme, C: Digest, M: Mode<S, C>> State<S, C, M> {
     /// Creates floor state from the configured floor, if any, and the restored floor.
-    pub(super) const fn new(configured: Option<Finalization<S, C>>, floor: Floor) -> Self {
+    pub(super) const fn new(configured: Option<M::Certificate>, floor: Floor) -> Self {
         Self {
             processed: floor.processed,
             round: floor.round,
@@ -93,7 +94,7 @@ impl<S: Scheme, C: Digest> State<S, C> {
 
     /// Takes the configured floor, if any.
     #[must_use]
-    pub(super) const fn take_configured(&mut self) -> Option<Finalization<S, C>> {
+    pub(super) const fn take_configured(&mut self) -> Option<M::Certificate> {
         self.configured.take()
     }
 
@@ -147,11 +148,7 @@ impl<S: Scheme, C: Digest> State<S, C> {
     ///
     /// Taking or replacing the pending floor drops `aborter`, which aborts its
     /// buffer waiter.
-    pub(super) fn set_pending(
-        &mut self,
-        finalization: Finalization<S, C>,
-        aborter: Option<Aborter>,
-    ) {
+    pub(super) fn set_pending(&mut self, finalization: M::Certificate, aborter: Option<Aborter>) {
         self.pending = Some(Pending {
             finalization,
             _aborter: aborter,
@@ -160,9 +157,11 @@ impl<S: Scheme, C: Digest> State<S, C> {
 
     /// Takes the pending floor if `commitment` is its payload.
     #[must_use]
-    pub(super) fn take_matching(&mut self, commitment: C) -> Option<Finalization<S, C>> {
+    pub(super) fn take_matching(&mut self, commitment: C) -> Option<M::Certificate> {
         self.pending
-            .take_if(|pending| pending.finalization.proposal.payload == commitment)
+            .take_if(|pending| {
+                M::finalization_proposal(&pending.finalization).payload == commitment
+            })
             .map(|pending| pending.finalization)
     }
 
@@ -171,7 +170,7 @@ impl<S: Scheme, C: Digest> State<S, C> {
     /// Finalized rounds and heights increase together along the finalized chain, so
     /// an anchor at or below the round floor sits at or below the processed height.
     #[must_use]
-    pub(super) fn take_superseded(&mut self, round: Round) -> Option<Finalization<S, C>> {
+    pub(super) fn take_superseded(&mut self, round: Round) -> Option<M::Certificate> {
         self.pending
             .take_if(|pending| pending.finalization.round() <= round)
             .map(|pending| pending.finalization)

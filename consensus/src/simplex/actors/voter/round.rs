@@ -3,7 +3,8 @@ use crate::{
     simplex::{
         actors::span::ViewSpan,
         metrics::TimeoutReason,
-        types::{Artifact, Finalization, Notarization, Nullification, Proposal},
+        phase2::{Plain, voting::Voting},
+        types::{ArtifactWith, Notarization, Nullification, Proposal},
     },
     types::{Attributable, Participant, Round as Rnd, View},
 };
@@ -19,7 +20,7 @@ use tracing::{Span, debug, info_span};
 /// No honest participant votes both nullify and finalize in a single view (see
 /// [Same-Term Vote Safety](crate::simplex#same-term-vote-safety)). Neither
 /// vote is retracted, so a round never returns to [Decision::Pending].
-enum Decision {
+enum Decision<F> {
     /// Neither vote broadcast. The leader and certification deadlines are
     /// armed on view entry. [Round::next_timeout] ignores the leader deadline
     /// once a proposal is known (which can happen before view entry) and the
@@ -34,10 +35,10 @@ enum Decision {
     /// [Round::next_timeout] schedules it on the first poll after each vote.
     Nullify { retry: Option<SystemTime> },
     /// Finalize vote broadcast. No round-local timeout can fire.
-    Finalize,
+    Finalize(F),
 }
 
-impl Decision {
+impl<F> Decision<F> {
     /// Returns true if neither vote was broadcast.
     const fn is_pending(&self) -> bool {
         matches!(self, Self::Pending { .. })
@@ -50,7 +51,7 @@ impl Decision {
 
     /// Returns true if we broadcast a finalize vote.
     const fn is_finalize(&self) -> bool {
-        matches!(self, Self::Finalize)
+        matches!(self, Self::Finalize(_))
     }
 }
 
@@ -74,7 +75,10 @@ enum CertifyState {
 }
 
 /// Per-[Rnd] state machine.
-pub struct Round<S: Scheme, D: Digest> {
+pub type Round<S, D> = RoundWith<S, D, Plain>;
+
+/// Native per-view voter state with mode-specific final subjects and certificates.
+pub struct RoundWith<S: Scheme, D: Digest, M: Voting<S, D>> {
     // When the local node entered this view (see `State::enter_view`). Unset
     // for rounds created early by optimistic lookahead or future-view
     // messages. Latency samples fall back to this when `proposed_at` is unset.
@@ -95,7 +99,8 @@ pub struct Round<S: Scheme, D: Digest> {
 
     proposal: ProposalSlot<D>,
 
-    decision: Decision,
+    decision: Decision<M::FinalSubject>,
+    recovery: M::RecoveryState,
 
     // Same-term stall anchor armed by `Self::set_deadlines`. Unlike the
     // round-local timeouts, it survives both local votes and is only
@@ -108,7 +113,7 @@ pub struct Round<S: Scheme, D: Digest> {
     broadcast_notarization: bool,
     nullification: Option<Nullification<S>>,
     broadcast_nullification: bool,
-    finalization: Option<Finalization<S, D>>,
+    finalization: Option<M::Certificate>,
     broadcast_finalization: bool,
     certify: CertifyState,
     last_ancestry_request: Option<View>,
@@ -118,7 +123,7 @@ pub struct Round<S: Scheme, D: Digest> {
     verifying: Option<(Proposal<D>, D)>,
 }
 
-impl<S: Scheme, D: Digest> Round<S, D> {
+impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
     pub const fn new(scheme: S, round: Rnd) -> Self {
         Self {
             entered_at: None,
@@ -133,6 +138,7 @@ impl<S: Scheme, D: Digest> Round<S, D> {
                 certification: None,
                 latch: None,
             },
+            recovery: M::EMPTY_RECOVERY,
             stall_deadline: None,
             notarization: None,
             broadcast_notarize: false,
@@ -330,7 +336,7 @@ impl<S: Scheme, D: Digest> Round<S, D> {
     }
 
     /// Returns the finalization certificate if we already reconstructed one.
-    pub const fn finalization(&self) -> Option<&Finalization<S, D>> {
+    pub const fn finalization(&self) -> Option<&M::Certificate> {
         self.finalization.as_ref()
     }
 
@@ -361,7 +367,7 @@ impl<S: Scheme, D: Digest> Round<S, D> {
             return None;
         }
         if let Some(finalization) = &self.finalization {
-            return Some(&finalization.proposal.payload);
+            return Some(&M::finalization_proposal(finalization).payload);
         }
         self.notarization
             .as_ref()
@@ -539,7 +545,7 @@ impl<S: Scheme, D: Digest> Round<S, D> {
     /// Returns `Some(true)` if this is a retry (we've already broadcast nullify before),
     /// `Some(false)` if this is the first timeout for this round, and `None` if we
     /// should not timeout (e.g. because we have already finalized).
-    pub const fn construct_nullify(&mut self) -> Option<bool> {
+    pub fn construct_nullify(&mut self) -> Option<bool> {
         if self.decision.is_finalize() {
             return None;
         }
@@ -561,7 +567,7 @@ impl<S: Scheme, D: Digest> Round<S, D> {
         let proposed = self.proposal().is_some();
         let certified = self.is_certified();
         match &mut self.decision {
-            Decision::Finalize => None,
+            Decision::Finalize(_) => None,
             // Schedule the retry on the first poll after a nullify broadcast
             // (this also covers rounds restored from replay).
             Decision::Nullify { retry } => {
@@ -657,7 +663,7 @@ impl<S: Scheme, D: Digest> Round<S, D> {
     /// Returns the leader's public key if equivocation is detected.
     pub fn add_finalization(
         &mut self,
-        finalization: Finalization<S, D>,
+        finalization: M::Certificate,
     ) -> (bool, Option<S::PublicKey>) {
         // Only one finalization certificate can exist unless safety already failed, so we ignore
         // later duplicates.
@@ -665,7 +671,8 @@ impl<S: Scheme, D: Digest> Round<S, D> {
             return (false, None);
         }
 
-        let equivocator = self.add_recovered_proposal(finalization.proposal.clone());
+        let equivocator =
+            self.add_recovered_proposal(M::finalization_proposal(&finalization).clone());
         self.finalization = Some(finalization);
         (true, equivocator)
     }
@@ -695,7 +702,7 @@ impl<S: Scheme, D: Digest> Round<S, D> {
     }
 
     /// Returns a finalization certificate for broadcast if we have one and haven't broadcast it yet.
-    pub fn broadcast_finalization(&mut self) -> Option<Finalization<S, D>> {
+    pub fn broadcast_finalization(&mut self) -> Option<M::Certificate> {
         if self.broadcast_finalization {
             return None;
         }
@@ -735,11 +742,11 @@ impl<S: Scheme, D: Digest> Round<S, D> {
     /// Returns a proposal candidate for finalization if we're ready to vote.
     ///
     /// Marks that we've broadcast our finalize vote to prevent duplicates.
-    pub fn construct_finalize(&mut self) -> Option<&Proposal<D>> {
+    pub fn construct_finalize_with(&mut self, subject: M::FinalSubject) -> Option<&Proposal<D>> {
         // Ensure we haven't already broadcast a finalize vote or nullify vote.
         // The nullify check is the never-healing base case of same-term vote
         // safety (see the module documentation).
-        if !self.decision.is_pending() {
+        if !self.decision.is_pending() || !M::allows_original(&self.recovery) {
             return None;
         }
         // We do not check for an observed finalization here: the caller only
@@ -763,23 +770,63 @@ impl<S: Scheme, D: Digest> Round<S, D> {
             return None;
         }
 
-        self.decision = Decision::Finalize;
+        if !M::matches_subject(self.proposal.proposal()?, &subject) {
+            return None;
+        }
+        self.decision = Decision::Finalize(subject);
         self.proposal.proposal()
     }
 
-    pub fn replay(&mut self, artifact: &Artifact<S, D>) {
+    /// The exact locally accepted final subject, including after journal replay.
+    /// This is a local vote, not a quorum certificate or canonical finality.
+    pub const fn final_subject(&self) -> Option<&M::FinalSubject> {
+        match &self.decision {
+            Decision::Finalize(subject) => Some(subject),
+            _ => None,
+        }
+    }
+
+    /// Read-only recovery fence, including the frozen pre-ballot acceptance.
+    pub const fn recovery_state(&self) -> &M::RecoveryState {
+        &self.recovery
+    }
+
+    /// Stages a checked local recovery decision. The actor must journal and sync
+    /// before exposing any resulting status or vote; failure is fatal to the actor.
+    pub fn stage_recovery(&mut self, record: &M::Recovery) -> bool {
+        if self.notarization.is_none()
+            || self.proposal.proposal() != Some(M::recovery_proposal(record))
+        {
+            return false;
+        }
+        let original = match &self.decision {
+            Decision::Finalize(s) => Some(s),
+            _ => None,
+        };
+        M::replay_recovery(&mut self.recovery, original, record)
+    }
+
+    pub fn replay(&mut self, artifact: &ArtifactWith<S, D, M>) {
         match artifact {
-            Artifact::Notarize(notarize) => {
+            ArtifactWith::Recovered(_) => {}
+            ArtifactWith::Recovery(record) => {
+                assert!(
+                    self.stage_recovery(record),
+                    "invalid recovery fence transition"
+                );
+            }
+            ArtifactWith::Notarize(notarize) => {
                 assert!(
                     self.is_signer(notarize.signer()),
                     "replaying notarize from another signer"
                 );
 
                 // Our journaled notarize records a locally verified proposal.
-                self.proposal.record_verified(notarize.proposal.clone());
+                self.proposal
+                    .record_verified(M::notarize(notarize).proposal.clone());
                 self.broadcast_notarize = true;
             }
-            Artifact::Nullify(nullify) => {
+            ArtifactWith::Nullify(nullify) => {
                 assert!(
                     self.is_signer(nullify.signer()),
                     "replaying nullify from another signer"
@@ -793,7 +840,11 @@ impl<S: Scheme, D: Digest> Round<S, D> {
                 );
                 self.decision = Decision::Nullify { retry: None };
             }
-            Artifact::Finalize(finalize) => {
+            ArtifactWith::Finalize(finalize) => {
+                assert!(
+                    M::allows_original(&self.recovery),
+                    "original final vote after recovery promise"
+                );
                 assert!(
                     self.is_signer(finalize.signer()),
                     "replaying finalize from another signer"
@@ -805,21 +856,32 @@ impl<S: Scheme, D: Digest> Round<S, D> {
                     !self.decision.is_nullify(),
                     "replayed finalize conflicts with local nullify"
                 );
-                self.decision = Decision::Finalize;
+                let subject = M::final_subject(finalize);
+                if let Decision::Finalize(previous) = &self.decision {
+                    assert_eq!(previous, &subject, "replayed conflicting final subjects");
+                }
+                self.decision = Decision::Finalize(subject);
             }
-            Artifact::Notarization(_) => {
+            ArtifactWith::Notarization(_) => {
                 self.broadcast_notarization = true;
             }
-            Artifact::Nullification(_) => {
+            ArtifactWith::Nullification(_) => {
                 self.broadcast_nullification = true;
             }
-            Artifact::Finalization(_) => {
+            ArtifactWith::Finalization(_) => {
                 self.broadcast_finalization = true;
             }
-            Artifact::Certification(_, success) => {
+            ArtifactWith::Certification(_, success) => {
                 self.certified(*success);
             }
         }
+    }
+}
+
+impl<S: Scheme, D: Digest> RoundWith<S, D, Plain> {
+    /// Preserves the stock finalize decision with no extension payload.
+    pub fn construct_finalize(&mut self) -> Option<&Proposal<D>> {
+        self.construct_finalize_with(())
     }
 }
 
@@ -830,7 +892,8 @@ mod tests {
         simplex::{
             scheme::ed25519,
             types::{
-                Finalization, Finalize, Notarization, Notarize, Nullification, Nullify, Proposal,
+                Artifact, Finalization, Finalize, Notarization, Notarize, Nullification, Nullify,
+                Proposal,
             },
         },
         types::{Epoch, Participant, View},

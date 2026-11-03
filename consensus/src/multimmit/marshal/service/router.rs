@@ -228,7 +228,9 @@ where
     fn on_hint(&mut self, activity: Activity<V, H::Digest>) {
         match activity {
             // The public mailbox hands certificate records to the catalog directly.
-            Activity::TransactionProposed { .. } | Activity::CertificateRecorded { .. } => {}
+            Activity::TransactionProposed { .. }
+            | Activity::CertificateRecorded { .. }
+            | Activity::ParentPrepared { .. } => {}
             Activity::CommitmentsAccepted { commitments } => {
                 let _ = self.synchronizer.commitments(commitments);
             }

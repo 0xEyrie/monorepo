@@ -12,7 +12,7 @@ use crate::{
     multimmit::types::CodecConfig,
     types::{Attributable, Epoch, Participant, Round, View},
 };
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 use commonware_codec::{
     Buf, EncodeSize, Error as CodecError, FixedSize as _, RangeCfg, Read, ReadExt, Write,
 };
@@ -107,6 +107,7 @@ pub struct Ballot<D: Digest> {
     leader: D,
     positions: Arc<[Position]>,
     extensions: Arc<[Extension<D>]>,
+    application: Bytes,
 }
 
 impl<D: Digest> Ballot<D> {
@@ -121,6 +122,7 @@ impl<D: Digest> Ballot<D> {
             leader,
             positions: positions.into(),
             extensions: extensions.into(),
+            application: Bytes::new(),
         };
         ballot.validate(limits)?;
         Ok(ballot)
@@ -141,8 +143,28 @@ impl<D: Digest> Ballot<D> {
         &self.extensions
     }
 
+    /// Returns the application report authenticated with this ballot.
+    /// This report is not a vote for a direction selected after collection.
+    pub const fn application(&self) -> &Bytes {
+        &self.application
+    }
+
+    /// Attaches a report within the epoch's application-extension byte bound.
+    pub fn with_application(
+        mut self,
+        application: Bytes,
+        limits: CodecConfig,
+    ) -> Result<Self, Error> {
+        self.application = application;
+        self.validate(limits)?;
+        Ok(self)
+    }
+
     /// Checks the chain count, positions, and extensions against `limits`.
     pub(super) fn validate(&self, limits: CodecConfig) -> Result<(), Error> {
+        if self.application.len() > limits.proposal_extension_bound() {
+            return Err(Error::VoteApplicationLength);
+        }
         if self.positions.len() != limits.chains() || self.extensions.len() != limits.chains() {
             return Err(Error::ChainCount);
         }
@@ -175,6 +197,7 @@ impl<D: Digest> Ballot<D> {
             D::SIZE,
             encoded_vec(chains, encoded_len(codec.pipeline_depth())?)?,
             encoded_vec(chains, Extension::<D>::max_encode_size(codec)?)?,
+            encoded_vec(codec.proposal_extension_bound(), 1)?,
         ])
     }
 }
@@ -184,6 +207,7 @@ impl<D: Digest> Write for Ballot<D> {
         self.leader.write(buf);
         self.positions().write(buf);
         self.extensions().write(buf);
+        self.application.write(buf);
     }
 }
 
@@ -196,14 +220,19 @@ impl<D: Digest> Read for Ballot<D> {
         let positions = Vec::<Position>::read_cfg(buf, &(exact_chains, ()))?;
         let extensions =
             Vec::<Extension<D>>::read_cfg(buf, &(exact_chains, limits.extension_bound()))?;
+        let application = Bytes::read_cfg(buf, &(0..=limits.proposal_extension_bound()).into())?;
         Self::new(leader, positions, extensions, *limits)
+            .and_then(|ballot| ballot.with_application(application, *limits))
             .map_err(|error| CodecError::Wrapped("Ballot", error.into()))
     }
 }
 
 impl<D: Digest> EncodeSize for Ballot<D> {
     fn encode_size(&self) -> usize {
-        self.leader.encode_size() + self.positions().encode_size() + self.extensions().encode_size()
+        self.leader.encode_size()
+            + self.positions().encode_size()
+            + self.extensions().encode_size()
+            + self.application.encode_size()
     }
 }
 
@@ -232,6 +261,7 @@ impl<D: Digest> VoteBody<D> {
                 leader,
                 positions: positions.into(),
                 extensions: extensions.into(),
+                application: Bytes::new(),
             },
         };
         body.validate(limits)?;
@@ -298,6 +328,21 @@ impl<D: Digest> VoteBody<D> {
     /// Returns one extension per producer chain in chain order.
     pub fn extensions(&self) -> &[Extension<D>] {
         self.ballot.extensions()
+    }
+
+    /// Returns the application report covered by the ordinary vote signature.
+    pub const fn application(&self) -> &Bytes {
+        self.ballot.application()
+    }
+
+    /// Attaches a bounded application report before signing this vote body.
+    pub fn with_application(
+        mut self,
+        application: Bytes,
+        limits: CodecConfig,
+    ) -> Result<Self, Error> {
+        self.ballot = self.ballot.with_application(application, limits)?;
+        Ok(self)
     }
 
     pub(crate) fn validate(&self, limits: CodecConfig) -> Result<(), Error> {
@@ -788,6 +833,7 @@ mod tests {
             digest(b"leader"),
             vec![Position::new(3), Position::new(0)],
             vec![Extension::<sha256::Digest>::empty(), Extension::empty()],
+            Bytes::new(),
         )
             .encode();
         let error = VoteBody::<sha256::Digest>::decode_cfg(encoded, &codec_config()).unwrap_err();
@@ -958,6 +1004,7 @@ mod tests {
             body.leader(),
             body.positions().to_vec(),
             body.extensions().to_vec(),
+            body.application().clone(),
         )
             .encode();
         assert_eq!(body.encode(), encoded_vectors);

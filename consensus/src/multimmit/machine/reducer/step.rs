@@ -627,10 +627,26 @@ impl<H: Hasher, V: Variant> Machine<H, V> {
             Artifact::LeaderBlock(block) => self.history_acceptance(block).ok(),
             _ => None,
         };
+        let prepared = match artifact.as_ref() {
+            Artifact::Vqc(certificate) => {
+                self.views
+                    .prepared_history(&artifact)
+                    .map(|(commitment, record)| Activity::ParentPrepared {
+                        round: certificate.leader().round(),
+                        artifact_id,
+                        commitment,
+                        record,
+                    })
+            }
+            _ => None,
+        };
         activities.push(Activity::ProtocolAccepted {
             artifact_id,
             artifact,
         });
+        if let Some(prepared) = prepared {
+            activities.push(prepared);
+        }
         if let Some(history) = history {
             activities.push(history);
         }
@@ -645,7 +661,7 @@ impl<H: Hasher, V: Variant> Machine<H, V> {
         &self,
         block: &SignedLeaderBlock<V, H::Digest>,
     ) -> Result<Activity<V, H::Digest>, ViewError> {
-        let record = self.views.leader_history::<H>(block.block())?;
+        let record = self.views.leader_history(block.block())?;
         Ok(Activity::HistoryAccepted {
             view: block.view(),
             commitment: block.block().history(),

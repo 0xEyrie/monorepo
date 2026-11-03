@@ -4534,7 +4534,7 @@ mod tests {
             page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
             strategy: Sequential,
         };
-        let finalizations_by_height = immutable::Archive::init(
+        let finalizations_by_height = immutable::Archive::<_, D, Finalization<S, D>>::init(
             context.child("finalizations_by_height"),
             immutable::Config {
                 metadata_partition: format!("{partition_prefix}-finalizations-by-height-metadata"),
@@ -7918,7 +7918,7 @@ mod tests {
                 page_cache: page_cache.clone(),
                 strategy: Sequential,
             };
-            let finalizations_by_height = prunable::Archive::init(
+            let finalizations_by_height = prunable::Archive::<_, _, D, Finalization<S, D>>::init(
                 context.child("finalizations_by_height"),
                 prunable::Config {
                     translator: EightCap,
@@ -8199,13 +8199,17 @@ mod tests {
         type BlockDigest = T::BlockDigest;
         type Commitment = T::Commitment;
         type Scheme = T::Scheme;
+        type Mode = T::Mode;
         type Error = T::Error;
 
         async fn put(
             mut self,
             height: Height,
             digest: Self::BlockDigest,
-            finalization: &Finalization<Self::Scheme, Self::Commitment>,
+            finalization: &<Self::Mode as crate::simplex::phase2::Mode<
+                Self::Scheme,
+                Self::Commitment,
+            >>::Certificate,
         ) -> Result<Self, Self::Error> {
             self.inner = self.inner.put(height, digest, finalization).await?;
             Ok(self)
@@ -8235,7 +8239,7 @@ mod tests {
         async fn get(
             &self,
             id: commonware_storage::archive::Identifier<'_, Self::BlockDigest>,
-        ) -> Result<Option<Finalization<Self::Scheme, Self::Commitment>>, Self::Error> {
+        ) -> Result<Option<<Self::Mode as crate::simplex::phase2::Mode<Self::Scheme, Self::Commitment>>::Certificate>, Self::Error>{
             self.inner.get(id).await
         }
 
@@ -8266,7 +8270,7 @@ mod tests {
         partition_prefix: &str,
     ) -> (Finalizations, FinalizedBlocks<T>) {
         let page_cache = CacheRef::from_pooler(context, PAGE_SIZE, PAGE_CACHE_SIZE);
-        let finalizations_by_height = prunable::Archive::init(
+        let finalizations_by_height = prunable::Archive::<_, _, D, Finalization<S, D>>::init(
             context.child("finalizations_by_height"),
             prunable::Config {
                 translator: EightCap,

@@ -103,6 +103,48 @@ proptest! {
 }
 
 #[test]
+fn application_reports_survive_tally_compaction_and_reject_missing_or_oversize_entries() {
+    let config = config().with_proposal_extension_bound(32);
+    let leader = leader();
+    let digested = DigestedLeader::new::<Sha256>(&leader);
+    let votes = [4, 1, 3]
+        .into_iter()
+        .map(|signer| {
+            let body = VoteBody::for_leader(
+                digested,
+                vec![Position::new(1); config.chains()],
+                vec![Extension::empty(); config.chains()],
+                config,
+            )
+            .unwrap()
+            .with_application(Bytes::from(vec![signer as u8; 3]), config)
+            .unwrap();
+            (Participant::new(signer), body)
+        })
+        .collect::<Vec<_>>();
+    let tally = Tally::from_votes(digested, votes.clone(), config).unwrap();
+    let mut encoded = tally.encode();
+    let decoded = Tally::decode_for_leader(&mut encoded, &leader, config).unwrap();
+    assert!(!encoded.has_remaining());
+    for (signer, body) in votes {
+        assert_eq!(decoded.vote(digested, signer, config).unwrap(), body);
+        assert_eq!(VoteBody::decode_cfg(body.encode(), &config).unwrap(), body);
+        assert!(
+            body.with_application(Bytes::from(vec![0; 33]), config)
+                .is_err()
+        );
+    }
+    let mut missing = tally.clone();
+    missing.applications.pop();
+    assert_eq!(missing.validate(&leader, config), Err(Error::Transcript));
+    assert!(Tally::decode_for_leader(&mut missing.encode(), &leader, config).is_err());
+    let mut oversize = tally;
+    oversize.applications[0] = Bytes::from(vec![0; 33]);
+    assert_eq!(oversize.validate(&leader, config), Err(Error::Transcript));
+    assert!(Tally::decode_for_leader(&mut oversize.encode(), &leader, config).is_err());
+}
+
+#[test]
 fn reference_prefers_most_common_standard_vote_then_canonical_bytes() {
     let config = config();
     let leader = leader();
@@ -494,6 +536,7 @@ fn certificate_extension_deviations<V: Variant>() {
                     )
                     .write(&mut dense);
                 }
+                tally.applications.write(&mut dense);
                 let dense_size = encoded.len() - tally.encode_size() + dense.len();
                 match changed {
                     0 => assert_eq!(encoded.len(), dense_size + 1),
@@ -651,6 +694,7 @@ fn validation_rejects_expanded_height_overflow() {
     let mut reference_extensions = vec![Extension::empty(); config.chains()];
     reference_extensions[0] = Extension::new(vec![digest(300)], config.extension_bound()).unwrap();
     let tally = Tally {
+        applications: vec![Bytes::new()],
         extension_paths: Vec::new(),
         reference_extensions,
         signers: Signers::new(
@@ -671,6 +715,7 @@ fn expanding_untrusted_tally_never_indexes_an_unchecked_chain() {
     let config = config();
     let leader = leader();
     let mut tally = Tally {
+        applications: vec![Bytes::new()],
         extension_paths: Vec::new(),
         reference_extensions: vec![Extension::empty(); config.chains()],
         signers: Signers::new(

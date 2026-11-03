@@ -2,7 +2,7 @@
 
 use crate::{
     multimmit::types::{Artifact, ArtifactId, BlockRef, FinalityFact, TipRecord},
-    types::{Epoch, Height, View},
+    types::{Epoch, Height, Round, View},
 };
 use commonware_cryptography::{Digest, bls12381::primitives::variant::Variant};
 use std::sync::Arc;
@@ -91,6 +91,20 @@ pub enum Activity<V: Variant, D: Digest> {
         artifact_id: ArtifactId<D>,
         /// Admitted artifact.
         artifact: Arc<Artifact<V, D>>,
+    },
+    /// A contextually admitted V-QC supplies a possible successor history.
+    ///
+    /// This is an advisory planning observation. Another certificate may be selected as the
+    /// successor's parent. It does not establish final order, body availability, or delivery.
+    ParentPrepared {
+        /// Round certified by the retained V-QC.
+        round: Round,
+        /// Exact admitted certificate artifact supplying this candidate.
+        artifact_id: ArtifactId<D>,
+        /// Commitment a successor choosing this parent would carry.
+        commitment: D,
+        /// Safe-tip opening reconstructed from the exact validated parent.
+        record: Arc<TipRecord<D>>,
     },
     /// An authenticated leader exposed its safe-tip history opening for peer seeding.
     HistoryAccepted {

@@ -383,13 +383,9 @@ pub(super) fn leader_extending_view_one_vqc(
     let (tips, _) = VqcExtraction::new::<Sha256, MinPk>(parent, protocol.codec_config())
         .unwrap()
         .into_parts();
-    let history = TipRecord::new(
-        parent.leader().history(),
-        tips.blocks().to_vec(),
-        parent.leader().proposed_heights(),
-    )
-    .unwrap()
-    .commitment::<Sha256>();
+    let history = TipRecord::from_vqc::<Sha256, MinPk>(parent, tips.blocks().to_vec())
+        .unwrap()
+        .commitment::<Sha256>();
     let leader = LeaderBlock::new(
         Round::new(protocol.epoch(), View::new(view)),
         parent.id::<Sha256>(),
@@ -1014,7 +1010,8 @@ pub(super) fn record_protocol_acceptances(
         Activity::CommitmentsAccepted { .. }
         | Activity::HistoryAccepted { .. }
         | Activity::TransactionProposed { .. }
-        | Activity::CertificateRecorded { .. } => None,
+        | Activity::CertificateRecorded { .. }
+        | Activity::ParentPrepared { .. } => None,
         Activity::LeaderFinalized { .. } | Activity::LeaderFinalityUpdated { .. } => None,
     }));
 }

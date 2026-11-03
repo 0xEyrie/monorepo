@@ -103,6 +103,30 @@ impl<'a, D: Digest> CertificateSubject for Subject<'a, D> {
             Self::Notarize { .. } => &derived.notarize,
             Self::Nullify { .. } => &derived.nullify,
             Self::Finalize { .. } => &derived.finalize,
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Self::FinalizeExtension { .. } => &derived.finalize,
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Self::ExtensionStatus { .. } => &derived.finalize,
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Self::ExtensionRequest { .. } => &derived.finalize,
         }
     }
 
@@ -111,6 +135,39 @@ impl<'a, D: Digest> CertificateSubject for Subject<'a, D> {
             Self::Notarize { proposal } => proposal.encode(),
             Self::Nullify { round } => round.encode(),
             Self::Finalize { proposal } => proposal.encode(),
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Self::FinalizeExtension { statement } => {
+                // The tagged full statement is distinct from ordinary Proposal encoding.
+                let tag = crate::simplex::extension::vote::SIGNING_TAG;
+                Bytes::from([tag, statement.encode().as_ref()].concat())
+            }
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Self::ExtensionStatus { promise } => {
+                let tag = crate::simplex::extension::recovery::SIGNING_TAG;
+                Bytes::from([tag, promise.encode().as_ref()].concat())
+            }
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Self::ExtensionRequest { payload, .. } => {
+                Bytes::from([crate::simplex::extension::request::SIGNING_TAG, *payload].concat())
+            }
         }
     }
 }

@@ -2,7 +2,12 @@ use super::{
     actors::{batcher, resolver, voter},
     config::{Config, SkipPolicy},
     elector::{self, Elector as _},
-    types::{Activity, Context},
+    phase2::{
+        Plain,
+        aggregation::Aggregation,
+        voting::{NoExtension, Participation, Voting},
+    },
+    types::{ActivityWith, Context},
 };
 use crate::{
     CertifiableAutomaton, Relay, Reporter,
@@ -27,19 +32,21 @@ pub struct Engine<
     D: Digest,
     A: CertifiableAutomaton<Context = Context<D, S::PublicKey>, Digest = D>,
     R: Relay<Digest = D, PublicKey = S::PublicKey, Plan = Plan<S::PublicKey>>,
-    F: Reporter<Activity = Activity<S, D>>,
+    F: Reporter<Activity = ActivityWith<S, D, M>>,
     T: Strategy,
+    M: Aggregation<S, D> + Voting<S, D> = Plain,
+    X: Participation<S, D, M> = NoExtension,
 > {
     context: ContextCell<E>,
 
-    voter: voter::Actor<E, S, L::Elector, B, D, A, R, F>,
-    voter_mailbox: voter::Mailbox<S, D>,
+    voter: voter::ActorWith<E, S, L::Elector, B, D, A, R, F, M, X>,
+    voter_mailbox: voter::Mailbox<S, D, M>,
 
-    batcher: batcher::Actor<E, S, B, D, F, R, T>,
-    batcher_mailbox: batcher::Mailbox<S, D>,
+    batcher: batcher::ActorWith<E, S, B, D, F, R, T, M>,
+    batcher_mailbox: batcher::Mailbox<S, D, M>,
 
-    resolver: resolver::Actor<E, S, B, D, T>,
-    resolver_mailbox: resolver::Mailbox<S, D>,
+    resolver: resolver::ActorWith<E, S, B, D, T, M>,
+    resolver_mailbox: resolver::Mailbox<S, D, M>,
 }
 
 impl<
@@ -50,12 +57,34 @@ impl<
     D: Digest,
     A: CertifiableAutomaton<Context = Context<D, S::PublicKey>, Digest = D>,
     R: Relay<Digest = D, PublicKey = S::PublicKey, Plan = Plan<S::PublicKey>>,
-    F: Reporter<Activity = Activity<S, D>>,
+    F: Reporter<Activity = ActivityWith<S, D, M>>,
     T: Strategy,
-> Engine<E, S, L, B, D, A, R, F, T>
+    M: Aggregation<S, D> + Voting<S, D>,
+    X: Participation<S, D, M>,
+> Engine<E, S, L, B, D, A, R, F, T, M, X>
 {
-    /// Create a new `simplex` consensus engine.
-    pub fn new(mut context: E, cfg: Config<S, L, B, D, A, R, F, T>) -> Self {
+    /// Constructs an engine with a static vote representation and trusted evidence adapter.
+    ///
+    /// The adapter must restore durable evidence before startup and authenticate
+    /// application material before making it ready. It cannot grant native vote
+    /// eligibility or parent authority. Extended split-vote recovery and bounded
+    /// exact-history fetching are not yet integrated; this is an experimental API.
+    #[commonware_macros::stability(ALPHA)]
+    pub fn new_with(
+        context: E,
+        cfg: Config<S, L, B, D, A, R, F, T, M>,
+        mode_context: M::Context,
+        participation: X,
+    ) -> Self {
+        Self::build(context, cfg, mode_context, participation)
+    }
+
+    fn build(
+        mut context: E,
+        cfg: Config<S, L, B, D, A, R, F, T, M>,
+        mode_context: M::Context,
+        participation: X,
+    ) -> Self {
         // Ensure configuration is valid
         cfg.assert(&mut context);
         let skip_budget = match cfg.skip {
@@ -73,7 +102,7 @@ impl<
         }
 
         // Create batcher
-        let (batcher, batcher_mailbox) = batcher::Actor::new(
+        let (batcher, batcher_mailbox) = batcher::ActorWith::new(
             context.child("batcher"),
             batcher::Config {
                 scheme: cfg.scheme.clone(),
@@ -93,7 +122,7 @@ impl<
         );
 
         // Create voter
-        let (voter, voter_mailbox) = voter::Actor::new(
+        let (voter, voter_mailbox) = voter::ActorWith::new_with(
             context.child("voter"),
             voter::Config {
                 scheme: cfg.scheme.clone(),
@@ -115,10 +144,12 @@ impl<
                 write_buffer: cfg.write_buffer,
                 page_cache: cfg.page_cache,
             },
+            mode_context,
+            participation,
         );
 
         // Create resolver
-        let (resolver, resolver_mailbox) = resolver::Actor::new(
+        let (resolver, resolver_mailbox) = resolver::ActorWith::new(
             context.child("resolver"),
             resolver::Config {
                 blocker: cfg.blocker,
@@ -143,6 +174,14 @@ impl<
 
             resolver,
             resolver_mailbox,
+        }
+    }
+
+    /// Returns a local readiness notifier. It cannot inject votes or certificates.
+    #[commonware_macros::stability(ALPHA)]
+    pub fn readiness(&self) -> Readiness<S, D, M> {
+        Readiness {
+            mailbox: self.voter_mailbox.clone(),
         }
     }
 
@@ -261,3 +300,82 @@ impl<
         }
     }
 }
+
+impl<
+    E: BufferPooler + Clock + CryptoRng + Spawner + Storage + Metrics,
+    S: Scheme<D>,
+    L: elector::Config<S>,
+    B: Blocker<PublicKey = S::PublicKey>,
+    D: Digest,
+    A: CertifiableAutomaton<Context = Context<D, S::PublicKey>, Digest = D>,
+    R: Relay<Digest = D, PublicKey = S::PublicKey, Plan = Plan<S::PublicKey>>,
+    F: Reporter<Activity = ActivityWith<S, D, Plain>>,
+    T: Strategy,
+> Engine<E, S, L, B, D, A, R, F, T>
+{
+    /// Creates the stock Simplex engine without extension state or wire fields.
+    pub fn new(context: E, cfg: Config<S, L, B, D, A, R, F, T>) -> Self {
+        Self::build(context, cfg, (), NoExtension)
+    }
+}
+
+commonware_macros::stability_scope!(ALPHA {
+    /// Exact Accept request admitted by the live native voter for material retention.
+    /// This is neither a vote nor durable authority. After custody, the voter repeats
+    /// election, deadline, ancestry, proof and local fence checks before staging.
+    /// No decoder or public constructor can recreate this live admission.
+    pub struct AdmittedRecovery<S: Scheme<D>, D: Digest> {
+        request: super::extension::request::Request<S,D>,
+    }
+    impl<S: Scheme<D>, D: Digest> AdmittedRecovery<S,D> {
+        /// The exact immutable request checked by the native voter.
+        pub const fn request(&self) -> &super::extension::request::Request<S,D> { &self.request }
+        /// Consumes admission and returns its original request as untrusted data.
+        pub fn into_request(self) -> super::extension::request::Request<S,D> { self.request }
+    }
+    /// A trusted application may announce that its retained evidence changed.
+    /// Native eligibility, ancestry and journal durability still govern voting.
+    #[derive(Clone)]
+    pub struct Readiness<S: Scheme<D>, D: Digest, M: Voting<S, D>> {
+        mailbox: voter::Mailbox<S, D, M>,
+    }
+    impl<S:Scheme<D>,D:Digest> Readiness<S,D,super::phase2::Extended> {
+        /// Admits an exact Accept for custody only after read-only native validation.
+        /// Closure or refusal yields no token. Eligibility can change during custody;
+        /// request_recovery must still perform the normal validation and sync barrier.
+        pub fn admit_recovery(&mut self,request:super::extension::request::Request<S,D>) -> impl std::future::Future<Output=Option<AdmittedRecovery<S,D>>> + Send + 'static {
+            use commonware_codec::EncodeSize as _;
+            let reply = (request.encode_size() <= super::extension::request::MAX_BYTES)
+                .then(|| self.mailbox.validate_recovery(request.clone()));
+            async move {
+                if reply?.await.ok()? { Some(AdmittedRecovery { request }) } else { None }
+            }
+        }
+        /// Polls native leader/deadline/ancestry state or prepares a request from
+        /// a retained original status quorum. It does not grant a voting decision.
+        pub fn prepare_recovery(&mut self,query:super::extension::request::Query<S,D>)->commonware_utils::channel::oneshot::Receiver<Option<super::extension::request::Request<S,D>>> {
+            self.mailbox.prepare_recovery(query)
+        }
+        /// Installs an authenticated parent interpretation after native journal sync.
+        /// True is durable retention, not canonical finality or delivery authority.
+        pub fn install_recovered(&mut self,certificate:super::extension::certificate::Recovered<S,D>)->commonware_utils::channel::oneshot::Receiver<bool> {
+            self.mailbox.install_recovered(certificate)
+        }
+        /// Submits a signed replacement-leader request to the native voter.
+        /// A response is produced only after native validation and journal sync.
+        /// Neither this handle nor an evidence callback can grant voting authority.
+        pub fn request_recovery(&mut self,request:super::extension::request::Request<S,D>)->commonware_utils::channel::oneshot::Receiver<Option<super::extension::request::Response<S,D>>> {
+            self.mailbox.recover_extension(request)
+        }
+    }
+    impl<S: Scheme<D>, D: Digest, M: Voting<S, D>> Readiness<S, D, M> {
+        /// Retry this view after evidence has been authenticated and made durable.
+        /// Repeated pending notifications for the same view are coalesced.
+        pub fn notify(&mut self, view: crate::types::View) {
+            self.mailbox.interpretation_ready(view);
+        }
+    }
+    #[cfg(test)]
+    #[path = "extension/coordinator_tests.rs"]
+    mod coordinator_tests;
+});

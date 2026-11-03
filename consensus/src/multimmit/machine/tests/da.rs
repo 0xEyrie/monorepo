@@ -49,6 +49,58 @@ use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 #[test]
+fn planned_anchor_survives_newer_certificates_within_pipeline_window() {
+    let profile = Harness::validator(0).participants(6).profile();
+    let mut chain = ChainState::<MinPk, Digest>::new(&profile);
+    chain.proposal_policy = crate::multimmit::config::ProposalPolicy::Certified;
+    let protocol = profile.protocol();
+    let genesis = protocol.genesis().tips()[0];
+    let depth = protocol.codec_config().pipeline_depth();
+    assert_eq!(depth, 2);
+    let mut parent = genesis;
+    let mut first = None;
+    for height in 1..=4 {
+        let header = TransactionBlockHeader::new(
+            protocol.epoch(),
+            genesis.chain(),
+            Height::new(height),
+            parent.digest(),
+            digest(format!("retained anchor {height}").as_bytes()),
+        )
+        .unwrap();
+        parent = header.block_ref::<Sha256>();
+        first.get_or_insert(parent);
+        let certificate = symbolic_da_certificate(header, 0);
+        chain
+            .compact_certified::<Sha256>(&certificate, Height::new(height))
+            .unwrap();
+        // Ordinary proposals still use the newest certificate.
+        assert_eq!(
+            chain
+                .propose_chain(genesis)
+                .unwrap()
+                .anchor()
+                .block_ref::<Sha256>(),
+            parent
+        );
+        let selected = chain.propose_chain_at(genesis, first.unwrap()).unwrap();
+        if height <= depth as u64 {
+            assert_eq!(
+                selected.unwrap().anchor().block_ref::<Sha256>(),
+                first.unwrap(),
+                "a prepared exact anchor must survive one newer certificate"
+            );
+        } else {
+            assert!(
+                selected.is_none(),
+                "expired anchors cannot accumulate without bound"
+            );
+        }
+        assert!(chain.da.chains[0].certified.len() <= depth + 1);
+    }
+}
+
+#[test]
 fn da_choices_below_a_newer_certificate_still_endorse_proposed_positions() {
     // Pipelining depth 2: the retained window below the certified floor is two heights.
     let profile = Harness::validator(0).participants(6).profile();

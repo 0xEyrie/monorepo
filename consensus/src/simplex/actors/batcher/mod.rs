@@ -1,3 +1,4 @@
+commonware_macros::stability_mod!(ALPHA, pub mod extensions);
 mod actor;
 mod ingress;
 mod round;
@@ -11,14 +12,16 @@ use crate::{
     },
     types::{Epoch, View, ViewDelta},
 };
+#[cfg(test)]
 pub use actor::Actor;
+pub use actor::ActorWith;
 use commonware_cryptography::certificate::Scheme;
 use commonware_p2p::Blocker;
 use commonware_parallel::Strategy;
 pub use ingress::{Mailbox, Message};
-pub use round::Round;
+pub use round::{Round, RoundWith};
 use std::num::NonZeroUsize;
-pub use verifier::Verifier;
+pub use verifier::{Verifier, VerifierWith};
 
 pub struct Config<S: Scheme, B: Blocker, Re: Reporter, Rl: Relay, T: Strategy> {
     pub scheme: S,
@@ -47,6 +50,7 @@ pub struct Config<S: Scheme, B: Blocker, Re: Reporter, Rl: Relay, T: Strategy> {
 
 #[cfg(test)]
 mod tests {
+    commonware_macros::stability_mod!(ALPHA, mod extension);
     use super::{verifier::Batch, *};
     use crate::{
         Viewable,

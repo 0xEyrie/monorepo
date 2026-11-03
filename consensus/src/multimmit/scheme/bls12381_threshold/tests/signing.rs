@@ -2,6 +2,229 @@
 
 use super::*;
 
+fn application_reports_are_authenticated_in_votes_and_qcs<V: Variant>() {
+    let committee = Committee::<V>::builder(77, 6)
+        .proposal_extension_bound(32)
+        .build();
+    let codec = committee.codec();
+    let leader = committee.leader_block(View::new(1));
+    let votes = (0..codec.view_quorum())
+        .map(|signer| {
+            let original = committee.vote(Participant::from_usize(signer), &leader);
+            let body = original
+                .body()
+                .clone()
+                .with_application(bytes::Bytes::from(vec![signer as u8; 3]), codec)
+                .unwrap();
+            committee.signers[signer].sign_vote(body).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let lqc = committee
+        .verifier
+        .assemble_lqc::<Sha256, _>(leader.block().clone(), &votes, &Sequential)
+        .unwrap();
+    let messages = votes
+        .iter()
+        .cloned()
+        .map(ViewMessage::Vote)
+        .collect::<Vec<_>>();
+    let vqc = committee
+        .verifier
+        .assemble_vqc::<Sha256, _>(leader.block().clone(), &messages, &Sequential)
+        .unwrap();
+    let lqc = Lqc::<V, Digest>::decode_cfg(lqc.encode(), &codec).unwrap();
+    let vqc = Vqc::<V, Digest>::decode_cfg(vqc.encode(), &codec).unwrap();
+    let digested = DigestedLeader::new::<Sha256>(leader.block());
+    for vote in &votes {
+        assert_eq!(
+            lqc.tally().vote(digested, vote.signer(), codec).unwrap(),
+            *vote.body()
+        );
+        assert_eq!(
+            vqc.tally().vote(digested, vote.signer(), codec).unwrap(),
+            *vote.body()
+        );
+    }
+    let altered = Vote::new(
+        votes[0]
+            .body()
+            .clone()
+            .with_application(bytes::Bytes::from_static(b"altered"), codec)
+            .unwrap(),
+        votes[0].attestation().clone(),
+    );
+    let changed_tally = Tally::from_votes(
+        digested,
+        votes.iter().enumerate().map(|(i, vote)| {
+            (
+                vote.signer(),
+                if i == 0 {
+                    altered.body().clone()
+                } else {
+                    vote.body().clone()
+                },
+            )
+        }),
+        codec,
+    )
+    .unwrap();
+    let changed_lqc = Lqc::new(
+        leader.block().clone(),
+        changed_tally.clone(),
+        lqc.signature().unwrap().clone(),
+        codec,
+    )
+    .unwrap();
+    let changed_vqc = Vqc::new(
+        leader.block().clone(),
+        changed_tally,
+        vqc.novoters().clone(),
+        vqc.conflicting_votes().to_vec(),
+        vqc.signature().unwrap().clone(),
+        codec,
+    )
+    .unwrap();
+    let validated = validate_vqc::<Sha256, V, Digest>(&vqc, codec)
+        .unwrap()
+        .into_parts();
+    let record = crate::multimmit::types::TipRecord::from_vqc::<Sha256, V>(
+        &vqc,
+        validated.tips.blocks().to_vec(),
+    )
+    .unwrap();
+    assert_eq!(validated.child_history, Some(record.commitment::<Sha256>()));
+    let record =
+        crate::multimmit::types::TipRecord::<Digest>::decode_cfg(record.encode(), &codec).unwrap();
+    let reports = record.vote_reports().unwrap();
+    assert_eq!(reports.round(), leader.block().round());
+    assert_eq!(reports.leader(), leader.block().digest::<Sha256>());
+    assert_eq!(
+        reports.reports(),
+        votes
+            .iter()
+            .map(|v| (v.signer(), v.body().application().clone()))
+            .collect::<Vec<_>>()
+    );
+    let altered_record = crate::multimmit::types::TipRecord::from_vqc::<Sha256, V>(
+        &changed_vqc,
+        validated.tips.blocks().to_vec(),
+    )
+    .unwrap();
+    assert_ne!(
+        record.commitment::<Sha256>(),
+        altered_record.commitment::<Sha256>()
+    );
+    let derived_record = crate::multimmit::types::TipRecord::from_vqc::<Sha256, V>(
+        &lqc.derive_vqc(codec).unwrap(),
+        validated.tips.blocks().to_vec(),
+    )
+    .unwrap();
+    assert_eq!(record, derived_record);
+    let artifacts = [
+        Artifact::Vote(votes[0].clone()),
+        Artifact::Vote(altered),
+        Artifact::Lqc(lqc),
+        Artifact::Vqc(vqc),
+        Artifact::Lqc(changed_lqc),
+        Artifact::Vqc(changed_vqc),
+    ];
+    assert_eq!(
+        committee.verifier.verify_artifacts::<_, Sha256, Digest>(
+            &mut test_rng(),
+            &artifacts.iter().collect::<Vec<_>>(),
+            &[],
+            &Sequential,
+        ),
+        vec![true, false, true, true, false, false]
+    );
+}
+
+#[test]
+fn application_reports_are_authenticated_for_both_variants() {
+    application_reports_are_authenticated_in_votes_and_qcs::<MinPk>();
+    application_reports_are_authenticated_in_votes_and_qcs::<MinSig>();
+}
+
+fn ordinary_lqc_application_transcripts_can_differ<V: Variant>() {
+    let committee = Committee::<V>::builder(77, 11)
+        .proposal_extension_bound(32)
+        .build();
+    let codec = committee.codec();
+    assert_eq!(codec.view_quorum(), 9);
+    let leader = committee.leader_block(View::new(1));
+    // Each participant signs exactly one body for the same proposal. The payloads
+    // are opaque application intentions, not execution or final-order proofs.
+    let votes = (0..10)
+        .map(|signer| {
+            let original = committee.vote(Participant::from_usize(signer), &leader);
+            let application = if signer < 5 { b"AB" } else { b"BA" };
+            let body = original
+                .body()
+                .clone()
+                .with_application(bytes::Bytes::from_static(application), codec)
+                .unwrap();
+            committee.signers[signer].sign_vote(body).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let first = committee
+        .verifier
+        .assemble_lqc::<Sha256, _>(leader.block().clone(), &votes[..9], &Sequential)
+        .unwrap();
+    let second = committee
+        .verifier
+        .assemble_lqc::<Sha256, _>(leader.block().clone(), &votes[1..], &Sequential)
+        .unwrap();
+    let certificates = [first, second]
+        .map(|certificate| Lqc::<V, Digest>::decode_cfg(certificate.encode(), &codec).unwrap());
+    assert_ne!(
+        certificates[0].id::<Sha256>(),
+        certificates[1].id::<Sha256>()
+    );
+    assert_eq!(certificates[0].leader(), certificates[1].leader());
+    let records = certificates.each_ref().map(|certificate| {
+        let vqc = certificate.derive_vqc(codec).unwrap();
+        let validated = validate_vqc::<Sha256, V, Digest>(&vqc, codec)
+            .unwrap()
+            .into_parts();
+        TipRecord::from_vqc::<Sha256, V>(&vqc, validated.tips.blocks().to_vec()).unwrap()
+    });
+    for (record, expected) in records.iter().zip([b"AB", b"BA"]) {
+        let reports = record.vote_reports().unwrap();
+        assert_eq!(reports.reports().len(), 9);
+        assert_eq!(
+            reports
+                .reports()
+                .iter()
+                .filter(|(_, application)| application.as_ref() == expected)
+                .count(),
+            5
+        );
+    }
+    // Native signatures authenticate each transcript, but do not choose one
+    // application order between these valid quorum subsets. Custom ordering
+    // therefore needs its separate authenticated history/finality boundary.
+    assert_ne!(
+        records[0].commitment::<Sha256>(),
+        records[1].commitment::<Sha256>()
+    );
+    let artifacts = certificates.map(Artifact::Lqc);
+    assert_eq!(
+        committee.verifier.verify_artifacts::<_, Sha256, Digest>(
+            &mut test_rng(),
+            &artifacts.iter().collect::<Vec<_>>(),
+            &[],
+            &Sequential,
+        ),
+        vec![true, true]
+    );
+}
+
+#[test]
+fn ordinary_lqc_application_transcripts_can_differ_without_equivocation() {
+    ordinary_lqc_application_transcripts_can_differ::<MinPk>();
+    ordinary_lqc_application_transcripts_can_differ::<MinSig>();
+}
+
 fn proposal_extension_is_authenticated_by_proposals_and_qcs<V: Variant>() {
     let committee = Committee::<V>::builder(77, 6)
         .proposal_extension_bound(32)

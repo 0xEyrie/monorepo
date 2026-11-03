@@ -29,11 +29,18 @@ impl<D: Digest> Tally<D> {
         {
             return Err(Error::Context);
         }
-        if !self.signers.iter().any(|candidate| candidate == signer) {
-            return Err(Error::Participants);
+        let offset = self
+            .signers
+            .iter()
+            .position(|candidate| candidate == signer)
+            .ok_or(Error::Participants)?;
+        if self.applications.len() != self.signers.count() {
+            return Err(Error::Transcript);
         }
+        let application = self.applications.get(offset).ok_or(Error::Transcript)?;
         let paths = self.expand(block, signer, config)?;
-        VoteBody::for_leader(leader, paths.positions, paths.extensions, config)
+        VoteBody::for_leader(leader, paths.positions, paths.extensions, config)?
+            .with_application(application.clone(), config)
     }
 
     /// Applies `signer`'s deviation, if any, to the proposal tips and reference extensions.
@@ -89,6 +96,11 @@ impl<D: Digest> Tally<D> {
                 .any(|extension| extension.len() > config.extension_bound())
             || self.signers.len() != config.participants()
             || self.signers.count() == 0
+            || self.applications.len() != self.signers.count()
+            || self
+                .applications
+                .iter()
+                .any(|data| data.len() > config.proposal_extension_bound())
         {
             return Err(Error::Transcript);
         }

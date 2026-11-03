@@ -1,15 +1,16 @@
 use super::{
-    Verifier,
+    VerifierWith,
     verifier::{Batch, ProposalState},
 };
 use crate::{
     Reporter,
     simplex::{
         actors::span::ViewSpan,
+        phase2::{Plain, aggregation::Aggregation},
         scheme::Scheme,
         types::{
-            Activity, Certificate, ConflictingFinalize, ConflictingNotarize, Kind, NullifyFinalize,
-            ObservedVote, Outcome, Proposal, Vote, VoteTracker,
+            ActivityWith, CertificateWith, ConflictingFinalizeWith, ConflictingNotarize, Kind,
+            NullifyFinalizeWith, ObservedVote, Outcome, Proposal, VoteTrackerWith, VoteWith,
         },
     },
     types::{Attributable, Participant, Round as Rnd},
@@ -22,12 +23,16 @@ use rand_core::CryptoRng;
 use std::sync::Arc;
 use tracing::Span;
 
-/// Per-view state for vote accumulation and certificate tracking.
-pub struct Round<
+/// Stock per-view state with native vote and certificate representations.
+pub type Round<S, B, D, R> = RoundWith<S, B, D, R, Plain>;
+
+/// Per-view state for mode-specific vote accumulation and certificate tracking.
+pub struct RoundWith<
     S: Scheme<D>,
     B: Blocker<PublicKey = S::PublicKey>,
     D: Digest,
-    R: Reporter<Activity = Activity<S, D>>,
+    R: Reporter<Activity = ActivityWith<S, D, M>>,
+    M: Aggregation<S, D>,
 > {
     blocker: B,
     reporter: R,
@@ -35,13 +40,13 @@ pub struct Round<
     /// from votes for one proposal. It initially filters to the first proposal
     /// observed from the known leader. Independently authenticated proposal
     /// evidence is authoritative and switches the filter.
-    verifier: Verifier<S, D>,
+    verifier: VerifierWith<S, D, M>,
     /// At most one vote of each kind per signer.
     ///
     /// Includes locally constructed votes and network votes that may not be
     /// verified. Used for duplicate detection, conflict reporting, and
     /// proposal-switch recovery.
-    votes: VoteTracker<S, D>,
+    votes: VoteTrackerWith<S, D, M>,
 
     /// Whether we've already sent the selected proposal to the voter.
     proposal_sent: bool,
@@ -56,8 +61,9 @@ impl<
     S: Scheme<D>,
     B: Blocker<PublicKey = S::PublicKey>,
     D: Digest,
-    R: Reporter<Activity = Activity<S, D>>,
-> Round<S, B, D, R>
+    R: Reporter<Activity = ActivityWith<S, D, M>>,
+    M: Aggregation<S, D>,
+> RoundWith<S, B, D, R, M>
 {
     pub fn new(
         round: Rnd,
@@ -71,9 +77,9 @@ impl<
         Self {
             blocker,
             reporter,
-            verifier: Verifier::new(round, scheme, quorum),
+            verifier: VerifierWith::new(round, scheme, quorum),
 
-            votes: VoteTracker::new(len, track_historical_votes),
+            votes: VoteTrackerWith::new(len, track_historical_votes),
 
             proposal_sent: false,
 
@@ -100,7 +106,7 @@ impl<
     }
 
     /// Returns true if we already have a certificate of `kind` for this view.
-    pub const fn has_certificate(&self, kind: Kind) -> bool {
+    pub(crate) fn has_certificate(&self, kind: Kind) -> bool {
         self.verifier.has_certificate(kind)
     }
 
@@ -110,19 +116,20 @@ impl<
     /// policy. A notarization or finalization also establishes authoritative
     /// proposal evidence. Returns `true` when a notarization selects a new proposal,
     /// making buffered finalize votes eligible for processing.
-    pub fn record_certificate(&mut self, certificate: &Certificate<S, D>) -> bool {
+    pub fn record_certificate(&mut self, certificate: &CertificateWith<S, D, M>) -> bool {
         let process_votes = match certificate {
-            Certificate::Notarization(notarization) => {
+            CertificateWith::Notarization(notarization) => {
                 self.set_authoritative_proposal(&notarization.proposal)
             }
-            Certificate::Finalization(finalization) => {
+            CertificateWith::Finalization(finalization) => {
                 // A finalization may replace the leader-selected proposal, but its
                 // certificate makes reprocessing buffered finalize votes unnecessary.
-                self.verifier
-                    .set_proposal(ProposalState::Certificate(finalization.proposal.clone()));
+                self.verifier.set_proposal(ProposalState::Certificate(
+                    M::finalization_proposal(finalization).clone(),
+                ));
                 false
             }
-            Certificate::Nullification(_) => false,
+            CertificateWith::Nullification(_) => false,
         };
         self.verifier.record_certificate(certificate.kind());
         self.release_votes(certificate.kind());
@@ -155,11 +162,11 @@ impl<
     /// Retained votes are forwarded to the verifier for certificate assembly.
     /// Compacted phases preserve duplicate suppression and proposal forwarding
     /// without recreating their released vote maps.
-    pub(super) fn accept_vote(&mut self, message: Vote<S, D>, constructed: bool) -> Outcome {
-        if constructed && let Vote::Finalize(finalize) = &message {
+    pub(super) fn accept_vote(&mut self, message: VoteWith<S, D, M>, constructed: bool) -> Outcome {
+        if constructed && let VoteWith::Finalize(finalize) = &message {
             // The voter only constructs a finalize after independently
             // authenticating the proposal.
-            self.set_authoritative_proposal(&finalize.proposal);
+            self.set_authoritative_proposal(M::finalize_proposal(finalize));
         }
 
         let retained = match self.votes.record(&message, self.verifier.proposal()) {
@@ -169,9 +176,9 @@ impl<
                     // Nullify is reconstructed for each retry. Notarize and finalize
                     // are one-shot local actions, so constructing either twice is a bug.
                     match &message {
-                        Vote::Notarize(_) => panic!("duplicate notarize"),
-                        Vote::Nullify(_) => {}
-                        Vote::Finalize(_) => panic!("duplicate finalize"),
+                        VoteWith::Notarize(_) => panic!("duplicate notarize"),
+                        VoteWith::Nullify(_) => {}
+                        VoteWith::Finalize(_) => panic!("duplicate finalize"),
                     }
                 }
                 return Outcome::Duplicate { retained };
@@ -187,9 +194,9 @@ impl<
         // is reported without forwarding the full vote to the verifier.
         let verifier_message = retained.then(|| message.clone());
         let activity = match message {
-            Vote::Notarize(notarize) => Activity::Notarize(notarize),
-            Vote::Nullify(nullify) => Activity::Nullify(nullify),
-            Vote::Finalize(finalize) => Activity::Finalize(finalize),
+            VoteWith::Notarize(notarize) => ActivityWith::Notarize(notarize),
+            VoteWith::Nullify(nullify) => ActivityWith::Nullify(nullify),
+            VoteWith::Finalize(finalize) => ActivityWith::Finalize(finalize),
         };
         self.reporter.report(activity);
         if let Some(message) = verifier_message {
@@ -213,16 +220,17 @@ impl<
             for finalize in self
                 .votes
                 .iter_finalizes()
-                .filter(|finalize| &finalize.proposal == proposal)
+                .filter(|finalize| M::finalize_proposal(finalize) == proposal)
             {
-                self.verifier.add(Vote::Finalize(finalize.clone()), false);
+                self.verifier
+                    .add(VoteWith::Finalize(finalize.clone()), false);
             }
         }
         update.changed
     }
 
     /// Adds a vote from the network to this round's verifier.
-    pub fn add_network(&mut self, sender: S::PublicKey, message: Vote<S, D>) -> bool {
+    pub fn add_network(&mut self, sender: S::PublicKey, message: VoteWith<S, D, M>) -> bool {
         // Check if sender is a participant
         let Some(index) = self.verifier.participants().index(&sender) else {
             commonware_p2p::block!(self.blocker, sender, "unknown participant");
@@ -231,7 +239,7 @@ impl<
 
         // Attempt to reserve
         match message {
-            Vote::Notarize(notarize) => {
+            VoteWith::Notarize(notarize) => {
                 // Verify sender is signer
                 if index != notarize.signer() {
                     commonware_p2p::block!(self.blocker, sender, "notarize signer mismatch");
@@ -241,17 +249,20 @@ impl<
                 // Try to reserve
                 match self.votes.notarize(index) {
                     Some(previous) => {
-                        if previous.proposal != notarize.proposal {
-                            let activity = ConflictingNotarize::new(previous.clone(), notarize);
+                        if M::notarize(previous).proposal != M::notarize(&notarize).proposal {
+                            let activity = ConflictingNotarize::new(
+                                M::notarize(previous).clone(),
+                                M::into_notarize(notarize),
+                            );
                             self.reporter
-                                .report(Activity::ConflictingNotarize(activity));
+                                .report(ActivityWith::ConflictingNotarize(activity));
                             commonware_p2p::block!(self.blocker, sender, "conflicting notarize");
-                        } else if previous != &notarize {
+                        } else if M::notarize(previous) != M::notarize(&notarize) {
                             commonware_p2p::block!(self.blocker, sender, "invalid signature");
                         }
                         false
                     }
-                    None => match self.accept_vote(Vote::Notarize(notarize), false) {
+                    None => match self.accept_vote(VoteWith::Notarize(notarize), false) {
                         Outcome::Added { .. } => true,
                         Outcome::Duplicate { .. } => false,
                         Outcome::Conflicting => {
@@ -261,7 +272,7 @@ impl<
                     },
                 }
             }
-            Vote::Nullify(nullify) => {
+            VoteWith::Nullify(nullify) => {
                 // Verify sender is signer
                 if index != nullify.signer() {
                     commonware_p2p::block!(self.blocker, sender, "nullify signer mismatch");
@@ -271,8 +282,10 @@ impl<
                 // Check if finalized
                 if let Some(previous) = self.votes.saw_finalize(index) {
                     if let ObservedVote::Retained(previous) = previous {
-                        let activity = NullifyFinalize::new(nullify, previous.clone());
-                        self.reporter.report(Activity::NullifyFinalize(activity));
+                        let activity =
+                            NullifyFinalizeWith::<S, D, M>::new(nullify, previous.clone());
+                        self.reporter
+                            .report(ActivityWith::NullifyFinalize(activity));
                     }
                     commonware_p2p::block!(self.blocker, sender, "nullify after finalize");
                     return false;
@@ -286,7 +299,7 @@ impl<
                         }
                         false
                     }
-                    None => match self.accept_vote(Vote::Nullify(nullify), false) {
+                    None => match self.accept_vote(VoteWith::Nullify(nullify), false) {
                         Outcome::Added { .. } => true,
                         Outcome::Duplicate { .. } => false,
                         Outcome::Conflicting => {
@@ -295,7 +308,7 @@ impl<
                     },
                 }
             }
-            Vote::Finalize(finalize) => {
+            VoteWith::Finalize(finalize) => {
                 // Verify sender is signer
                 if index != finalize.signer() {
                     commonware_p2p::block!(self.blocker, sender, "finalize signer mismatch");
@@ -305,8 +318,10 @@ impl<
                 // Check if nullified
                 if let Some(previous) = self.votes.saw_nullify(index) {
                     if let ObservedVote::Retained(previous) = previous {
-                        let activity = NullifyFinalize::new(previous.clone(), finalize);
-                        self.reporter.report(Activity::NullifyFinalize(activity));
+                        let activity =
+                            NullifyFinalizeWith::<S, D, M>::new(previous.clone(), finalize);
+                        self.reporter
+                            .report(ActivityWith::NullifyFinalize(activity));
                     }
                     commonware_p2p::block!(self.blocker, sender, "finalize after nullify");
                     return false;
@@ -315,17 +330,18 @@ impl<
                 // Try to reserve
                 match self.votes.finalize(index) {
                     Some(previous) => {
-                        if previous.proposal != finalize.proposal {
-                            let activity = ConflictingFinalize::new(previous.clone(), finalize);
+                        if M::conflicting_finalize_subjects(previous, &finalize) {
+                            let activity =
+                                ConflictingFinalizeWith::<S, D, M>::new(previous.clone(), finalize);
                             self.reporter
-                                .report(Activity::ConflictingFinalize(activity));
+                                .report(ActivityWith::ConflictingFinalize(activity));
                             commonware_p2p::block!(self.blocker, sender, "conflicting finalize");
                         } else if previous != &finalize {
                             commonware_p2p::block!(self.blocker, sender, "invalid signature");
                         }
                         false
                     }
-                    None => match self.accept_vote(Vote::Finalize(finalize), false) {
+                    None => match self.accept_vote(VoteWith::Finalize(finalize), false) {
                         Outcome::Added { .. } => true,
                         Outcome::Duplicate { .. } => false,
                         Outcome::Conflicting => {
@@ -338,6 +354,13 @@ impl<
         }
     }
 
+    /// Retained first votes in participant order. Entries are source-admitted,
+    /// not necessarily signature-verified. The consumer must authenticate the
+    /// original report, context and policy independently before counting support.
+    pub fn notarizes(&self) -> impl Iterator<Item = &M::Notarize> {
+        self.votes.iter_notarizes()
+    }
+
     /// Sets the leader for this view. If the leader's notarize has already
     /// been received, this will also set the leader's proposal (filtering out
     /// votes for other proposals).
@@ -345,7 +368,7 @@ impl<
         // Certification drops the verifier's buffered notarizes, so read an
         // uncertified leader vote from the tracker.
         self.verifier
-            .set_leader(leader, self.votes.notarize(leader));
+            .set_leader(leader, self.votes.notarize(leader).map(M::notarize));
     }
 
     /// Returns the proposal to forward to the voter, marking it sent (at most
@@ -369,11 +392,11 @@ impl<
     ///
     /// Once polled, construction moves the buffered votes into the worker. Do not
     /// cancel unless the round will also be discarded.
-    pub async fn try_construct<E: CryptoRng>(
+    pub async fn try_construct<E: CryptoRng + Send>(
         &mut self,
         rng: &mut E,
         strategy: &impl Strategy,
-    ) -> Option<Batch<Certificate<S, D>>> {
+    ) -> Option<Batch<CertificateWith<S, D, M>>> {
         let result = if let Some(result) = self
             .verifier
             .try_construct_notarization(rng, strategy)

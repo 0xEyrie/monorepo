@@ -111,10 +111,11 @@ where
     }
 }
 
-impl<S, B> BlockProvider for Mailbox<S, Standard<B>>
+impl<S, B, M> BlockProvider for Mailbox<S, Standard<B>, M>
 where
     S: Scheme,
     B: Block,
+    M: crate::simplex::phase2::Mode<S, B::Digest>,
 {
     type Block = B;
 

@@ -249,20 +249,21 @@ impl<V: Variant, D: Digest> DaState<V, D> {
     }
 
     /// Retires one chain's state at or below `retired` after `block` became its durable
-    /// certified tip, keeping one pipelining depth of DA choices below the floor.
+    /// certified tip, keeping one pipelining depth of DA choices and certificates
+    /// below the floor for in-flight proposals and prepared exact anchors.
     pub(super) fn retire(&mut self, block: BlockRef<D>, retired: Height, pipeline_depth: u64) {
         let index = block.chain().index();
         let genesis = self.genesis[index].height();
         let chain = &mut self.chains[index];
+        let kept = released(retired, pipeline_depth);
         chain.certified.retain(|height, certified| {
-            *height == genesis || *height > retired || certified.block == block
+            *height == genesis || *height > kept || certified.block == block
         });
         // A vote reports positions from the leader's anchor, and a leader anchors at the newest
         // certificate it held when it proposed. Certificates keep arriving while the proposal
         // travels, so a voter's own certified floor commonly passes that anchor before it votes.
         // Choices at or below the floor add no availability, but they are exactly the record a
         // vote needs to endorse the leader's payloads, so keep one pipelining depth of them.
-        let kept = released(retired, pipeline_depth);
         chain.local_da_votes.retain(|height, _| *height > kept);
         // Retirement only drops choices below the retained window, so the prefix above the new
         // floor stays contiguous; raising the cursor to the floor keeps it a valid lower bound.

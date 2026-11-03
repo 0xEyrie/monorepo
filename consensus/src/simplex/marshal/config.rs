@@ -1,6 +1,6 @@
 use crate::{
     Block,
-    simplex::types::Finalization,
+    simplex::phase2::{Mode, Plain},
     types::{Epoch, Epocher, ViewDelta},
 };
 use commonware_cryptography::{
@@ -15,14 +15,18 @@ use std::num::{NonZeroU64, NonZeroUsize};
 ///
 /// Durable progress from a previous run takes precedence when it already
 /// supersedes the configured anchor.
-pub enum Start<S: Scheme, C: Digest, B> {
+pub enum Start<S: Scheme, C: Digest, B, M: Mode<S, C> = Plain> {
     /// Start from the height-zero genesis block.
     Genesis(B),
     /// Start from a finalized commitment.
-    Floor(Finalization<S, C>),
+    Floor(M::Certificate),
 }
 
 /// Marshal configuration.
+///
+/// The phase-two mode must match the certificate archive. Use a distinct storage
+/// namespace when selecting a different mode; Plain and Extended certificate
+/// encodings are not interchangeable.
 ///
 /// # Epocher and Provider Coverage
 ///
@@ -41,11 +45,12 @@ pub enum Start<S: Scheme, C: Digest, B> {
 /// height passes a prune target. The last processed height can be
 /// derived from an `Update::Block` at height `H` as
 /// `H - max_pending_acks` (the maximum backlog of blocks the application can buffer).
-pub struct Config<P, ES, T, AB, B, C = <AB as Digestible>::Digest>
+pub struct Config<P, ES, T, AB, B, C = <AB as Digestible>::Digest, M = Plain>
 where
     AB: Block,
     C: Digest,
     P: Provider<Scope = Epoch>,
+    M: Mode<P::Scheme, C>,
     ES: Epocher,
     T: Strategy,
 {
@@ -60,7 +65,7 @@ where
     pub epocher: ES,
 
     /// Startup anchor for marshal's processed floor.
-    pub start: Start<P::Scheme, C, B>,
+    pub start: Start<P::Scheme, C, B, M>,
 
     /// The prefix to use for all partitions.
     pub partition_prefix: String,

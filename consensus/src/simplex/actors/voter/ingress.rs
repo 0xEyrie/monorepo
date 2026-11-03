@@ -2,18 +2,63 @@ use crate::{
     Epochable, Viewable,
     simplex::{
         metrics::TimeoutReason,
-        types::{Certificate, Proposal},
+        phase2::{Mode, Plain},
+        types::{CertificateWith, Proposal},
     },
     types::{Round as Rnd, View},
 };
 use commonware_actor::mailbox::{Overflow, Policy, Sender};
 use commonware_cryptography::{Digest, certificate::Scheme};
 use commonware_runtime::telemetry::traces::TracedExt as _;
+use commonware_utils::channel::oneshot;
 use std::collections::VecDeque;
 use tracing::{Span, info_span};
 
-/// Messages sent to the [super::actor::Actor].
-pub enum Message<S: Scheme, D: Digest> {
+/// Messages sent to the [super::actor::ActorWith].
+pub enum Message<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
+    /// Local coordinator query; it never authorizes a vote or advances the view.
+    #[cfg_attr(
+        commonware_stability_BETA,
+        expect(dead_code, reason = "recovery coordination is an ALPHA extension API")
+    )]
+    RecoveryQuery {
+        span: Span,
+        query: M::RecoveryQuery,
+        reply: oneshot::Sender<Option<M::RecoveryRequest>>,
+    },
+    /// Read-only native eligibility check before application material retention.
+    #[cfg_attr(
+        commonware_stability_BETA,
+        expect(dead_code, reason = "recovery admission is an ALPHA extension API")
+    )]
+    RecoveryAdmission {
+        span: Span,
+        request: M::RecoveryRequest,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Signed recovery request; native authentication and sync precede any reply.
+    #[cfg_attr(
+        commonware_stability_BETA,
+        expect(dead_code, reason = "recovery requests are an ALPHA extension API")
+    )]
+    Recovery {
+        span: Span,
+        request: M::RecoveryRequest,
+        reply: oneshot::Sender<Option<M::RecoveryResponse>>,
+    },
+    /// Later-ballot parent witness; ACK follows native validation and journal sync.
+    #[cfg_attr(
+        commonware_stability_BETA,
+        expect(
+            dead_code,
+            reason = "recovered interpretations are an ALPHA extension API"
+        )
+    )]
+    Recovered {
+        span: Span,
+        certificate: M::Recovered,
+        reply: oneshot::Sender<bool>,
+    },
     /// Leader's proposal from batcher.
     Proposal {
         /// The span carried with this message.
@@ -30,22 +75,34 @@ pub enum Message<S: Scheme, D: Digest> {
         /// The reason for the timeout.
         reason: TimeoutReason,
     },
+    /// Local evidence became available; the voter must repeat every check.
+    #[cfg_attr(
+        commonware_stability_BETA,
+        expect(dead_code, reason = "local readiness is an ALPHA extension API")
+    )]
+    InterpretationReady { span: Span, view: View },
     /// Certificate from batcher or resolver.
     Verified {
         /// The span carried with this message.
         span: Span,
         /// The verified certificate.
-        certificate: Certificate<S, D>,
+        certificate: CertificateWith<S, D, M>,
         /// Whether the certificate came from the resolver. When true, the voter
         /// will not send it back to the resolver (to avoid "boomerang").
         from_resolver: bool,
     },
 }
 
-impl<S: Scheme, D: Digest> Message<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Message<S, D, M> {
     /// Returns the message view used for pruning and deduplication.
     pub(crate) fn view(&self) -> View {
         match self {
+            Self::RecoveryQuery { query, .. } => M::recovery_query_view(query),
+            Self::Recovered { certificate, .. } => certificate.view(),
+            Self::Recovery { request, .. } | Self::RecoveryAdmission { request, .. } => {
+                M::recovery_view(request)
+            }
+            Self::InterpretationReady { view, .. } => *view,
             Self::Proposal { proposal, .. } => proposal.view(),
             Self::Timeout { round, .. } => round.view(),
             Self::Verified { certificate, .. } => certificate.view(),
@@ -55,7 +112,12 @@ impl<S: Scheme, D: Digest> Message<S, D> {
     /// Returns the span carried with this message.
     pub(crate) const fn span(&self) -> &Span {
         match self {
-            Self::Proposal { span, .. }
+            Self::RecoveryQuery { span, .. }
+            | Self::Recovered { span, .. }
+            | Self::RecoveryAdmission { span, .. }
+            | Self::Recovery { span, .. }
+            | Self::InterpretationReady { span, .. }
+            | Self::Proposal { span, .. }
             | Self::Timeout { span, .. }
             | Self::Verified { span, .. } => span,
         }
@@ -64,6 +126,11 @@ impl<S: Scheme, D: Digest> Message<S, D> {
     /// Returns the operation name of this message.
     pub(crate) const fn name(&self) -> &'static str {
         match self {
+            Self::RecoveryQuery { .. } => "recovery_query",
+            Self::Recovered { .. } => "recovered_interpretation",
+            Self::Recovery { .. } => "recovery",
+            Self::RecoveryAdmission { .. } => "recovery_admission",
+            Self::InterpretationReady { .. } => "interpretation_ready",
             Self::Proposal { .. } => "proposal",
             Self::Timeout { .. } => "timeout",
             Self::Verified { .. } => "verified",
@@ -72,12 +139,12 @@ impl<S: Scheme, D: Digest> Message<S, D> {
 }
 
 /// Pending voter messages retained after the mailbox fills.
-pub struct Pending<S: Scheme, D: Digest> {
-    finalization: Option<Message<S, D>>,
-    messages: VecDeque<Message<S, D>>,
+pub struct Pending<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
+    finalization: Option<Message<S, D, M>>,
+    messages: VecDeque<Message<S, D, M>>,
 }
 
-impl<S: Scheme, D: Digest> Default for Pending<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Default for Pending<S, D, M> {
     fn default() -> Self {
         Self {
             finalization: None,
@@ -86,14 +153,14 @@ impl<S: Scheme, D: Digest> Default for Pending<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Overflow<Message<S, D>> for Pending<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Overflow<Message<S, D, M>> for Pending<S, D, M> {
     fn is_empty(&self) -> bool {
         self.finalization.is_none() && self.messages.is_empty()
     }
 
     fn drain<F>(&mut self, mut push: F)
     where
-        F: FnMut(Message<S, D>) -> Option<Message<S, D>>,
+        F: FnMut(Message<S, D, M>) -> Option<Message<S, D, M>>,
     {
         if let Some(finalization) = self.finalization.take()
             && let Some(finalization) = push(finalization)
@@ -111,29 +178,58 @@ impl<S: Scheme, D: Digest> Overflow<Message<S, D>> for Pending<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Policy for Message<S, D> {
-    type Overflow = Pending<S, D>;
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Policy for Message<S, D, M> {
+    type Overflow = Pending<S, D, M>;
 
     fn handle(overflow: &mut Self::Overflow, message: Self) {
+        // Recovery requests are retriable and are not accepted until their reply.
+        // Bound retained oneshots independently of adversarial view numbers.
+        if matches!(
+            message,
+            Self::RecoveryQuery { .. }
+                | Self::RecoveryAdmission { .. }
+                | Self::Recovery { .. }
+                | Self::Recovered { .. }
+        ) && overflow
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    Self::RecoveryQuery { .. }
+                        | Self::RecoveryAdmission { .. }
+                        | Self::Recovery { .. }
+                        | Self::Recovered { .. }
+                )
+            })
+            .count()
+            >= 16
+        {
+            return;
+        }
         // Ignore the message if there exists a queued finalization
         // with a view greater than or equal to the new view
         let new_view = message.view();
-        if matches!(
-            overflow.finalization.as_ref(),
-            Some(Self::Verified { certificate: Certificate::Finalization(old_finalized), .. })
-                if old_finalized.view() >= new_view
-        ) {
+        if !M::RETAIN_INTERPRETATION
+            && matches!(
+                overflow.finalization.as_ref(),
+                Some(Self::Verified { certificate: CertificateWith::Finalization(old_finalized), .. })
+                    if old_finalized.view() >= new_view
+            )
+        {
             return;
         }
 
         // Retain only the highest-view finalization and any messages with a view greater than the new view
-        if matches!(
-            &message,
-            Self::Verified {
-                certificate: Certificate::Finalization(_),
-                ..
-            }
-        ) {
+        if !M::RETAIN_INTERPRETATION
+            && matches!(
+                &message,
+                Self::Verified {
+                    certificate: CertificateWith::Finalization(_),
+                    ..
+                }
+            )
+        {
             overflow
                 .messages
                 .retain(|old_message| old_message.view() > new_view);
@@ -176,6 +272,10 @@ impl<S: Scheme, D: Digest> Policy for Message<S, D> {
             .iter()
             .any(|old_message| match (&message, old_message) {
                 (
+                    Self::InterpretationReady { view: a, .. },
+                    Self::InterpretationReady { view: b, .. },
+                ) => a == b,
+                (
                     Self::Proposal {
                         proposal: new_proposal,
                         ..
@@ -195,12 +295,23 @@ impl<S: Scheme, D: Digest> Policy for Message<S, D> {
                         ..
                     },
                 ) => {
+                    if M::RETAIN_INTERPRETATION
+                        && let (CertificateWith::Finalization(a), CertificateWith::Finalization(b)) = (new_certificate, old_certificate) {
+                        return a == b;
+                    }
                     new_certificate.view() == old_certificate.view()
                         && matches!(
                             (new_certificate, old_certificate),
-                            (Certificate::Notarization(_), Certificate::Notarization(_))
-                                | (Certificate::Nullification(_), Certificate::Nullification(_))
-                                | (Certificate::Finalization(_), Certificate::Finalization(_))
+                            (
+                                CertificateWith::Notarization(_),
+                                CertificateWith::Notarization(_)
+                            ) | (
+                                CertificateWith::Nullification(_),
+                                CertificateWith::Nullification(_)
+                            ) | (
+                                CertificateWith::Finalization(_),
+                                CertificateWith::Finalization(_)
+                            )
                         )
                 }
                 _ => false,
@@ -213,14 +324,26 @@ impl<S: Scheme, D: Digest> Policy for Message<S, D> {
 }
 
 #[derive(Clone)]
-pub struct Mailbox<S: Scheme, D: Digest> {
-    sender: Sender<Message<S, D>>,
+pub struct Mailbox<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
+    sender: Sender<Message<S, D, M>>,
 }
 
-impl<S: Scheme, D: Digest> Mailbox<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Mailbox<S, D, M> {
     /// Create a new mailbox.
-    pub const fn new(sender: Sender<Message<S, D>>) -> Self {
+    pub const fn new(sender: Sender<Message<S, D, M>>) -> Self {
         Self { sender }
+    }
+
+    /// Wake local evidence processing without granting finality or voting approval.
+    #[commonware_macros::stability(ALPHA)]
+    pub fn interpretation_ready(&mut self, view: View) {
+        let _ = self.sender.enqueue(Message::InterpretationReady {
+            span: info_span!(
+                "simplex.voter.mailbox.interpretation_ready",
+                view = view.traced()
+            ),
+            view,
+        });
     }
 
     /// Send a leader's proposal.
@@ -250,7 +373,7 @@ impl<S: Scheme, D: Digest> Mailbox<S, D> {
     }
 
     /// Send a recovered certificate.
-    pub fn recovered(&mut self, certificate: Certificate<S, D>) {
+    pub fn recovered(&mut self, certificate: CertificateWith<S, D, M>) {
         let _ = self.sender.enqueue(Message::Verified {
             span: info_span!(
                 "simplex.voter.mailbox.recovered",
@@ -264,7 +387,7 @@ impl<S: Scheme, D: Digest> Mailbox<S, D> {
     }
 
     /// Send a resolved certificate.
-    pub fn resolved(&mut self, certificate: Certificate<S, D>) {
+    pub fn resolved(&mut self, certificate: CertificateWith<S, D, M>) {
         let _ = self.sender.enqueue(Message::Verified {
             span: info_span!(
                 "simplex.voter.mailbox.resolved",
@@ -277,6 +400,39 @@ impl<S: Scheme, D: Digest> Mailbox<S, D> {
         });
     }
 }
+
+commonware_macros::stability_scope!(ALPHA {
+impl<S: crate::simplex::scheme::Scheme<D>, D: Digest> Mailbox<S,D,crate::simplex::phase2::Extended> {
+    /// Checks native eligibility without mutating recovery state or signing a response.
+    pub(crate) fn validate_recovery(&mut self, request: crate::simplex::extension::request::Request<S,D>) -> oneshot::Receiver<bool> {
+        let (reply,receiver)=oneshot::channel();
+        let _=self.sender.enqueue(Message::RecoveryAdmission {span:info_span!("simplex.voter.recovery_admission",view=request.view().traced()),request,reply});
+        receiver
+    }
+    /// Asks native state to prepare an eligible recovery leader request. This does
+    /// not persist a decision; the ordinary recovery request path still must run.
+    pub fn prepare_recovery(&mut self, query: crate::simplex::extension::request::Query<S,D>) -> oneshot::Receiver<Option<crate::simplex::extension::request::Request<S,D>>> {
+        let (reply,receiver)=oneshot::channel();
+        if !query.bounded() { let _=reply.send(None); return receiver; }
+        let _=self.sender.enqueue(Message::RecoveryQuery {span:info_span!("simplex.voter.recovery_query",view=query.view().traced()),query,reply});
+        receiver
+    }
+    /// Installs a recovered parent interpretation. True acknowledges durable retention,
+    /// never native finality; closure is not an ACK and may be retried.
+    pub fn install_recovered(&mut self, certificate: crate::simplex::extension::certificate::Recovered<S,D>) -> oneshot::Receiver<bool> {
+        let (reply,receiver)=oneshot::channel();
+        let _=self.sender.enqueue(Message::Recovered {span:info_span!("simplex.voter.recovered_interpretation",view=certificate.view().traced()),certificate,reply});
+        receiver
+    }
+    /// Submits a signed native recovery request. Closure or None is not an ACK;
+    /// cancellation does not undo a decision already accepted by the voter.
+    pub fn recover_extension(&mut self, request: crate::simplex::extension::request::Request<S,D>) -> oneshot::Receiver<Option<crate::simplex::extension::request::Response<S,D>>> {
+        let (reply, receiver)=oneshot::channel();
+        let _=self.sender.enqueue(Message::Recovery{span:info_span!("simplex.voter.recovery",view=request.view().traced()),request,reply});
+        receiver
+    }
+}
+});
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,9 @@
 //! Application-defined merging of authenticated producer-chain prefixes.
 
-use crate::{multimmit::types::BlockRef, types::Epoch};
+use crate::{
+    multimmit::types::{BlockRef, VoteReports},
+    types::Epoch,
+};
 use bytes::Bytes;
 use commonware_codec::{Codec, Decode as _, Error as CodecError};
 use commonware_cryptography::Digest;
@@ -21,9 +24,11 @@ pub const MAX_ORDERING_BLOCKS: usize = 1024;
 pub struct OrderingContext<D: Digest, T = [u8; 0]> {
     epoch: Option<Epoch>,
     history: Option<D>,
+    parent_history: Option<D>,
     base: Option<Arc<[BlockRef<D>]>>,
     prefixes: Arc<[Vec<BlockRef<D>>]>,
     proposal_extension: Option<T>,
+    vote_reports: Option<Arc<VoteReports<D>>>,
 }
 
 impl<D: Digest> OrderingContext<D> {
@@ -36,9 +41,11 @@ impl<D: Digest> OrderingContext<D> {
         Self {
             epoch: Some(epoch),
             history: Some(history),
+            parent_history: None,
             base: Some(base.into()),
             prefixes: prefixes.into(),
             proposal_extension: None,
+            vote_reports: None,
         }
     }
 }
@@ -66,9 +73,11 @@ impl<D: Digest, T> OrderingContext<D, T> {
         Self {
             epoch: None,
             history: None,
+            parent_history: None,
             base: None,
             prefixes: prefixes.into(),
             proposal_extension: extension,
+            vote_reports: None,
         }
     }
 
@@ -81,9 +90,11 @@ impl<D: Digest, T> OrderingContext<D, T> {
         OrderingContext {
             epoch: self.epoch,
             history: self.history,
+            parent_history: self.parent_history,
             base: self.base.as_ref().map(Arc::clone),
             prefixes: Arc::clone(&self.prefixes),
             proposal_extension: extension,
+            vote_reports: self.vote_reports.as_ref().map(Arc::clone),
         }
     }
 
@@ -95,6 +106,19 @@ impl<D: Digest, T> OrderingContext<D, T> {
         self.proposal_extension.as_ref()
     }
 
+    /// Returns original ordinary-vote reports authenticated by this history opening.
+    ///
+    /// Local speculative contexts omit them. The application must check its required quorum,
+    /// report codec and exact context; this collection does not attest execution progress.
+    pub fn vote_reports(&self) -> Option<&VoteReports<D>> {
+        self.vote_reports.as_deref()
+    }
+
+    pub(crate) fn with_vote_reports(mut self, reports: Option<Arc<VoteReports<D>>>) -> Self {
+        self.vote_reports = reports;
+        self
+    }
+
     /// Returns the authenticated producer epoch, absent for speculative inputs.
     pub const fn epoch(&self) -> Option<Epoch> {
         self.epoch
@@ -103,6 +127,19 @@ impl<D: Digest, T> OrderingContext<D, T> {
     /// Returns the history commitment, absent for speculative inputs.
     pub const fn history(&self) -> Option<D> {
         self.history
+    }
+
+    /// Returns the parent commitment of this authenticated history opening.
+    ///
+    /// This is the producing proposal's history subject. Consecutive chunks of one opening
+    /// share it even as `base()` advances. Local inputs and default final sweeps omit it.
+    pub const fn parent_history(&self) -> Option<D> {
+        self.parent_history
+    }
+
+    pub(crate) const fn with_parent_history(mut self, parent: Option<D>) -> Self {
+        self.parent_history = parent;
+        self
     }
 
     /// Returns the authenticated per-chain frontier, absent for speculative inputs.
@@ -162,6 +199,15 @@ impl<D: Digest, T> OrderingContext<D, T> {
 /// // Install on every node with config.with_ordering(LaneMajor, ()).
 /// ```
 pub trait Ordering<D: Digest, T = [u8; 0]>: Send + Sync + 'static {
+    /// Checks frozen policy constraints before the context can produce any outputs.
+    ///
+    /// Use only the supplied context and immutable epoch rules. Returning `false` rejects
+    /// the opening, including replay; it must not depend on local availability or reports.
+    /// Native permutation and lane-order checks run independently after `order`.
+    fn validate_context(&self, _context: &OrderingContext<D, T>) -> bool {
+        true
+    }
+
     /// Returns a complete chain-order-preserving permutation of the context's blocks.
     fn order(&self, context: &OrderingContext<D, T>) -> Vec<BlockRef<D>>;
 }
@@ -184,7 +230,14 @@ where
             .map(|bytes| Option::<T>::decode_cfg(bytes.clone(), &codec))
             .transpose()?
             .flatten();
-        Ok(ordering.order(&context.with_proposal_extension(extension)))
+        let context = context.with_proposal_extension(extension);
+        if !ordering.validate_context(&context) {
+            return Err(CodecError::Invalid(
+                "Ordering",
+                "policy rejected history context",
+            ));
+        }
+        Ok(ordering.order(&context))
     })
 }
 

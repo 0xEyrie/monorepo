@@ -20,7 +20,11 @@
 
 use crate::{
     Reporter,
-    simplex::{scheme::Scheme, types::Activity},
+    simplex::{
+        phase2::{Mode, Plain},
+        scheme::Scheme,
+        types::ActivityWith,
+    },
 };
 use commonware_actor::Feedback;
 use commonware_cryptography::{Digest, certificate};
@@ -34,12 +38,16 @@ use std::sync::Arc;
 /// This wrapper provides scheme-aware activity filtering with automatic verification of peer
 /// activities. It prevents signature forgery attacks on non-attributable schemes while ensuring
 /// all activities are cryptographically valid before reporting.
-pub struct AttributableReporter<
+pub type AttributableReporter<E, S, D, T, R> = AttributableReporterWith<E, S, D, T, R, Plain>;
+
+/// Mode-specific activity filtering with the native scheme's attribution rules.
+pub struct AttributableReporterWith<
     E: CryptoRng + Send + 'static,
     S: certificate::Scheme,
     D: Digest,
     T: Strategy,
-    R: Reporter<Activity = Activity<S, D>>,
+    R: Reporter<Activity = ActivityWith<S, D, M>>,
+    M: Mode<S, D>,
 > {
     /// RNG for certificate verification
     rng: Arc<Mutex<E>>,
@@ -58,8 +66,9 @@ impl<
     S: certificate::Scheme + Clone,
     D: Digest,
     T: Strategy,
-    R: Reporter<Activity = Activity<S, D>>,
-> Clone for AttributableReporter<E, S, D, T, R>
+    R: Reporter<Activity = ActivityWith<S, D, M>>,
+    M: Mode<S, D>,
+> Clone for AttributableReporterWith<E, S, D, T, R, M>
 {
     fn clone(&self) -> Self {
         Self {
@@ -77,8 +86,9 @@ impl<
     S: certificate::Scheme,
     D: Digest,
     T: Strategy,
-    R: Reporter<Activity = Activity<S, D>>,
-> AttributableReporter<E, S, D, T, R>
+    R: Reporter<Activity = ActivityWith<S, D, M>>,
+    M: Mode<S, D>,
+> AttributableReporterWith<E, S, D, T, R, M>
 {
     /// Creates a new `AttributableReporter` that wraps an inner reporter.
     pub fn new(rng: E, scheme: S, reporter: R, strategy: T, verify: bool) -> Self {
@@ -97,10 +107,11 @@ impl<
     S: Scheme<D>,
     D: Digest,
     T: Strategy,
-    R: Reporter<Activity = Activity<S, D>>,
-> Reporter for AttributableReporter<E, S, D, T, R>
+    R: Reporter<Activity = ActivityWith<S, D, M>>,
+    M: Mode<S, D>,
+> Reporter for AttributableReporterWith<E, S, D, T, R, M>
 {
-    type Activity = Activity<S, D>;
+    type Activity = ActivityWith<S, D, M>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         // Verify peer activities if verification is enabled
@@ -115,19 +126,19 @@ impl<
         // Filter based on scheme attributability
         if !S::is_attributable() {
             match activity {
-                Activity::Notarize(_)
-                | Activity::Nullify(_)
-                | Activity::Finalize(_)
-                | Activity::ConflictingNotarize(_)
-                | Activity::ConflictingFinalize(_)
-                | Activity::NullifyFinalize(_) => {
+                ActivityWith::Notarize(_)
+                | ActivityWith::Nullify(_)
+                | ActivityWith::Finalize(_)
+                | ActivityWith::ConflictingNotarize(_)
+                | ActivityWith::ConflictingFinalize(_)
+                | ActivityWith::NullifyFinalize(_) => {
                     // Ignore per-validator peer activity for non-attributable schemes.
                     return Feedback::Ok;
                 }
-                Activity::Notarization(_)
-                | Activity::Certification(_)
-                | Activity::Nullification(_)
-                | Activity::Finalization(_) => {
+                ActivityWith::Notarization(_)
+                | ActivityWith::Certification(_)
+                | ActivityWith::Nullification(_)
+                | ActivityWith::Finalization(_) => {
                     // Always report certificates
                 }
             }
@@ -143,7 +154,7 @@ mod tests {
     use crate::{
         simplex::{
             scheme::{bls12381_threshold::vrf as bls12381_threshold_vrf, ed25519},
-            types::{Notarization, Notarize, Proposal, Subject},
+            types::{Activity, Notarization, Notarize, Proposal, Subject},
         },
         types::{Epoch, Round, View},
     };

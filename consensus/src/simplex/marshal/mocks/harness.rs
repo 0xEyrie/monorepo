@@ -1923,45 +1923,46 @@ impl TestHarness for StandardHarness {
         broadcast_engine.start(network);
 
         let start = Instant::now();
-        let finalizations_by_height = immutable::Archive::init(
-            context.child("finalizations_by_height"),
-            immutable::Config {
-                metadata_partition: format!(
-                    "{}-finalizations-by-height-metadata",
-                    config.partition_prefix
-                ),
-                freezer_table_partition: format!(
-                    "{}-finalizations-by-height-freezer-table",
-                    config.partition_prefix
-                ),
-                freezer_table_initial_size: 64,
-                freezer_table_resize_frequency: 10,
-                freezer_table_resize_chunk_size: 10,
-                freezer_key_partition: format!(
-                    "{}-finalizations-by-height-freezer-key",
-                    config.partition_prefix
-                ),
-                freezer_key_page_cache: config.page_cache.clone(),
-                freezer_value_partition: format!(
-                    "{}-finalizations-by-height-freezer-value",
-                    config.partition_prefix
-                ),
-                freezer_value_target_size: 1024,
-                freezer_value_compression: None,
-                ordinal_partition: format!(
-                    "{}-finalizations-by-height-ordinal",
-                    config.partition_prefix
-                ),
-                items_per_section: NZU64!(10),
-                codec_config: S::certificate_codec_config_unbounded(),
-                replay_buffer: config.replay_buffer,
-                freezer_key_write_buffer: config.key_write_buffer,
-                freezer_value_write_buffer: config.value_write_buffer,
-                ordinal_write_buffer: config.key_write_buffer,
-            },
-        )
-        .await
-        .expect("failed to initialize finalizations by height archive");
+        let finalizations_by_height =
+            immutable::Archive::<_, D, Finalization<S, Self::Commitment>>::init(
+                context.child("finalizations_by_height"),
+                immutable::Config {
+                    metadata_partition: format!(
+                        "{}-finalizations-by-height-metadata",
+                        config.partition_prefix
+                    ),
+                    freezer_table_partition: format!(
+                        "{}-finalizations-by-height-freezer-table",
+                        config.partition_prefix
+                    ),
+                    freezer_table_initial_size: 64,
+                    freezer_table_resize_frequency: 10,
+                    freezer_table_resize_chunk_size: 10,
+                    freezer_key_partition: format!(
+                        "{}-finalizations-by-height-freezer-key",
+                        config.partition_prefix
+                    ),
+                    freezer_key_page_cache: config.page_cache.clone(),
+                    freezer_value_partition: format!(
+                        "{}-finalizations-by-height-freezer-value",
+                        config.partition_prefix
+                    ),
+                    freezer_value_target_size: 1024,
+                    freezer_value_compression: None,
+                    ordinal_partition: format!(
+                        "{}-finalizations-by-height-ordinal",
+                        config.partition_prefix
+                    ),
+                    items_per_section: NZU64!(10),
+                    codec_config: S::certificate_codec_config_unbounded(),
+                    replay_buffer: config.replay_buffer,
+                    freezer_key_write_buffer: config.key_write_buffer,
+                    freezer_value_write_buffer: config.value_write_buffer,
+                    ordinal_write_buffer: config.key_write_buffer,
+                },
+            )
+            .await
+            .expect("failed to initialize finalizations by height archive");
         info!(elapsed = ?start.elapsed(), "restored finalizations by height archive");
 
         let start = Instant::now();
@@ -2157,27 +2158,28 @@ impl TestHarness for StandardHarness {
         let network = control.register(1, TEST_QUOTA).await.unwrap();
         broadcast_engine.start(network);
 
-        let finalizations_by_height = prunable::Archive::init(
-            context.child("finalizations_by_height"),
-            prunable::Config {
-                translator: EightCap,
-                metadata_partition: format!(
-                    "{}-finalizations-by-height-metadata",
-                    partition_prefix
-                ),
-                key_partition: format!("{}-finalizations-by-height-key", partition_prefix),
-                key_page_cache: page_cache.clone(),
-                value_partition: format!("{}-finalizations-by-height-value", partition_prefix),
-                compression: None,
-                codec_config: S::certificate_codec_config_unbounded(),
-                items_per_section: NZU64!(10),
-                key_write_buffer: config.key_write_buffer,
-                value_write_buffer: config.value_write_buffer,
-                replay_buffer: config.replay_buffer,
-            },
-        )
-        .await
-        .expect("failed to initialize finalizations by height archive");
+        let finalizations_by_height =
+            prunable::Archive::<_, _, D, Finalization<S, Self::Commitment>>::init(
+                context.child("finalizations_by_height"),
+                prunable::Config {
+                    translator: EightCap,
+                    metadata_partition: format!(
+                        "{}-finalizations-by-height-metadata",
+                        partition_prefix
+                    ),
+                    key_partition: format!("{}-finalizations-by-height-key", partition_prefix),
+                    key_page_cache: page_cache.clone(),
+                    value_partition: format!("{}-finalizations-by-height-value", partition_prefix),
+                    compression: None,
+                    codec_config: S::certificate_codec_config_unbounded(),
+                    items_per_section: NZU64!(10),
+                    key_write_buffer: config.key_write_buffer,
+                    value_write_buffer: config.value_write_buffer,
+                    replay_buffer: config.replay_buffer,
+                },
+            )
+            .await
+            .expect("failed to initialize finalizations by height archive");
 
         let finalized_blocks = prunable::Archive::init(
             context.child("finalized_blocks"),
@@ -2706,45 +2708,46 @@ impl TestHarness for CodingHarness {
         let resolver = resolver::init(context.child("resolver"), resolver_cfg, backfill);
 
         let start = Instant::now();
-        let finalizations_by_height = immutable::Archive::init(
-            context.child("finalizations_by_height"),
-            immutable::Config {
-                metadata_partition: format!(
-                    "{}-finalizations-by-height-metadata",
-                    config.partition_prefix
-                ),
-                freezer_table_partition: format!(
-                    "{}-finalizations-by-height-freezer-table",
-                    config.partition_prefix
-                ),
-                freezer_table_initial_size: 64,
-                freezer_table_resize_frequency: 10,
-                freezer_table_resize_chunk_size: 10,
-                freezer_key_partition: format!(
-                    "{}-finalizations-by-height-freezer-key",
-                    config.partition_prefix
-                ),
-                freezer_key_page_cache: config.page_cache.clone(),
-                freezer_value_partition: format!(
-                    "{}-finalizations-by-height-freezer-value",
-                    config.partition_prefix
-                ),
-                freezer_value_target_size: 1024,
-                freezer_value_compression: None,
-                ordinal_partition: format!(
-                    "{}-finalizations-by-height-ordinal",
-                    config.partition_prefix
-                ),
-                items_per_section: NZU64!(10),
-                codec_config: S::certificate_codec_config_unbounded(),
-                replay_buffer: config.replay_buffer,
-                freezer_key_write_buffer: config.key_write_buffer,
-                freezer_value_write_buffer: config.value_write_buffer,
-                ordinal_write_buffer: config.key_write_buffer,
-            },
-        )
-        .await
-        .expect("failed to initialize finalizations by height archive");
+        let finalizations_by_height =
+            immutable::Archive::<_, D, Finalization<S, Self::Commitment>>::init(
+                context.child("finalizations_by_height"),
+                immutable::Config {
+                    metadata_partition: format!(
+                        "{}-finalizations-by-height-metadata",
+                        config.partition_prefix
+                    ),
+                    freezer_table_partition: format!(
+                        "{}-finalizations-by-height-freezer-table",
+                        config.partition_prefix
+                    ),
+                    freezer_table_initial_size: 64,
+                    freezer_table_resize_frequency: 10,
+                    freezer_table_resize_chunk_size: 10,
+                    freezer_key_partition: format!(
+                        "{}-finalizations-by-height-freezer-key",
+                        config.partition_prefix
+                    ),
+                    freezer_key_page_cache: config.page_cache.clone(),
+                    freezer_value_partition: format!(
+                        "{}-finalizations-by-height-freezer-value",
+                        config.partition_prefix
+                    ),
+                    freezer_value_target_size: 1024,
+                    freezer_value_compression: None,
+                    ordinal_partition: format!(
+                        "{}-finalizations-by-height-ordinal",
+                        config.partition_prefix
+                    ),
+                    items_per_section: NZU64!(10),
+                    codec_config: S::certificate_codec_config_unbounded(),
+                    replay_buffer: config.replay_buffer,
+                    freezer_key_write_buffer: config.key_write_buffer,
+                    freezer_value_write_buffer: config.value_write_buffer,
+                    ordinal_write_buffer: config.key_write_buffer,
+                },
+            )
+            .await
+            .expect("failed to initialize finalizations by height archive");
         info!(elapsed = ?start.elapsed(), "restored finalizations by height archive");
 
         let start = Instant::now();
@@ -2994,27 +2997,28 @@ impl TestHarness for CodingHarness {
         let network = control.register(1, TEST_QUOTA).await.unwrap();
         shard_engine.start(network);
 
-        let finalizations_by_height = prunable::Archive::init(
-            context.child("finalizations_by_height"),
-            prunable::Config {
-                translator: EightCap,
-                metadata_partition: format!(
-                    "{}-finalizations-by-height-metadata",
-                    partition_prefix
-                ),
-                key_partition: format!("{}-finalizations-by-height-key", partition_prefix),
-                key_page_cache: page_cache.clone(),
-                value_partition: format!("{}-finalizations-by-height-value", partition_prefix),
-                compression: None,
-                codec_config: S::certificate_codec_config_unbounded(),
-                items_per_section: NZU64!(10),
-                key_write_buffer: config.key_write_buffer,
-                value_write_buffer: config.value_write_buffer,
-                replay_buffer: config.replay_buffer,
-            },
-        )
-        .await
-        .expect("failed to initialize finalizations by height archive");
+        let finalizations_by_height =
+            prunable::Archive::<_, _, D, Finalization<S, Self::Commitment>>::init(
+                context.child("finalizations_by_height"),
+                prunable::Config {
+                    translator: EightCap,
+                    metadata_partition: format!(
+                        "{}-finalizations-by-height-metadata",
+                        partition_prefix
+                    ),
+                    key_partition: format!("{}-finalizations-by-height-key", partition_prefix),
+                    key_page_cache: page_cache.clone(),
+                    value_partition: format!("{}-finalizations-by-height-value", partition_prefix),
+                    compression: None,
+                    codec_config: S::certificate_codec_config_unbounded(),
+                    items_per_section: NZU64!(10),
+                    key_write_buffer: config.key_write_buffer,
+                    value_write_buffer: config.value_write_buffer,
+                    replay_buffer: config.replay_buffer,
+                },
+            )
+            .await
+            .expect("failed to initialize finalizations by height archive");
 
         let finalized_blocks = prunable::Archive::init(
             context.child("finalized_blocks"),

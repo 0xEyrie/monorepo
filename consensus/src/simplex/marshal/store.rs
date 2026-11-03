@@ -1,6 +1,17 @@
 //! Interfaces for stores of finalized certificates and blocks.
 
-use crate::{Block, simplex::types::Finalization, types::Height};
+#[commonware_macros::stability(ALPHA)]
+use crate::simplex::{
+    extension::certificate::Finalization as ExtendedFinalization, phase2::Extended,
+};
+use crate::{
+    Block,
+    simplex::{
+        phase2::{Mode, Plain},
+        types::Finalization,
+    },
+    types::Height,
+};
 use commonware_cryptography::{Digest, Digestible, certificate::Scheme};
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Storage};
 use commonware_storage::{
@@ -22,6 +33,9 @@ pub trait Certificates: Send + Sync + Sized + 'static {
 
     /// The type of signing [Scheme] used by consensus.
     type Scheme: Scheme;
+
+    /// Exact phase-two certificate representation retained in this store.
+    type Mode: Mode<Self::Scheme, Self::Commitment>;
 
     /// The type of error returned when storing, retrieving, or pruning finalizations.
     type Error: Error + Send + Sync + 'static;
@@ -46,7 +60,7 @@ pub trait Certificates: Send + Sync + Sized + 'static {
         self,
         height: Height,
         digest: Self::BlockDigest,
-        finalization: &Finalization<Self::Scheme, Self::Commitment>,
+        finalization: &<Self::Mode as Mode<Self::Scheme, Self::Commitment>>::Certificate,
     ) -> impl Future<Output = Result<Self, Self::Error>> + Send;
 
     /// Flush all buffered writes to durable storage.
@@ -84,7 +98,10 @@ pub trait Certificates: Send + Sync + Sized + 'static {
         &self,
         id: Identifier<'_, Self::BlockDigest>,
     ) -> impl Future<
-        Output = Result<Option<Finalization<Self::Scheme, Self::Commitment>>, Self::Error>,
+        Output = Result<
+            Option<<Self::Mode as Mode<Self::Scheme, Self::Commitment>>::Certificate>,
+            Self::Error,
+        >,
     > + Send;
 
     /// Check whether a finalization is stored at `height` without fetching it.
@@ -241,6 +258,7 @@ where
     type BlockDigest = B;
     type Commitment = C;
     type Scheme = S;
+    type Mode = Plain;
     type Error = archive::Error;
 
     async fn put(
@@ -264,6 +282,63 @@ where
         &self,
         id: Identifier<'_, Self::BlockDigest>,
     ) -> Result<Option<Finalization<Self::Scheme, Self::Commitment>>, Self::Error> {
+        <Self as Archive>::get(self, id).await
+    }
+
+    async fn has(&self, height: Height) -> Result<bool, Self::Error> {
+        <Self as Archive>::has(self, Identifier::Index(height.get())).await
+    }
+
+    async fn prune(self, _: Height) -> Result<Self, Self::Error> {
+        // Pruning is a no-op for immutable archives.
+        Ok(self)
+    }
+
+    fn last_index(&self) -> Option<Height> {
+        <Self as Archive>::last_index(self).map(Height::new)
+    }
+
+    fn ranges_from(&self, from: Height) -> impl Iterator<Item = (Height, Height)> {
+        <Self as Archive>::ranges_from(self, from.get())
+            .map(|(s, e)| (Height::new(s), Height::new(e)))
+    }
+}
+
+#[commonware_macros::stability(ALPHA)]
+impl<E, B, C, S> Certificates for immutable::Archive<E, B, ExtendedFinalization<S, C>>
+where
+    E: BufferPooler + Storage + Metrics + Clock,
+    B: Digest,
+    C: Digest,
+    S: Scheme,
+{
+    type BlockDigest = B;
+    type Commitment = C;
+    type Scheme = S;
+    type Mode = Extended;
+    type Error = archive::Error;
+
+    async fn put(
+        self,
+        height: Height,
+        digest: Self::BlockDigest,
+        finalization: &ExtendedFinalization<S, Self::Commitment>,
+    ) -> Result<Self, Self::Error> {
+        Archive::put(self, height.get(), digest, finalization).await
+    }
+
+    async fn sync(self) -> Result<Self, Self::Error> {
+        Archive::sync(self).await
+    }
+
+    async fn start_sync(self) -> Result<(Self, Handle<()>), Self::Error> {
+        Archive::start_sync(self).await
+    }
+
+    async fn get(
+        &self,
+        id: Identifier<'_, Self::BlockDigest>,
+    ) -> Result<Option<ExtendedFinalization<Self::Scheme, Self::Commitment>>, Self::Error> {
         <Self as Archive>::get(self, id).await
     }
 
@@ -346,6 +421,7 @@ where
     type BlockDigest = B;
     type Commitment = C;
     type Scheme = S;
+    type Mode = Plain;
     type Error = archive::Error;
 
     async fn put(
@@ -369,6 +445,63 @@ where
         &self,
         id: Identifier<'_, Self::BlockDigest>,
     ) -> Result<Option<Finalization<Self::Scheme, Self::Commitment>>, Self::Error> {
+        <Self as Archive>::get(self, id).await
+    }
+
+    async fn has(&self, height: Height) -> Result<bool, Self::Error> {
+        <Self as Archive>::has(self, Identifier::Index(height.get())).await
+    }
+
+    async fn prune(self, min: Height) -> Result<Self, Self::Error> {
+        Self::prune(self, min.get()).await
+    }
+
+    fn last_index(&self) -> Option<Height> {
+        <Self as Archive>::last_index(self).map(Height::new)
+    }
+
+    fn ranges_from(&self, from: Height) -> impl Iterator<Item = (Height, Height)> {
+        <Self as Archive>::ranges_from(self, from.get())
+            .map(|(s, e)| (Height::new(s), Height::new(e)))
+    }
+}
+
+#[commonware_macros::stability(ALPHA)]
+impl<T, E, B, C, S> Certificates for prunable::Archive<T, E, B, ExtendedFinalization<S, C>>
+where
+    T: Translator,
+    E: BufferPooler + Storage + Metrics + Clock,
+    B: Digest,
+    C: Digest,
+    S: Scheme,
+{
+    type BlockDigest = B;
+    type Commitment = C;
+    type Scheme = S;
+    type Mode = Extended;
+    type Error = archive::Error;
+
+    async fn put(
+        self,
+        height: Height,
+        digest: Self::BlockDigest,
+        finalization: &ExtendedFinalization<S, Self::Commitment>,
+    ) -> Result<Self, Self::Error> {
+        Archive::put(self, height.get(), digest, finalization).await
+    }
+
+    async fn sync(self) -> Result<Self, Self::Error> {
+        Archive::sync(self).await
+    }
+
+    async fn start_sync(self) -> Result<(Self, Handle<()>), Self::Error> {
+        Archive::start_sync(self).await
+    }
+
+    async fn get(
+        &self,
+        id: Identifier<'_, Self::BlockDigest>,
+    ) -> Result<Option<ExtendedFinalization<Self::Scheme, Self::Commitment>>, Self::Error> {
         <Self as Archive>::get(self, id).await
     }
 

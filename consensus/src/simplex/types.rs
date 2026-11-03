@@ -2,7 +2,10 @@
 
 use crate::{
     Epochable, Viewable,
-    simplex::scheme::{self, CertificateVerifier},
+    simplex::{
+        phase2::{Mode, Plain},
+        scheme::{self, CertificateVerifier},
+    },
     types::{Attributable, Epoch, Participant, Round, View},
 };
 use bytes::BufMut;
@@ -93,521 +96,12 @@ where
     }
 }
 
-/// A map of [Attributable] items keyed by their signer index.
-///
-/// The key for each item is automatically inferred from [Attributable::signer()].
-/// Each signer can insert at most one item.
-pub struct AttributableMap<T: Attributable> {
-    participants: usize,
-    data: Vec<Option<T>>,
-    added: usize,
-}
-
-impl<T: Attributable> AttributableMap<T> {
-    /// Creates a new [AttributableMap] with the given number of participants.
-    pub const fn new(participants: usize) -> Self {
-        Self {
-            participants,
-            data: Vec::new(),
-            added: 0,
-        }
-    }
-
-    /// Clears all existing items and releases their storage.
-    pub fn clear(&mut self) {
-        self.data = Vec::new();
-        self.added = 0;
-    }
-
-    /// Inserts an item into the map, using [Attributable::signer()] as the key,
-    /// if it has not been added yet.
-    ///
-    /// Returns `true` if the item was inserted, `false` if an item from this
-    /// signer already exists or if the signer index is out of bounds.
-    pub fn insert(&mut self, item: T) -> bool {
-        let index: usize = item.signer().into();
-        if index >= self.participants {
-            return false;
-        }
-        if self.data.is_empty() {
-            // `resize_with` avoids requiring `T: Clone` while pre-filling with `None`.
-            self.data.reserve_exact(self.participants);
-            self.data.resize_with(self.participants, || None);
-        }
-        if self.data[index].is_some() {
-            return false;
-        }
-        self.data[index] = Some(item);
-        self.added += 1;
-        true
-    }
-
-    /// Returns the number of items in the [AttributableMap].
-    pub const fn len(&self) -> usize {
-        self.added
-    }
-
-    /// Returns `true` if the [AttributableMap] is empty.
-    pub const fn is_empty(&self) -> bool {
-        self.added == 0
-    }
-
-    /// Returns a reference to the item associated with the given signer, if present.
-    pub fn get(&self, signer: Participant) -> Option<&T> {
-        self.data.get(<usize>::from(signer))?.as_ref()
-    }
-
-    /// Returns an iterator over items in the map, ordered by signer index
-    /// ([Attributable::signer()]).
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.data.iter().filter_map(|o| o.as_ref())
-    }
-}
-
-/// Full vote storage for a phase, or a marker that its certificate was recorded.
+mod tracker;
+pub use tracker::AttributableMap;
 #[cfg(not(target_arch = "wasm32"))]
-enum Phase<T: Attributable> {
-    Full(AttributableMap<T>),
-    Compacted,
-}
-
+pub(crate) use tracker::{ObservedVote, Outcome};
 #[cfg(not(target_arch = "wasm32"))]
-impl<T: Attributable> Phase<T> {
-    const fn new(participants: usize) -> Self {
-        Self::Full(AttributableMap::new(participants))
-    }
-
-    fn insert(&mut self, vote: T) -> bool {
-        match self {
-            Self::Full(votes) => votes.insert(vote),
-            Self::Compacted => false,
-        }
-    }
-
-    fn get(&self, signer: Participant) -> Option<&T> {
-        match self {
-            Self::Full(votes) => votes.get(signer),
-            Self::Compacted => None,
-        }
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &T> {
-        match self {
-            Self::Full(votes) => Some(votes),
-            Self::Compacted => None,
-        }
-        .into_iter()
-        .flat_map(AttributableMap::iter)
-    }
-
-    const fn len(&self) -> usize {
-        match self {
-            Self::Full(votes) => votes.len(),
-            Self::Compacted => 0,
-        }
-    }
-
-    fn compact(&mut self) -> Option<AttributableMap<T>> {
-        match std::mem::replace(self, Self::Compacted) {
-            Self::Full(votes) => Some(votes),
-            Self::Compacted => None,
-        }
-    }
-
-    fn reset(&mut self, participants: usize) {
-        *self = Self::new(participants);
-    }
-}
-
-/// Tracks notarize/nullify/finalize votes for a view.
-///
-/// Each vote type is stored in its own lazily allocated phase so a validator can
-/// contribute at most one vote per phase. After certification, compact signer facts
-/// can replace full votes while preserving forwarding, duplicate suppression, and
-/// compact conflict detection.
-#[cfg(not(target_arch = "wasm32"))]
-pub struct VoteTracker<S: Scheme, D: Digest> {
-    participants: usize,
-    retain_votes_after_certification: bool,
-    /// Compact state records whether a signer voted and whether the vote carried the
-    /// authoritative proposal. The first fact suppresses duplicates and cross-phase
-    /// conflicts. The second avoids forwarding a block to validators that already have it.
-    compacted: Vec<u8>,
-    notarizes: Phase<Notarize<S, D>>,
-    nullifies: Phase<Nullify<S>>,
-    /// Finalize votes include the proposal digest so the entire certificate can be
-    /// reconstructed once the quorum threshold is hit.
-    finalizes: Phase<Finalize<S, D>>,
-}
-
-/// Outcome of recording a vote in its phase-specific lifecycle state.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) enum Outcome {
-    /// Newly recorded, with the full vote retained when `retained` is true.
-    Added { retained: bool },
-    /// Not newly recorded, with full votes still retained when `retained` is true.
-    Duplicate { retained: bool },
-    /// The compact proposal relation proves a same-phase conflict.
-    Conflicting,
-}
-
-/// A recorded vote retained in full or represented by compact signer state.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) enum ObservedVote<'a, T> {
-    Retained(&'a T),
-    Compacted,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl<S: Scheme, D: Digest> VoteTracker<S, D> {
-    const NOTARIZE_SEEN: u8 = 1 << 0;
-    const NOTARIZE_HAS_PROPOSAL: u8 = 1 << 1;
-    const NULLIFY_SEEN: u8 = 1 << 2;
-    const FINALIZE_SEEN: u8 = 1 << 3;
-    const FINALIZE_HAS_PROPOSAL: u8 = 1 << 4;
-
-    /// Creates a tracker sized for `participants` validators.
-    ///
-    /// When `retain_votes_after_certification` is false, full votes are released
-    /// once their phase certifies. Otherwise they remain until explicitly cleared
-    /// or the tracker is dropped.
-    pub const fn new(participants: usize, retain_votes_after_certification: bool) -> Self {
-        Self {
-            participants,
-            retain_votes_after_certification,
-            compacted: Vec::new(),
-            notarizes: Phase::new(participants),
-            nullifies: Phase::new(participants),
-            finalizes: Phase::new(participants),
-        }
-    }
-
-    /// Records monotonic signer facts after a phase releases its full vote map.
-    ///
-    /// A later matching vote can record that the signer has the authoritative
-    /// proposal even when the signer was already observed.
-    fn remember(
-        participants: usize,
-        compacted: &mut Vec<u8>,
-        signer: Participant,
-        seen: u8,
-        proposal_relation: Option<(u8, bool)>,
-    ) -> Outcome {
-        let index = usize::from(signer);
-        if index >= participants {
-            return Outcome::Duplicate { retained: false };
-        }
-
-        // Certificate-first rounds remain allocation-free until a vote arrives.
-        if compacted.is_empty() {
-            compacted.resize(participants, 0);
-        }
-
-        let flags = &mut compacted[index];
-        let previously_seen = *flags & seen != 0;
-        let proposal_conflict = proposal_relation.is_some_and(|(has_proposal, matches)| {
-            previously_seen && (*flags & has_proposal != 0) != matches
-        });
-        *flags |= seen;
-        if let Some((has_proposal, true)) = proposal_relation {
-            *flags |= has_proposal;
-        }
-        if !previously_seen {
-            Outcome::Added { retained: false }
-        } else if proposal_conflict {
-            Outcome::Conflicting
-        } else {
-            Outcome::Duplicate { retained: false }
-        }
-    }
-
-    /// Records one phase according to its full-to-compact storage lifecycle.
-    ///
-    /// A full phase owns duplicate detection and full-vote storage. A compacted
-    /// phase retains only signer facts until explicitly cleared.
-    fn record_phase<T: Attributable + Clone>(
-        participants: usize,
-        compacted: &mut Vec<u8>,
-        phase: &mut Phase<T>,
-        vote: &T,
-        seen: u8,
-        proposal_relation: Option<(u8, bool)>,
-    ) -> Outcome {
-        match phase {
-            Phase::Full(votes) => {
-                if votes.insert(vote.clone()) {
-                    Outcome::Added { retained: true }
-                } else {
-                    Outcome::Duplicate { retained: true }
-                }
-            }
-            Phase::Compacted => Self::remember(
-                participants,
-                compacted,
-                vote.signer(),
-                seen,
-                proposal_relation,
-            ),
-        }
-    }
-
-    fn remembered(&self, signer: Participant, flag: u8) -> bool {
-        self.compacted
-            .get(usize::from(signer))
-            .is_some_and(|flags| flags & flag != 0)
-    }
-
-    /// Records a vote in full or as compact post-certificate state.
-    ///
-    /// `proposal` identifies the authoritative proposal used for compact match state.
-    pub(crate) fn record(&mut self, vote: &Vote<S, D>, proposal: Option<&Proposal<D>>) -> Outcome {
-        match vote {
-            Vote::Notarize(notarize) => Self::record_phase(
-                self.participants,
-                &mut self.compacted,
-                &mut self.notarizes,
-                notarize,
-                Self::NOTARIZE_SEEN,
-                proposal
-                    .map(|proposal| (Self::NOTARIZE_HAS_PROPOSAL, proposal == &notarize.proposal)),
-            ),
-            Vote::Nullify(nullify) => Self::record_phase(
-                self.participants,
-                &mut self.compacted,
-                &mut self.nullifies,
-                nullify,
-                Self::NULLIFY_SEEN,
-                None,
-            ),
-            Vote::Finalize(finalize) => Self::record_phase(
-                self.participants,
-                &mut self.compacted,
-                &mut self.finalizes,
-                finalize,
-                Self::FINALIZE_SEEN,
-                proposal
-                    .map(|proposal| (Self::FINALIZE_HAS_PROPOSAL, proposal == &finalize.proposal)),
-            ),
-        }
-    }
-
-    /// Moves a phase from full vote storage to compact signer state.
-    ///
-    /// Taking the map makes the transition idempotent. Empty phases remain
-    /// allocation-free, while existing signer and proposal-match facts survive.
-    fn release<T: Attributable>(
-        participants: usize,
-        compacted: &mut Vec<u8>,
-        phase: &mut Phase<T>,
-        seen: u8,
-        has_proposal: u8,
-        carries_proposal: impl Fn(&T) -> bool,
-    ) {
-        let Some(votes) = phase.compact() else {
-            return;
-        };
-
-        // A certificate may arrive before any individual votes, in which case there
-        // are no signer facts worth allocating a table for.
-        if !votes.is_empty() && compacted.is_empty() {
-            compacted.resize(participants, 0);
-        }
-
-        // Proposal-match bits are relative to the certificate-backed proposal.
-        for vote in votes.iter() {
-            let flags = &mut compacted[usize::from(vote.signer())];
-            *flags |= seen;
-            if carries_proposal(vote) {
-                *flags |= has_proposal;
-            }
-        }
-    }
-
-    /// Returns the retained or compact state for a previously observed nullify vote.
-    pub(crate) fn saw_nullify(&self, signer: Participant) -> Option<ObservedVote<'_, Nullify<S>>> {
-        self.nullify(signer)
-            .map(ObservedVote::Retained)
-            .or_else(|| {
-                self.remembered(signer, Self::NULLIFY_SEEN)
-                    .then_some(ObservedVote::Compacted)
-            })
-    }
-
-    /// Returns the retained or compact state for a previously observed finalize vote.
-    pub(crate) fn saw_finalize(
-        &self,
-        signer: Participant,
-    ) -> Option<ObservedVote<'_, Finalize<S, D>>> {
-        self.finalize(signer)
-            .map(ObservedVote::Retained)
-            .or_else(|| {
-                self.remembered(signer, Self::FINALIZE_SEEN)
-                    .then_some(ObservedVote::Compacted)
-            })
-    }
-
-    /// Returns whether `signer` is known to have the authoritative proposal
-    /// from notarizing it.
-    pub(crate) fn has_notarize_for(&self, signer: Participant, proposal: &Proposal<D>) -> bool {
-        self.remembered(signer, Self::NOTARIZE_HAS_PROPOSAL)
-            || self
-                .notarize(signer)
-                .is_some_and(|vote| &vote.proposal == proposal)
-    }
-
-    /// Returns whether `signer` is known to have the authoritative proposal
-    /// from finalizing it.
-    pub(crate) fn has_finalize_for(&self, signer: Participant, proposal: &Proposal<D>) -> bool {
-        self.remembered(signer, Self::FINALIZE_HAS_PROPOSAL)
-            || self
-                .finalize(signer)
-                .is_some_and(|vote| &vote.proposal == proposal)
-    }
-
-    /// Releases notarize votes unless full evidence is configured for retention.
-    pub(crate) fn release_notarizes(&mut self, proposal: &Proposal<D>) {
-        if self.retain_votes_after_certification {
-            return;
-        }
-        Self::release(
-            self.participants,
-            &mut self.compacted,
-            &mut self.notarizes,
-            Self::NOTARIZE_SEEN,
-            Self::NOTARIZE_HAS_PROPOSAL,
-            |vote: &Notarize<S, D>| &vote.proposal == proposal,
-        );
-    }
-
-    /// Releases nullify votes unless full evidence is configured for retention.
-    pub(crate) fn release_nullifies(&mut self) {
-        if self.retain_votes_after_certification {
-            return;
-        }
-        Self::release(
-            self.participants,
-            &mut self.compacted,
-            &mut self.nullifies,
-            Self::NULLIFY_SEEN,
-            0,
-            |_| false,
-        );
-    }
-
-    /// Releases finalize votes unless full evidence is configured for retention.
-    pub(crate) fn release_finalizes(&mut self, proposal: &Proposal<D>) {
-        if self.retain_votes_after_certification {
-            return;
-        }
-        Self::release(
-            self.participants,
-            &mut self.compacted,
-            &mut self.finalizes,
-            Self::FINALIZE_SEEN,
-            Self::FINALIZE_HAS_PROPOSAL,
-            |vote: &Finalize<S, D>| &vote.proposal == proposal,
-        );
-    }
-
-    fn clear_compacted(&mut self, cleared: u8) {
-        for flags in &mut self.compacted {
-            *flags &= !cleared;
-        }
-        if self.compacted.iter().all(|&flags| flags == 0) {
-            self.compacted = Vec::new();
-        }
-    }
-
-    /// Inserts a notarize vote if the signer has not already voted.
-    pub fn insert_notarize(&mut self, vote: Notarize<S, D>) -> bool {
-        self.notarizes.insert(vote)
-    }
-
-    /// Inserts a nullify vote if the signer has not already voted.
-    pub fn insert_nullify(&mut self, vote: Nullify<S>) -> bool {
-        self.nullifies.insert(vote)
-    }
-
-    /// Inserts a finalize vote if the signer has not already voted.
-    pub fn insert_finalize(&mut self, vote: Finalize<S, D>) -> bool {
-        self.finalizes.insert(vote)
-    }
-
-    /// Returns the notarize vote for `signer`, if present.
-    pub fn notarize(&self, signer: Participant) -> Option<&Notarize<S, D>> {
-        self.notarizes.get(signer)
-    }
-
-    /// Returns the nullify vote for `signer`, if present.
-    pub fn nullify(&self, signer: Participant) -> Option<&Nullify<S>> {
-        self.nullifies.get(signer)
-    }
-
-    /// Returns the finalize vote for `signer`, if present.
-    pub fn finalize(&self, signer: Participant) -> Option<&Finalize<S, D>> {
-        self.finalizes.get(signer)
-    }
-
-    /// Iterates over notarize votes in signer order.
-    pub fn iter_notarizes(&self) -> impl Iterator<Item = &Notarize<S, D>> {
-        self.notarizes.iter()
-    }
-
-    /// Iterates over nullify votes in signer order.
-    pub fn iter_nullifies(&self) -> impl Iterator<Item = &Nullify<S>> {
-        self.nullifies.iter()
-    }
-
-    /// Iterates over finalize votes in signer order.
-    pub fn iter_finalizes(&self) -> impl Iterator<Item = &Finalize<S, D>> {
-        self.finalizes.iter()
-    }
-
-    /// Returns how many notarize votes have been recorded.
-    pub fn len_notarizes(&self) -> u32 {
-        let len = self.notarizes.len();
-        u32::try_from(len).expect("too many notarize votes")
-    }
-
-    /// Returns how many nullify votes have been recorded.
-    pub fn len_nullifies(&self) -> u32 {
-        let len = self.nullifies.len();
-        u32::try_from(len).expect("too many nullify votes")
-    }
-
-    /// Returns how many finalize votes have been recorded.
-    pub fn len_finalizes(&self) -> u32 {
-        let len = self.finalizes.len();
-        u32::try_from(len).expect("too many finalize votes")
-    }
-
-    /// Returns `true` if the given signer has a notarize vote recorded.
-    pub fn has_notarize(&self, signer: Participant) -> bool {
-        self.notarize(signer).is_some()
-    }
-
-    /// Returns `true` if a nullify vote has been recorded for `signer`.
-    pub fn has_nullify(&self, signer: Participant) -> bool {
-        self.nullify(signer).is_some()
-    }
-
-    /// Returns `true` if a finalize vote has been recorded for `signer`.
-    pub fn has_finalize(&self, signer: Participant) -> bool {
-        self.finalize(signer).is_some()
-    }
-
-    /// Clears all notarize votes and releases their storage.
-    pub fn clear_notarizes(&mut self) {
-        self.notarizes.reset(self.participants);
-        self.clear_compacted(Self::NOTARIZE_SEEN | Self::NOTARIZE_HAS_PROPOSAL);
-    }
-
-    /// Clears all finalize votes and releases their storage.
-    pub fn clear_finalizes(&mut self) {
-        self.finalizes.reset(self.participants);
-        self.clear_compacted(Self::FINALIZE_SEEN | Self::FINALIZE_HAS_PROPOSAL);
-    }
-}
+pub use tracker::{VoteTracker, VoteTrackerWith};
 
 /// Identifies the subject of a vote or certificate.
 ///
@@ -621,6 +115,37 @@ pub enum Subject<'a, D: Digest> {
     Nullify { round: Round },
     /// Subject for finalize votes and certificates, carrying the proposal.
     Finalize { proposal: &'a Proposal<D> },
+    /// ALPHA: final vote over immutable P and the exact extension interpretation.
+    #[cfg(not(any(
+        commonware_stability_BETA,
+        commonware_stability_GAMMA,
+        commonware_stability_DELTA,
+        commonware_stability_EPSILON,
+        commonware_stability_RESERVED
+    )))]
+    FinalizeExtension {
+        statement: &'a super::extension::vote::Statement<D>,
+    },
+    /// ALPHA: individually attributable, frozen recovery status.
+    #[cfg(not(any(
+        commonware_stability_BETA,
+        commonware_stability_GAMMA,
+        commonware_stability_DELTA,
+        commonware_stability_EPSILON,
+        commonware_stability_RESERVED
+    )))]
+    ExtensionStatus {
+        promise: &'a super::extension::recovery::Promise<D>,
+    },
+    /// ALPHA: elected recovery leader request, separate from any vote.
+    #[cfg(not(any(
+        commonware_stability_BETA,
+        commonware_stability_GAMMA,
+        commonware_stability_DELTA,
+        commonware_stability_EPSILON,
+        commonware_stability_RESERVED
+    )))]
+    ExtensionRequest { round: Round, payload: &'a [u8] },
 }
 
 impl<D: Digest> Viewable for Subject<'_, D> {
@@ -629,22 +154,63 @@ impl<D: Digest> Viewable for Subject<'_, D> {
             Subject::Notarize { proposal } => proposal.view(),
             Subject::Nullify { round } => round.view(),
             Subject::Finalize { proposal } => proposal.view(),
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Subject::FinalizeExtension { statement } => statement.ballot.view(),
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Subject::ExtensionStatus { promise } => promise.ballot.view(),
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Subject::ExtensionRequest { round, .. } => round.view(),
         }
     }
 }
 
+/// Stock Simplex vote representation. Its existing fields and wire format are unchanged.
+pub type Vote<S, D> = VoteWith<S, D, Plain>;
+
+/// Stock Simplex certificate representation, excluding extension recovery results.
+pub type Certificate<S, D> = CertificateWith<S, D, Plain>;
+
 /// Vote represents individual votes ([Notarize], [Nullify], [Finalize]).
-#[derive(Clone, Debug, PartialEq)]
-pub enum Vote<S: Scheme, D: Digest> {
+#[derive(Clone, Debug)]
+pub enum VoteWith<S: Scheme, D: Digest, M: Mode<S, D>> {
     /// A validator's notarize vote over a proposal.
-    Notarize(Notarize<S, D>),
+    Notarize(M::Notarize),
     /// A validator's nullify vote used to skip the current view.
     Nullify(Nullify<S>),
     /// A validator's finalize vote over a proposal.
-    Finalize(Finalize<S, D>),
+    Finalize(M::Vote),
 }
 
-impl<S: Scheme, D: Digest> Write for Vote<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> PartialEq for VoteWith<S, D, M> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Notarize(a), Self::Notarize(b)) => a == b,
+            (Self::Nullify(a), Self::Nullify(b)) => a == b,
+            (Self::Finalize(a), Self::Finalize(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Write for VoteWith<S, D, M> {
     fn write(&self, writer: &mut impl BufMut) {
         match self {
             Self::Notarize(v) => {
@@ -663,7 +229,7 @@ impl<S: Scheme, D: Digest> Write for Vote<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> EncodeSize for Vote<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> EncodeSize for VoteWith<S, D, M> {
     fn encode_size(&self) -> usize {
         1 + match self {
             Self::Notarize(v) => v.encode_size(),
@@ -673,14 +239,14 @@ impl<S: Scheme, D: Digest> EncodeSize for Vote<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Read for Vote<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Read for VoteWith<S, D, M> {
     type Cfg = ();
 
     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, Error> {
         let tag = <u8>::read(reader)?;
         match tag {
             0 => {
-                let v = Notarize::read(reader)?;
+                let v = M::Notarize::read(reader)?;
                 Ok(Self::Notarize(v))
             }
             1 => {
@@ -688,7 +254,7 @@ impl<S: Scheme, D: Digest> Read for Vote<S, D> {
                 Ok(Self::Nullify(v))
             }
             2 => {
-                let v = Finalize::read(reader)?;
+                let v = M::Vote::read(reader)?;
                 Ok(Self::Finalize(v))
             }
             _ => Err(Error::Invalid("consensus::simplex::Vote", "Invalid type")),
@@ -696,7 +262,7 @@ impl<S: Scheme, D: Digest> Read for Vote<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Epochable for Vote<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Epochable for VoteWith<S, D, M> {
     fn epoch(&self) -> Epoch {
         match self {
             Self::Notarize(v) => v.epoch(),
@@ -706,7 +272,7 @@ impl<S: Scheme, D: Digest> Epochable for Vote<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Viewable for Vote<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Viewable for VoteWith<S, D, M> {
     fn view(&self) -> View {
         match self {
             Self::Notarize(v) => v.view(),
@@ -717,16 +283,18 @@ impl<S: Scheme, D: Digest> Viewable for Vote<S, D> {
 }
 
 #[cfg(feature = "arbitrary")]
-impl<S: Scheme, D: Digest> arbitrary::Arbitrary<'_> for Vote<S, D>
+impl<S: Scheme, D: Digest, M: Mode<S, D>> arbitrary::Arbitrary<'_> for VoteWith<S, D, M>
 where
     S::Signature: for<'a> arbitrary::Arbitrary<'a>,
+    M::Notarize: for<'a> arbitrary::Arbitrary<'a>,
+    M::Vote: for<'a> arbitrary::Arbitrary<'a>,
     D: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         let tag = u.int_in_range(0..=2)?;
         match tag {
             0 => {
-                let v = Notarize::arbitrary(u)?;
+                let v = M::Notarize::arbitrary(u)?;
                 Ok(Self::Notarize(v))
             }
             1 => {
@@ -734,7 +302,7 @@ where
                 Ok(Self::Nullify(v))
             }
             2 => {
-                let v = Finalize::arbitrary(u)?;
+                let v = M::Vote::arbitrary(u)?;
                 Ok(Self::Finalize(v))
             }
             _ => unreachable!(),
@@ -744,13 +312,13 @@ where
 
 /// Certificate represents aggregated votes ([Notarization], [Nullification], [Finalization]).
 #[derive(Clone, Debug, PartialEq)]
-pub enum Certificate<S: Scheme, D: Digest> {
+pub enum CertificateWith<S: Scheme, D: Digest, M: Mode<S, D>> {
     /// A recovered certificate for a notarization.
     Notarization(Notarization<S, D>),
     /// A recovered certificate for a nullification.
     Nullification(Nullification<S>),
     /// A recovered certificate for a finalization.
-    Finalization(Finalization<S, D>),
+    Finalization(M::Certificate),
 }
 
 /// The discriminant of a [Certificate], naming its kind without its contents.
@@ -774,7 +342,7 @@ impl std::fmt::Display for Kind {
     }
 }
 
-impl<S: Scheme, D: Digest> Certificate<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> CertificateWith<S, D, M> {
     /// Returns this certificate's type.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) const fn kind(&self) -> Kind {
@@ -795,12 +363,12 @@ impl<S: Scheme, D: Digest> Certificate<S, D> {
             Self::Nullification(nullification) => {
                 nullification.verify::<_, D>(rng, scheme, strategy)
             }
-            Self::Finalization(finalization) => finalization.verify(rng, scheme, strategy),
+            Self::Finalization(finalization) => M::verify(finalization, rng, scheme, strategy),
         }
     }
 }
 
-impl<S: Scheme, D: Digest> Write for Certificate<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Write for CertificateWith<S, D, M> {
     fn write(&self, writer: &mut impl BufMut) {
         match self {
             Self::Notarization(v) => {
@@ -819,7 +387,7 @@ impl<S: Scheme, D: Digest> Write for Certificate<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> EncodeSize for Certificate<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> EncodeSize for CertificateWith<S, D, M> {
     fn encode_size(&self) -> usize {
         1 + match self {
             Self::Notarization(v) => v.encode_size(),
@@ -829,7 +397,7 @@ impl<S: Scheme, D: Digest> EncodeSize for Certificate<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Read for Certificate<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Read for CertificateWith<S, D, M> {
     type Cfg = <S::Certificate as Read>::Cfg;
 
     fn read_cfg(reader: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
@@ -844,7 +412,7 @@ impl<S: Scheme, D: Digest> Read for Certificate<S, D> {
                 Ok(Self::Nullification(v))
             }
             2 => {
-                let v = Finalization::read_cfg(reader, cfg)?;
+                let v = M::Certificate::read_cfg(reader, cfg)?;
                 Ok(Self::Finalization(v))
             }
             _ => Err(Error::Invalid(
@@ -855,7 +423,7 @@ impl<S: Scheme, D: Digest> Read for Certificate<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Epochable for Certificate<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Epochable for CertificateWith<S, D, M> {
     fn epoch(&self) -> Epoch {
         match self {
             Self::Notarization(v) => v.epoch(),
@@ -865,7 +433,7 @@ impl<S: Scheme, D: Digest> Epochable for Certificate<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Viewable for Certificate<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Viewable for CertificateWith<S, D, M> {
     fn view(&self) -> View {
         match self {
             Self::Notarization(v) => v.view(),
@@ -876,9 +444,10 @@ impl<S: Scheme, D: Digest> Viewable for Certificate<S, D> {
 }
 
 #[cfg(feature = "arbitrary")]
-impl<S: Scheme, D: Digest> arbitrary::Arbitrary<'_> for Certificate<S, D>
+impl<S: Scheme, D: Digest, M: Mode<S, D>> arbitrary::Arbitrary<'_> for CertificateWith<S, D, M>
 where
     S::Certificate: for<'a> arbitrary::Arbitrary<'a>,
+    M::Certificate: for<'a> arbitrary::Arbitrary<'a>,
     D: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
@@ -893,7 +462,7 @@ where
                 Ok(Self::Nullification(v))
             }
             2 => {
-                let v = Finalization::arbitrary(u)?;
+                let v = M::Certificate::arbitrary(u)?;
                 Ok(Self::Finalization(v))
             }
             _ => unreachable!(),
@@ -901,11 +470,14 @@ where
     }
 }
 
+/// Stock Simplex journal representation, with unchanged record bytes.
+pub type Artifact<S, D> = ArtifactWith<S, D, Plain>;
+
 /// Artifact represents all consensus artifacts (votes and certificates) for storage.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Artifact<S: Scheme, D: Digest> {
+pub enum ArtifactWith<S: Scheme, D: Digest, M: Mode<S, D>> {
     /// A validator's notarize vote over a proposal.
-    Notarize(Notarize<S, D>),
+    Notarize(M::Notarize),
     /// A recovered certificate for a notarization.
     Notarization(Notarization<S, D>),
     /// A notarization was locally certified.
@@ -915,14 +487,26 @@ pub enum Artifact<S: Scheme, D: Digest> {
     /// A recovered certificate for a nullification.
     Nullification(Nullification<S>),
     /// A validator's finalize vote over a proposal.
-    Finalize(Finalize<S, D>),
+    Finalize(M::Vote),
     /// A recovered certificate for a finalization.
-    Finalization(Finalization<S, D>),
+    Finalization(M::Certificate),
+    /// Local recovery promise or acceptance, never native finality.
+    Recovery(M::Recovery),
+    /// Authenticated later-ballot interpretation, without native finality.
+    Recovered(M::Recovered),
 }
 
-impl<S: Scheme, D: Digest> Write for Artifact<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Write for ArtifactWith<S, D, M> {
     fn write(&self, writer: &mut impl BufMut) {
         match self {
+            Self::Recovered(v) => {
+                8u8.write(writer);
+                v.write(writer);
+            }
+            Self::Recovery(v) => {
+                7u8.write(writer);
+                v.write(writer);
+            }
             Self::Notarize(v) => {
                 0u8.write(writer);
                 v.write(writer);
@@ -956,7 +540,7 @@ impl<S: Scheme, D: Digest> Write for Artifact<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> EncodeSize for Artifact<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> EncodeSize for ArtifactWith<S, D, M> {
     fn encode_size(&self) -> usize {
         1 + match self {
             Self::Notarize(v) => v.encode_size(),
@@ -964,20 +548,24 @@ impl<S: Scheme, D: Digest> EncodeSize for Artifact<S, D> {
             Self::Certification(r, b) => r.encode_size() + b.encode_size(),
             Self::Nullify(v) => v.encode_size(),
             Self::Nullification(v) => v.encode_size(),
+            Self::Recovered(v) => v.encode_size(),
+            Self::Recovery(v) => v.encode_size(),
             Self::Finalize(v) => v.encode_size(),
             Self::Finalization(v) => v.encode_size(),
         }
     }
 }
 
-impl<S: Scheme, D: Digest> Read for Artifact<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Read for ArtifactWith<S, D, M> {
     type Cfg = <S::Certificate as Read>::Cfg;
 
     fn read_cfg(reader: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let tag = <u8>::read(reader)?;
         match tag {
+            8 => M::read_recovered(reader, cfg).map(Self::Recovered),
+            7 => M::Recovery::read(reader).map(Self::Recovery),
             0 => {
-                let v = Notarize::read(reader)?;
+                let v = M::Notarize::read(reader)?;
                 Ok(Self::Notarize(v))
             }
             1 => {
@@ -998,11 +586,11 @@ impl<S: Scheme, D: Digest> Read for Artifact<S, D> {
                 Ok(Self::Nullification(v))
             }
             5 => {
-                let v = Finalize::read(reader)?;
+                let v = M::Vote::read(reader)?;
                 Ok(Self::Finalize(v))
             }
             6 => {
-                let v = Finalization::read_cfg(reader, cfg)?;
+                let v = M::Certificate::read_cfg(reader, cfg)?;
                 Ok(Self::Finalization(v))
             }
             _ => Err(Error::Invalid(
@@ -1013,7 +601,7 @@ impl<S: Scheme, D: Digest> Read for Artifact<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Epochable for Artifact<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Epochable for ArtifactWith<S, D, M> {
     fn epoch(&self) -> Epoch {
         match self {
             Self::Notarize(v) => v.epoch(),
@@ -1021,13 +609,15 @@ impl<S: Scheme, D: Digest> Epochable for Artifact<S, D> {
             Self::Certification(r, _) => r.epoch(),
             Self::Nullify(v) => v.epoch(),
             Self::Nullification(v) => v.epoch(),
+            Self::Recovered(v) => v.epoch(),
+            Self::Recovery(v) => v.epoch(),
             Self::Finalize(v) => v.epoch(),
             Self::Finalization(v) => v.epoch(),
         }
     }
 }
 
-impl<S: Scheme, D: Digest> Viewable for Artifact<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Viewable for ArtifactWith<S, D, M> {
     fn view(&self) -> View {
         match self {
             Self::Notarize(v) => v.view(),
@@ -1035,44 +625,53 @@ impl<S: Scheme, D: Digest> Viewable for Artifact<S, D> {
             Self::Certification(r, _) => r.view(),
             Self::Nullify(v) => v.view(),
             Self::Nullification(v) => v.view(),
+            Self::Recovered(v) => v.view(),
+            Self::Recovery(v) => v.view(),
             Self::Finalize(v) => v.view(),
             Self::Finalization(v) => v.view(),
         }
     }
 }
 
-impl<S: Scheme, D: Digest> From<Vote<S, D>> for Artifact<S, D> {
-    fn from(vote: Vote<S, D>) -> Self {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> From<VoteWith<S, D, M>> for ArtifactWith<S, D, M> {
+    fn from(vote: VoteWith<S, D, M>) -> Self {
         match vote {
-            Vote::Notarize(v) => Self::Notarize(v),
-            Vote::Nullify(v) => Self::Nullify(v),
-            Vote::Finalize(v) => Self::Finalize(v),
+            VoteWith::Notarize(v) => Self::Notarize(v),
+            VoteWith::Nullify(v) => Self::Nullify(v),
+            VoteWith::Finalize(v) => Self::Finalize(v),
         }
     }
 }
 
-impl<S: Scheme, D: Digest> From<Certificate<S, D>> for Artifact<S, D> {
-    fn from(cert: Certificate<S, D>) -> Self {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> From<CertificateWith<S, D, M>> for ArtifactWith<S, D, M> {
+    fn from(cert: CertificateWith<S, D, M>) -> Self {
         match cert {
-            Certificate::Notarization(v) => Self::Notarization(v),
-            Certificate::Nullification(v) => Self::Nullification(v),
-            Certificate::Finalization(v) => Self::Finalization(v),
+            CertificateWith::Notarization(v) => Self::Notarization(v),
+            CertificateWith::Nullification(v) => Self::Nullification(v),
+            CertificateWith::Finalization(v) => Self::Finalization(v),
         }
     }
 }
 
 #[cfg(feature = "arbitrary")]
-impl<S: Scheme, D: Digest> arbitrary::Arbitrary<'_> for Artifact<S, D>
+impl<S: Scheme, D: Digest, M: Mode<S, D>> arbitrary::Arbitrary<'_> for ArtifactWith<S, D, M>
 where
     S::Signature: for<'a> arbitrary::Arbitrary<'a>,
     S::Certificate: for<'a> arbitrary::Arbitrary<'a>,
     D: for<'a> arbitrary::Arbitrary<'a>,
+    M::Notarize: for<'a> arbitrary::Arbitrary<'a>,
+    M::Vote: for<'a> arbitrary::Arbitrary<'a>,
+    M::Certificate: for<'a> arbitrary::Arbitrary<'a>,
+    M::Recovery: for<'a> arbitrary::Arbitrary<'a>,
+    M::Recovered: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let tag = u.int_in_range(0..=6)?;
+        let tag = u.int_in_range(0..=if M::RETAIN_INTERPRETATION { 8 } else { 6 })?;
         match tag {
+            8 => M::Recovered::arbitrary(u).map(Self::Recovered),
+            7 => M::Recovery::arbitrary(u).map(Self::Recovery),
             0 => {
-                let v = Notarize::arbitrary(u)?;
+                let v = M::Notarize::arbitrary(u)?;
                 Ok(Self::Notarize(v))
             }
             1 => {
@@ -1093,11 +692,11 @@ where
                 Ok(Self::Nullification(v))
             }
             5 => {
-                let v = Finalize::arbitrary(u)?;
+                let v = M::Vote::arbitrary(u)?;
                 Ok(Self::Finalize(v))
             }
             6 => {
-                let v = Finalization::arbitrary(u)?;
+                let v = M::Certificate::arbitrary(u)?;
                 Ok(Self::Finalization(v))
             }
             _ => unreachable!(),
@@ -2023,10 +1622,14 @@ where
 ///
 /// Use [`crate::simplex::scheme::reporter::AttributableReporter`] to automatically filter and
 /// verify activities based on [`Scheme::is_attributable`].
+pub type Activity<S, D> = ActivityWith<S, D, Plain>;
+
+/// Mode-specific native activity. First-vote activities cover only the native
+/// proposal vote; optional report bytes require independent policy validation.
 #[derive(Clone, Debug)]
-pub enum Activity<S: Scheme, D: Digest> {
-    /// A validator's notarize vote over a proposal.
-    Notarize(Notarize<S, D>),
+pub enum ActivityWith<S: Scheme, D: Digest, M: Mode<S, D>> {
+    /// A validator's notarize vote, including its mode-specific untrusted report.
+    Notarize(M::Notarize),
     /// A recovered certificate for a notarization (scheme-specific).
     Notarization(Notarization<S, D>),
     /// A notarization was locally certified.
@@ -2036,18 +1639,18 @@ pub enum Activity<S: Scheme, D: Digest> {
     /// A recovered certificate for a nullification (scheme-specific).
     Nullification(Nullification<S>),
     /// A validator's finalize vote over a proposal.
-    Finalize(Finalize<S, D>),
+    Finalize(M::Vote),
     /// A recovered certificate for a finalization (scheme-specific).
-    Finalization(Finalization<S, D>),
+    Finalization(M::Certificate),
     /// Evidence of a validator sending conflicting notarizes (Byzantine behavior).
     ConflictingNotarize(ConflictingNotarize<S, D>),
     /// Evidence of a validator sending conflicting finalizes (Byzantine behavior).
-    ConflictingFinalize(ConflictingFinalize<S, D>),
+    ConflictingFinalize(ConflictingFinalizeWith<S, D, M>),
     /// Evidence of a validator sending both nullify and finalize for the same view (Byzantine behavior).
-    NullifyFinalize(NullifyFinalize<S, D>),
+    NullifyFinalize(NullifyFinalizeWith<S, D, M>),
 }
 
-impl<S: Scheme, D: Digest> PartialEq for Activity<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> PartialEq for ActivityWith<S, D, M> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Notarize(a), Self::Notarize(b)) => a == b,
@@ -2065,9 +1668,20 @@ impl<S: Scheme, D: Digest> PartialEq for Activity<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Eq for Activity<S, D> {}
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Eq for ActivityWith<S, D, M>
+where
+    M::Notarize: Eq,
+    M::Vote: Eq,
+    M::Certificate: Eq,
+{
+}
 
-impl<S: Scheme, D: Digest> Hash for Activity<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Hash for ActivityWith<S, D, M>
+where
+    M::Notarize: Hash,
+    M::Vote: Hash,
+    M::Certificate: Hash,
+{
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
             Self::Notarize(v) => {
@@ -2114,7 +1728,7 @@ impl<S: Scheme, D: Digest> Hash for Activity<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Activity<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> ActivityWith<S, D, M> {
     /// Indicates whether the activity is guaranteed to have been verified by consensus.
     pub const fn verified(&self) -> bool {
         match self {
@@ -2132,6 +1746,8 @@ impl<S: Scheme, D: Digest> Activity<S, D> {
     }
 
     /// Verifies the validity of this activity against the signing scheme.
+    /// First-vote report bytes require independent application authentication;
+    /// this verifies only the native proposal vote, not its attached report.
     ///
     /// This method **always** performs verification regardless of whether the activity has been
     /// previously verified. Callers can use [`Activity::verified`] to check if verification is
@@ -2141,13 +1757,13 @@ impl<S: Scheme, D: Digest> Activity<S, D> {
         S: scheme::Scheme<D>,
     {
         match self {
-            Self::Notarize(n) => n.verify(rng, scheme, strategy),
+            Self::Notarize(n) => M::notarize(n).verify(rng, scheme, strategy),
             Self::Notarization(n) => n.verify(rng, scheme, strategy),
             Self::Certification(n) => n.verify(rng, scheme, strategy),
             Self::Nullify(n) => n.verify(rng, scheme, strategy),
             Self::Nullification(n) => n.verify(rng, scheme, strategy),
-            Self::Finalize(f) => f.verify(rng, scheme, strategy),
-            Self::Finalization(f) => f.verify(rng, scheme, strategy),
+            Self::Finalize(f) => M::verify_finalize(f, rng, scheme, strategy),
+            Self::Finalization(f) => M::verify(f, rng, scheme, strategy),
             Self::ConflictingNotarize(c) => c.verify(rng, scheme, strategy),
             Self::ConflictingFinalize(c) => c.verify(rng, scheme, strategy),
             Self::NullifyFinalize(c) => c.verify(rng, scheme, strategy),
@@ -2155,7 +1771,7 @@ impl<S: Scheme, D: Digest> Activity<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Write for Activity<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Write for ActivityWith<S, D, M> {
     fn write(&self, writer: &mut impl BufMut) {
         match self {
             Self::Notarize(v) => {
@@ -2202,7 +1818,7 @@ impl<S: Scheme, D: Digest> Write for Activity<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> EncodeSize for Activity<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> EncodeSize for ActivityWith<S, D, M> {
     fn encode_size(&self) -> usize {
         1 + match self {
             Self::Notarize(v) => v.encode_size(),
@@ -2219,14 +1835,14 @@ impl<S: Scheme, D: Digest> EncodeSize for Activity<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Read for Activity<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Read for ActivityWith<S, D, M> {
     type Cfg = <S::Certificate as Read>::Cfg;
 
     fn read_cfg(reader: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let tag = <u8>::read(reader)?;
         match tag {
             0 => {
-                let v = Notarize::<S, D>::read(reader)?;
+                let v = M::Notarize::read(reader)?;
                 Ok(Self::Notarize(v))
             }
             1 => {
@@ -2246,11 +1862,11 @@ impl<S: Scheme, D: Digest> Read for Activity<S, D> {
                 Ok(Self::Nullification(v))
             }
             5 => {
-                let v = Finalize::<S, D>::read(reader)?;
+                let v = M::Vote::read(reader)?;
                 Ok(Self::Finalize(v))
             }
             6 => {
-                let v = Finalization::<S, D>::read_cfg(reader, cfg)?;
+                let v = M::Certificate::read_cfg(reader, cfg)?;
                 Ok(Self::Finalization(v))
             }
             7 => {
@@ -2258,11 +1874,11 @@ impl<S: Scheme, D: Digest> Read for Activity<S, D> {
                 Ok(Self::ConflictingNotarize(v))
             }
             8 => {
-                let v = ConflictingFinalize::<S, D>::read(reader)?;
+                let v = ConflictingFinalizeWith::<S, D, M>::read(reader)?;
                 Ok(Self::ConflictingFinalize(v))
             }
             9 => {
-                let v = NullifyFinalize::<S, D>::read(reader)?;
+                let v = NullifyFinalizeWith::<S, D, M>::read(reader)?;
                 Ok(Self::NullifyFinalize(v))
             }
             _ => Err(Error::Invalid(
@@ -2273,7 +1889,7 @@ impl<S: Scheme, D: Digest> Read for Activity<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Epochable for Activity<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Epochable for ActivityWith<S, D, M> {
     fn epoch(&self) -> Epoch {
         match self {
             Self::Notarize(v) => v.epoch(),
@@ -2290,7 +1906,7 @@ impl<S: Scheme, D: Digest> Epochable for Activity<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> Viewable for Activity<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Viewable for ActivityWith<S, D, M> {
     fn view(&self) -> View {
         match self {
             Self::Notarize(v) => v.view(),
@@ -2308,8 +1924,11 @@ impl<S: Scheme, D: Digest> Viewable for Activity<S, D> {
 }
 
 #[cfg(feature = "arbitrary")]
-impl<S: Scheme, D: Digest> arbitrary::Arbitrary<'_> for Activity<S, D>
+impl<S: Scheme, D: Digest, M: Mode<S, D>> arbitrary::Arbitrary<'_> for ActivityWith<S, D, M>
 where
+    M::Notarize: for<'a> arbitrary::Arbitrary<'a>,
+    M::Vote: for<'a> arbitrary::Arbitrary<'a>,
+    M::Certificate: for<'a> arbitrary::Arbitrary<'a>,
     S::Signature: for<'a> arbitrary::Arbitrary<'a>,
     S::Certificate: for<'a> arbitrary::Arbitrary<'a>,
     D: for<'a> arbitrary::Arbitrary<'a>,
@@ -2318,7 +1937,7 @@ where
         let tag = u.int_in_range(0..=9)?;
         match tag {
             0 => {
-                let v = Notarize::<S, D>::arbitrary(u)?;
+                let v = M::Notarize::arbitrary(u)?;
                 Ok(Self::Notarize(v))
             }
             1 => {
@@ -2338,11 +1957,11 @@ where
                 Ok(Self::Nullification(v))
             }
             5 => {
-                let v = Finalize::<S, D>::arbitrary(u)?;
+                let v = M::Vote::arbitrary(u)?;
                 Ok(Self::Finalize(v))
             }
             6 => {
-                let v = Finalization::<S, D>::arbitrary(u)?;
+                let v = M::Certificate::arbitrary(u)?;
                 Ok(Self::Finalization(v))
             }
             7 => {
@@ -2350,11 +1969,11 @@ where
                 Ok(Self::ConflictingNotarize(v))
             }
             8 => {
-                let v = ConflictingFinalize::<S, D>::arbitrary(u)?;
+                let v = ConflictingFinalizeWith::<S, D, M>::arbitrary(u)?;
                 Ok(Self::ConflictingFinalize(v))
             }
             9 => {
-                let v = NullifyFinalize::<S, D>::arbitrary(u)?;
+                let v = NullifyFinalizeWith::<S, D, M>::arbitrary(u)?;
                 Ok(Self::NullifyFinalize(v))
             }
             _ => unreachable!(),
@@ -2490,44 +2109,55 @@ where
     }
 }
 
+/// Stock Simplex double-finalize evidence.
+pub type ConflictingFinalize<S, D> = ConflictingFinalizeWith<S, D, Plain>;
+/// Stock Simplex nullify/finalize evidence.
+pub type NullifyFinalize<S, D> = NullifyFinalizeWith<S, D, Plain>;
+
 /// ConflictingFinalize represents evidence of a Byzantine validator sending conflicting finalizes.
 /// Similar to ConflictingNotarize, but for finalizes.
 #[derive(Clone, Debug)]
-pub struct ConflictingFinalize<S: Scheme, D: Digest> {
+pub struct ConflictingFinalizeWith<S: Scheme, D: Digest, M: Mode<S, D>> {
     /// The second conflicting finalize
-    finalize_1: Finalize<S, D>,
+    finalize_1: M::Vote,
     /// The second conflicting finalize
-    finalize_2: Finalize<S, D>,
+    finalize_2: M::Vote,
 }
 
-impl<S: Scheme, D: Digest> PartialEq for ConflictingFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> PartialEq for ConflictingFinalizeWith<S, D, M> {
     fn eq(&self, other: &Self) -> bool {
         self.finalize_1 == other.finalize_1 && self.finalize_2 == other.finalize_2
     }
 }
 
-impl<S: Scheme, D: Digest> Eq for ConflictingFinalize<S, D> {}
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Eq for ConflictingFinalizeWith<S, D, M> where M::Vote: Eq {}
 
-impl<S: Scheme, D: Digest> Hash for ConflictingFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Hash for ConflictingFinalizeWith<S, D, M>
+where
+    M::Vote: Hash,
+{
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.finalize_1.hash(state);
         self.finalize_2.hash(state);
     }
 }
 
-impl<S: Scheme, D: Digest> ConflictingFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> ConflictingFinalizeWith<S, D, M> {
     /// Creates a new conflicting finalize evidence from two conflicting finalizes.
     ///
     /// # Panics
     ///
-    /// Panics if the two finalizes do not have the same round and signer, or if they
-    /// have identical proposals (which would not constitute conflicting evidence).
-    pub fn new(finalize_1: Finalize<S, D>, finalize_2: Finalize<S, D>) -> Self {
-        assert_eq!(finalize_1.round(), finalize_2.round());
+    /// Panics unless both votes have the same round and signer and conflicting
+    /// subjects in the same mode-specific protocol domain.
+    pub fn new(finalize_1: M::Vote, finalize_2: M::Vote) -> Self {
+        assert_eq!(
+            M::finalize_proposal(&finalize_1).round,
+            M::finalize_proposal(&finalize_2).round
+        );
         assert_eq!(finalize_1.signer(), finalize_2.signer());
-        assert_ne!(
-            finalize_1.proposal, finalize_2.proposal,
-            "proposals must differ to constitute conflicting evidence"
+        assert!(
+            M::conflicting_finalize_subjects(&finalize_1, &finalize_2),
+            "proposals must differ to constitute conflicting evidence in Plain; Extended requires distinct subjects in one domain"
         );
 
         Self {
@@ -2542,46 +2172,46 @@ impl<S: Scheme, D: Digest> ConflictingFinalize<S, D> {
         R: CryptoRng,
         S: scheme::Scheme<D>,
     {
-        self.finalize_1.verify(rng, scheme, strategy)
-            && self.finalize_2.verify(rng, scheme, strategy)
+        M::verify_finalize(&self.finalize_1, rng, scheme, strategy)
+            && M::verify_finalize(&self.finalize_2, rng, scheme, strategy)
     }
 }
 
-impl<S: Scheme, D: Digest> Attributable for ConflictingFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Attributable for ConflictingFinalizeWith<S, D, M> {
     fn signer(&self) -> Participant {
         self.finalize_1.signer()
     }
 }
 
-impl<S: Scheme, D: Digest> Epochable for ConflictingFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Epochable for ConflictingFinalizeWith<S, D, M> {
     fn epoch(&self) -> Epoch {
         self.finalize_1.epoch()
     }
 }
 
-impl<S: Scheme, D: Digest> Viewable for ConflictingFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Viewable for ConflictingFinalizeWith<S, D, M> {
     fn view(&self) -> View {
         self.finalize_1.view()
     }
 }
 
-impl<S: Scheme, D: Digest> Write for ConflictingFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Write for ConflictingFinalizeWith<S, D, M> {
     fn write(&self, writer: &mut impl BufMut) {
         self.finalize_1.write(writer);
         self.finalize_2.write(writer);
     }
 }
 
-impl<S: Scheme, D: Digest> Read for ConflictingFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Read for ConflictingFinalizeWith<S, D, M> {
     type Cfg = ();
 
     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, Error> {
-        let finalize_1 = Finalize::read(reader)?;
-        let finalize_2 = Finalize::read(reader)?;
+        let finalize_1 = M::Vote::read(reader)?;
+        let finalize_2 = M::Vote::read(reader)?;
 
         if finalize_1.signer() != finalize_2.signer()
-            || finalize_1.round() != finalize_2.round()
-            || finalize_1.proposal == finalize_2.proposal
+            || M::finalize_proposal(&finalize_1).round != M::finalize_proposal(&finalize_2).round
+            || !M::conflicting_finalize_subjects(&finalize_1, &finalize_2)
         {
             return Err(Error::Invalid(
                 "consensus::simplex::ConflictingFinalize",
@@ -2596,21 +2226,23 @@ impl<S: Scheme, D: Digest> Read for ConflictingFinalize<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> EncodeSize for ConflictingFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> EncodeSize for ConflictingFinalizeWith<S, D, M> {
     fn encode_size(&self) -> usize {
         self.finalize_1.encode_size() + self.finalize_2.encode_size()
     }
 }
 
 #[cfg(feature = "arbitrary")]
-impl<S: Scheme, D: Digest> arbitrary::Arbitrary<'_> for ConflictingFinalize<S, D>
+impl<S: Scheme, D: Digest, M: Mode<S, D>> arbitrary::Arbitrary<'_>
+    for ConflictingFinalizeWith<S, D, M>
 where
+    M::Vote: for<'a> arbitrary::Arbitrary<'a>,
     S::Signature: for<'a> arbitrary::Arbitrary<'a>,
     D: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let finalize_1 = Finalize::arbitrary(u)?;
-        let finalize_2 = Finalize::arbitrary(u)?;
+        let finalize_1 = M::Vote::arbitrary(u)?;
+        let finalize_2 = M::Vote::arbitrary(u)?;
         Ok(Self {
             finalize_1,
             finalize_2,
@@ -2622,32 +2254,35 @@ where
 /// for the same view, which is contradictory behavior (a validator should either try to skip a view OR
 /// finalize a proposal, not both).
 #[derive(Clone, Debug)]
-pub struct NullifyFinalize<S: Scheme, D: Digest> {
+pub struct NullifyFinalizeWith<S: Scheme, D: Digest, M: Mode<S, D>> {
     /// The conflicting nullify
     nullify: Nullify<S>,
     /// The conflicting finalize
-    finalize: Finalize<S, D>,
+    finalize: M::Vote,
 }
 
-impl<S: Scheme, D: Digest> PartialEq for NullifyFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> PartialEq for NullifyFinalizeWith<S, D, M> {
     fn eq(&self, other: &Self) -> bool {
         self.nullify == other.nullify && self.finalize == other.finalize
     }
 }
 
-impl<S: Scheme, D: Digest> Eq for NullifyFinalize<S, D> {}
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Eq for NullifyFinalizeWith<S, D, M> where M::Vote: Eq {}
 
-impl<S: Scheme, D: Digest> Hash for NullifyFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Hash for NullifyFinalizeWith<S, D, M>
+where
+    M::Vote: Hash,
+{
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.nullify.hash(state);
         self.finalize.hash(state);
     }
 }
 
-impl<S: Scheme, D: Digest> NullifyFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> NullifyFinalizeWith<S, D, M> {
     /// Creates a new nullify-finalize evidence from a nullify and a finalize.
-    pub fn new(nullify: Nullify<S>, finalize: Finalize<S, D>) -> Self {
-        assert_eq!(nullify.round, finalize.round());
+    pub fn new(nullify: Nullify<S>, finalize: M::Vote) -> Self {
+        assert_eq!(nullify.round, M::finalize_proposal(&finalize).round);
         assert_eq!(nullify.signer(), finalize.signer());
 
         Self { nullify, finalize }
@@ -2659,43 +2294,46 @@ impl<S: Scheme, D: Digest> NullifyFinalize<S, D> {
         R: CryptoRng,
         S: scheme::Scheme<D>,
     {
-        self.nullify.verify(rng, scheme, strategy) && self.finalize.verify(rng, scheme, strategy)
+        self.nullify.verify(rng, scheme, strategy)
+            && M::verify_finalize(&self.finalize, rng, scheme, strategy)
     }
 }
 
-impl<S: Scheme, D: Digest> Attributable for NullifyFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Attributable for NullifyFinalizeWith<S, D, M> {
     fn signer(&self) -> Participant {
         self.nullify.signer()
     }
 }
 
-impl<S: Scheme, D: Digest> Epochable for NullifyFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Epochable for NullifyFinalizeWith<S, D, M> {
     fn epoch(&self) -> Epoch {
         self.nullify.epoch()
     }
 }
 
-impl<S: Scheme, D: Digest> Viewable for NullifyFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Viewable for NullifyFinalizeWith<S, D, M> {
     fn view(&self) -> View {
         self.nullify.view()
     }
 }
 
-impl<S: Scheme, D: Digest> Write for NullifyFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Write for NullifyFinalizeWith<S, D, M> {
     fn write(&self, writer: &mut impl BufMut) {
         self.nullify.write(writer);
         self.finalize.write(writer);
     }
 }
 
-impl<S: Scheme, D: Digest> Read for NullifyFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> Read for NullifyFinalizeWith<S, D, M> {
     type Cfg = ();
 
     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, Error> {
         let nullify = Nullify::read(reader)?;
-        let finalize = Finalize::read(reader)?;
+        let finalize = M::Vote::read(reader)?;
 
-        if nullify.signer() != finalize.signer() || nullify.round != finalize.round() {
+        if nullify.signer() != finalize.signer()
+            || nullify.round != M::finalize_proposal(&finalize).round
+        {
             return Err(Error::Invalid(
                 "consensus::simplex::NullifyFinalize",
                 "mismatched signatures",
@@ -2706,21 +2344,22 @@ impl<S: Scheme, D: Digest> Read for NullifyFinalize<S, D> {
     }
 }
 
-impl<S: Scheme, D: Digest> EncodeSize for NullifyFinalize<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> EncodeSize for NullifyFinalizeWith<S, D, M> {
     fn encode_size(&self) -> usize {
         self.nullify.encode_size() + self.finalize.encode_size()
     }
 }
 
 #[cfg(feature = "arbitrary")]
-impl<S: Scheme, D: Digest> arbitrary::Arbitrary<'_> for NullifyFinalize<S, D>
+impl<S: Scheme, D: Digest, M: Mode<S, D>> arbitrary::Arbitrary<'_> for NullifyFinalizeWith<S, D, M>
 where
+    M::Vote: for<'a> arbitrary::Arbitrary<'a>,
     S::Signature: for<'a> arbitrary::Arbitrary<'a>,
     D: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         let nullify = Nullify::arbitrary(u)?;
-        let finalize = Finalize::arbitrary(u)?;
+        let finalize = M::Vote::arbitrary(u)?;
         Ok(Self { nullify, finalize })
     }
 }
@@ -3373,235 +3012,6 @@ mod tests {
         finalization_verify_wrong_scheme(bls12381_threshold_vrf::fixture::<MinSig, _>);
         finalization_verify_wrong_scheme(bls12381_threshold_std::fixture::<MinPk, _>);
         finalization_verify_wrong_scheme(bls12381_threshold_std::fixture::<MinSig, _>);
-    }
-
-    struct MockAttributable(Participant);
-
-    impl Attributable for MockAttributable {
-        fn signer(&self) -> Participant {
-            self.0
-        }
-    }
-
-    #[test]
-    fn test_attributable_map() {
-        let mut map = AttributableMap::new(5);
-        assert_eq!(map.len(), 0);
-        assert!(map.is_empty());
-        assert_eq!(map.data.capacity(), 0, "empty maps should allocate lazily");
-
-        // Test get on empty map
-        for i in 0..5 {
-            assert!(map.get(Participant::new(i)).is_none());
-        }
-
-        assert!(map.insert(MockAttributable(Participant::new(3))));
-        assert!(map.data.capacity() >= 5);
-        assert_eq!(map.len(), 1);
-        assert!(!map.is_empty());
-        let mut iter = map.iter();
-        assert!(matches!(iter.next(), Some(a) if a.signer() == Participant::new(3)));
-        assert!(iter.next().is_none());
-        drop(iter);
-
-        // Test get on existing item
-        assert!(
-            matches!(map.get(Participant::new(3)), Some(a) if a.signer() == Participant::new(3))
-        );
-
-        assert!(map.insert(MockAttributable(Participant::new(1))));
-        assert_eq!(map.len(), 2);
-        assert!(!map.is_empty());
-        let mut iter = map.iter();
-        assert!(matches!(iter.next(), Some(a) if a.signer() == Participant::new(1)));
-        assert!(matches!(iter.next(), Some(a) if a.signer() == Participant::new(3)));
-        assert!(iter.next().is_none());
-        drop(iter);
-
-        // Test get on both items
-        assert!(
-            matches!(map.get(Participant::new(1)), Some(a) if a.signer() == Participant::new(1))
-        );
-        assert!(
-            matches!(map.get(Participant::new(3)), Some(a) if a.signer() == Participant::new(3))
-        );
-
-        // Test get on non-existing items
-        assert!(map.get(Participant::new(0)).is_none());
-        assert!(map.get(Participant::new(2)).is_none());
-        assert!(map.get(Participant::new(4)).is_none());
-
-        assert!(!map.insert(MockAttributable(Participant::new(3))));
-        assert_eq!(map.len(), 2);
-        assert!(!map.is_empty());
-        let mut iter = map.iter();
-        assert!(matches!(iter.next(), Some(a) if a.signer() == Participant::new(1)));
-        assert!(matches!(iter.next(), Some(a) if a.signer() == Participant::new(3)));
-        assert!(iter.next().is_none());
-        drop(iter);
-
-        // Test out-of-bounds signer indices
-        assert!(!map.insert(MockAttributable(Participant::new(5))));
-        assert!(!map.insert(MockAttributable(Participant::new(100))));
-        assert_eq!(map.len(), 2);
-
-        // Test clear
-        map.clear();
-        assert_eq!(map.len(), 0);
-        assert!(map.is_empty());
-        assert!(map.iter().next().is_none());
-        assert_eq!(map.data.capacity(), 0, "clear should release vote storage");
-
-        // Verify can insert after clear
-        assert!(map.insert(MockAttributable(Participant::new(2))));
-        assert_eq!(map.len(), 1);
-        let mut iter = map.iter();
-        assert!(matches!(iter.next(), Some(a) if a.signer() == Participant::new(2)));
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn test_vote_tracker_clears_compacted_state() {
-        let mut rng = test_rng();
-        let fixture = ed25519::fixture(&mut rng, NAMESPACE, 2);
-        let round = Round::new(Epoch::new(0), View::new(1));
-        let mut tracker = VoteTracker::<ed25519::Scheme, Sha256>::new(2, false);
-        let signer = Participant::new(1);
-        let scheme = &fixture.schemes[usize::from(signer)];
-        let proposal = Proposal::new(round, View::zero(), sample_digest(1));
-        let notarize = Vote::Notarize(Notarize::sign(scheme, proposal.clone()).unwrap());
-        let finalize = Vote::Finalize(Finalize::sign(scheme, proposal.clone()).unwrap());
-
-        tracker.release_notarizes(&proposal);
-        tracker.release_finalizes(&proposal);
-        assert!(matches!(
-            tracker.record(&notarize, Some(&proposal)),
-            Outcome::Added { retained: false }
-        ));
-        assert!(matches!(
-            tracker.record(&finalize, Some(&proposal)),
-            Outcome::Added { retained: false }
-        ));
-        assert!(tracker.has_notarize_for(signer, &proposal));
-        assert!(tracker.has_finalize_for(signer, &proposal));
-
-        tracker.clear_notarizes();
-        assert!(!tracker.has_notarize_for(signer, &proposal));
-        assert!(matches!(
-            tracker.record(&notarize, Some(&proposal)),
-            Outcome::Added { retained: true }
-        ));
-
-        tracker.clear_finalizes();
-        assert!(!tracker.has_finalize_for(signer, &proposal));
-        assert_eq!(tracker.compacted.capacity(), 0);
-        assert!(matches!(
-            tracker.record(&finalize, Some(&proposal)),
-            Outcome::Added { retained: true }
-        ));
-    }
-
-    #[test]
-    fn test_vote_tracker_insert_and_accessors() {
-        let mut rng = test_rng();
-        let fixture = ed25519::fixture(&mut rng, NAMESPACE, 2);
-        let round = Round::new(Epoch::new(0), View::new(1));
-        let proposal = Proposal::new(round, View::zero(), sample_digest(1));
-        let scheme = &fixture.schemes[0];
-        let signer = Participant::new(0);
-        let notarize = Notarize::sign(scheme, proposal.clone()).unwrap();
-        let nullify = Nullify::sign::<Sha256>(scheme, round).unwrap();
-        let finalize = Finalize::sign(scheme, proposal.clone()).unwrap();
-        let mut tracker = VoteTracker::new(2, false);
-
-        assert!(tracker.insert_notarize(notarize.clone()));
-        assert!(tracker.insert_nullify(nullify.clone()));
-        assert!(tracker.insert_finalize(finalize.clone()));
-        assert_eq!(tracker.len_notarizes(), 1);
-        assert_eq!(tracker.len_nullifies(), 1);
-        assert_eq!(tracker.len_finalizes(), 1);
-        assert!(tracker.has_notarize(signer));
-        assert!(tracker.has_nullify(signer));
-        assert!(tracker.has_finalize(signer));
-
-        tracker.release_notarizes(&proposal);
-        tracker.release_nullifies();
-        tracker.release_finalizes(&proposal);
-        assert_eq!(tracker.len_notarizes(), 0);
-        assert_eq!(tracker.len_nullifies(), 0);
-        assert_eq!(tracker.len_finalizes(), 0);
-        assert!(!tracker.has_notarize(signer));
-        assert!(!tracker.has_nullify(signer));
-        assert!(!tracker.has_finalize(signer));
-        assert!(tracker.iter_notarizes().next().is_none());
-        assert!(tracker.iter_nullifies().next().is_none());
-        assert!(tracker.iter_finalizes().next().is_none());
-        assert!(!tracker.insert_notarize(notarize));
-        assert!(!tracker.insert_nullify(nullify));
-        assert!(!tracker.insert_finalize(finalize));
-
-        // Releasing a compacted phase is idempotent.
-        tracker.release_notarizes(&proposal);
-    }
-
-    #[test]
-    fn test_vote_tracker_retention_policy() {
-        let mut rng = test_rng();
-        let fixture = ed25519::fixture(&mut rng, NAMESPACE, 2);
-        let proposal = Proposal::new(
-            Round::new(Epoch::new(0), View::new(1)),
-            View::zero(),
-            sample_digest(1),
-        );
-        let notarize = Notarize::sign(&fixture.schemes[0], proposal.clone()).unwrap();
-        let signer = notarize.signer();
-        let vote = Vote::Notarize(notarize);
-
-        let mut releasing = VoteTracker::new(2, false);
-        assert!(matches!(
-            releasing.record(&vote, Some(&proposal)),
-            Outcome::Added { retained: true }
-        ));
-        let Phase::Full(votes) = &releasing.notarizes else {
-            panic!("notarize phase compacted before certification");
-        };
-        assert!(votes.data.capacity() >= 2);
-        releasing.release_notarizes(&proposal);
-        assert!(matches!(&releasing.notarizes, Phase::Compacted));
-        assert!(matches!(
-            releasing.record(&vote, Some(&proposal)),
-            Outcome::Duplicate { retained: false }
-        ));
-
-        // A certificate can arrive before any individual votes. Subsequent votes
-        // must use compact storage instead of recreating the released full map.
-        let mut certificate_first = VoteTracker::new(2, false);
-        certificate_first.release_notarizes(&proposal);
-        assert!(matches!(
-            certificate_first.record(&vote, Some(&proposal)),
-            Outcome::Added { retained: false }
-        ));
-        assert!(matches!(&certificate_first.notarizes, Phase::Compacted));
-        assert!(matches!(
-            certificate_first.record(&vote, Some(&proposal)),
-            Outcome::Duplicate { retained: false }
-        ));
-
-        let mut retaining = VoteTracker::new(2, true);
-        assert!(matches!(
-            retaining.record(&vote, Some(&proposal)),
-            Outcome::Added { retained: true }
-        ));
-        let Phase::Full(votes) = &retaining.notarizes else {
-            panic!("retained notarize phase compacted");
-        };
-        let retained_capacity = votes.data.capacity();
-        retaining.release_notarizes(&proposal);
-        let Phase::Full(votes) = &retaining.notarizes else {
-            panic!("retained notarize phase compacted");
-        };
-        assert_eq!(votes.data.capacity(), retained_capacity);
-        assert!(retaining.notarize(signer).is_some());
     }
 
     #[test]

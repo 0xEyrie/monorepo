@@ -2,20 +2,20 @@
 
 use super::fixtures::{
     Harness, TestConfig, TestMachine, active_machine, attestation, digest, durable_effect,
-    enqueue_due_batch_controls, genesis_tip_history, leader, leader_artifact, lqc, no_vote,
-    observe, offer_eligible, proposal_request_with_parent, queued_effect_id,
-    record_protocol_acceptances, route_blocks, sign_job, sign_request, start_profile,
-    symbolic_da_certificate, symbolic_nullification, threshold_share, validate_block, view_one_vqc,
-    view_vote, vqc,
+    enqueue_due_batch_controls, genesis_tip_history, leader, leader_artifact,
+    leader_extending_view_one_vqc, lqc, no_vote, observe, offer_eligible,
+    proposal_request_with_parent, queued_effect_id, record_protocol_acceptances, route_blocks,
+    sign_job, sign_request, start_profile, symbolic_da_certificate, symbolic_nullification,
+    threshold_share, validate_block, view_one_vqc, view_vote, vqc,
 };
 use crate::{
     Epochable as _, Viewable as _,
     multimmit::{
-        ProposalContext, ProposalExtension,
+        ProposalContext, ProposalExtension, ProposalPlan,
         algebra::VqcExtraction,
         config::{LeaderSchedule, Profile, Protocol, ResourceLimits, Role, Tuning},
         machine::{
-            ProposalParent,
+            ObservationStatus, ProposalParent, StepStatus,
             artifact::Dependency,
             capability::{Capability, ResolverCommand},
             core_state::{CoreState, CoreTurn},
@@ -37,7 +37,7 @@ use crate::{
             Activity, Anchor, Artifact, BlockRef, CertificateId, ChainId, ChainProposal,
             ConflictingVote, DaVote, DigestedLeader, Extension, LeaderBlock, Position,
             SignedLeaderBlock, SignedTransactionBlock, Tally, TipRecord, TransactionBlockHeader,
-            ViewMessage, Vqc,
+            ViewMessage, Vote, Vqc,
         },
     },
     types::{Attributable, Height, Participant, Round, View, ViewDelta},
@@ -53,6 +53,213 @@ use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 struct TestProposalExtension(Option<Bytes>);
+
+struct TestProposalPlan(u8);
+
+struct TestVoteReport(Bytes);
+
+impl ProposalExtension<Digest> for TestVoteReport {
+    fn propose(&self, _: &ProposalContext<'_, Digest>) -> Option<Bytes> {
+        Some(Bytes::new())
+    }
+    fn verify(&self, _: &ProposalContext<'_, Digest>, extension: &Bytes) -> bool {
+        extension.is_empty()
+    }
+    fn vote(
+        &self,
+        context: &ProposalContext<'_, Digest>,
+        body: &crate::multimmit::types::VoteBody<Digest>,
+    ) -> Bytes {
+        assert_eq!(context.round(), body.round());
+        assert!(
+            context.parent_tips().is_some(),
+            "vote reports require the resolved parent frontier"
+        );
+        self.0.clone()
+    }
+}
+
+impl ProposalExtension<Digest> for TestProposalPlan {
+    fn plan(&self, context: &ProposalContext<'_, Digest>) -> Option<ProposalPlan<Digest, Bytes>> {
+        let record = context.parent_record().expect("resolved parent opening");
+        assert_eq!(record.commitment::<Sha256>(), context.history());
+        assert_eq!(record.tips(), context.parent_tips().unwrap());
+        let tip = context.parent_tips().expect("resolved parent")[0];
+        let anchors = match self.0 {
+            1 => vec![BlockRef::new(
+                tip.chain(),
+                Height::new(1),
+                digest(b"unavailable"),
+            )],
+            2 => vec![tip, tip],
+            3 => vec![BlockRef::new(ChainId::new(99), tip.height(), tip.digest())],
+            _ => vec![tip],
+        };
+        Some(ProposalPlan {
+            anchors,
+            extension: Bytes::from_static(if self.0 == 4 { b"invalid" } else { b"planned" }),
+        })
+    }
+
+    fn propose(&self, _: &ProposalContext<'_, Digest>) -> Option<Bytes> {
+        Some(Bytes::from_static(b"fallback"))
+    }
+
+    fn verify(&self, _: &ProposalContext<'_, Digest>, extension: &Bytes) -> bool {
+        matches!(extension.as_ref(), b"planned" | b"fallback")
+    }
+
+    fn verify_parent(&self, context: &ProposalContext<'_, Digest>, extension: &Bytes) -> bool {
+        assert!(context.parent_tips().is_some());
+        self.0 != 5 || extension.as_ref() == b"fallback"
+    }
+}
+
+#[rstest::rstest]
+#[case::ready(0, false)]
+#[case::missing(1, false)]
+#[case::duplicate(2, false)]
+#[case::unknown_chain(3, false)]
+#[case::invalid_extension(4, false)]
+#[case::invalid_parent_policy(5, false)]
+#[case::typed_ready(0, true)]
+#[case::typed_parent_rejection(5, true)]
+fn local_plan_falls_back_before_adoption_without_waiting(#[case] mode: u8, #[case] typed: bool) {
+    let hook: Arc<dyn ProposalExtension<Digest>> = if typed {
+        crate::multimmit::extension::policy(TestProposalPlan(mode), (0..=64).into())
+    } else {
+        Arc::new(TestProposalPlan(mode))
+    };
+    let profile = extension_profile(None, Role::Validator(Participant::new(0)))
+        .with_proposal_extension(Some(hook));
+    let (_, started) = start_profile(profile);
+    let proposal = started
+        .find(
+            |effect| match durable_effect(effect).and_then(EffectExt::sign_one) {
+                Some(SignRequest::LeaderBlock(request)) => Some(request.block()),
+                _ => None,
+            },
+        )
+        .expect("optional plan must not wait for input");
+    let expected = Bytes::from_static(if mode == 0 { b"planned" } else { b"fallback" });
+    if typed {
+        use commonware_codec::Encode as _;
+        assert_eq!(proposal.extension(), &Some(expected).encode());
+    } else {
+        assert_eq!(proposal.extension(), &expected);
+    }
+}
+
+struct ParentBoundExtension(Vec<BlockRef<Digest>>);
+
+impl ProposalExtension<Digest> for ParentBoundExtension {
+    fn propose(&self, context: &ProposalContext<'_, Digest>) -> Option<Bytes> {
+        assert_eq!(context.parent_tips(), Some(self.0.as_slice()));
+        Some(Bytes::from_static(b"parent-bound"))
+    }
+
+    fn verify(&self, _: &ProposalContext<'_, Digest>, extension: &Bytes) -> bool {
+        extension.as_ref() == b"parent-bound"
+    }
+
+    fn verify_parent(&self, context: &ProposalContext<'_, Digest>, _: &Bytes) -> bool {
+        let record = context.parent_record().expect("resolved parent opening");
+        assert_eq!(record.commitment::<Sha256>(), context.history());
+        assert_eq!(record.tips(), context.parent_tips().unwrap());
+        context.parent_tips() == Some(self.0.as_slice())
+    }
+}
+
+#[test]
+fn local_proposal_receives_exact_parent_frontier() {
+    let profile = extension_profile(None, Role::Validator(Participant::new(0)));
+    let tips = profile.protocol().genesis().tips().to_vec();
+    let profile = profile.with_proposal_extension(Some(Arc::new(ParentBoundExtension(tips))));
+    let (_, started) = start_profile(profile);
+    assert!(started.has(|effect| matches!(
+        durable_effect(effect).and_then(EffectExt::sign_one),
+        Some(SignRequest::LeaderBlock(_))
+    )));
+}
+
+#[test]
+fn planned_proposal_recovery_does_not_reselect_its_policy() {
+    let profile = extension_profile(
+        Some(Bytes::from_static(b"fallback")),
+        Role::Validator(Participant::new(0)),
+    )
+    .with_proposal_extension(Some(Arc::new(TestProposalPlan(0))));
+    let (mut machine, started) = start_profile(profile.clone());
+    let original = sign_request(&sign_job(&started)).clone();
+    let SignRequest::LeaderBlock(request) = &original else {
+        panic!("proposal required")
+    };
+    assert_eq!(request.block().extension().as_ref(), b"planned");
+    machine.persist(&started.persist_job(), Until::CursorAdvance);
+    let snapshot = machine.live_snapshot_for_test();
+    // Local availability changes, but immutable verification rules still accept the old plan.
+    let profile = profile.with_proposal_extension(Some(Arc::new(TestProposalPlan(1))));
+    let mut recovered = Machine::<Sha256, MinPk>::restore(profile, snapshot).unwrap();
+    let recovery = recovered.step(Input::RecoveryComplete).unwrap();
+    let reissued = recovered.persist(&recovery.persist_job(), Until::CursorAdvance);
+    assert_eq!(sign_request(&sign_job(&reissued)), &original);
+}
+
+#[rstest::rstest]
+#[case::matching(true)]
+#[case::different(false)]
+fn parent_frontier_checks_direct_and_timeout_votes(#[case] matching: bool) {
+    let base = Harness::validator(0).participants(6).profile();
+    let parameters = base
+        .protocol()
+        .parameters()
+        .as_ref()
+        .clone()
+        .with_proposal_extension_bound(64);
+    let protocol =
+        Protocol::from_parameters(Arc::new(parameters), base.protocol().genesis().clone()).unwrap();
+    let mut tips = protocol.genesis().tips().to_vec();
+    if !matching {
+        tips[0] = BlockRef::new(ChainId::new(0), Height::new(1), digest(b"wrong parent"));
+    }
+    let profile = Profile::new::<MinPk>(
+        protocol,
+        Role::Validator(Participant::new(0)),
+        Tuning::default(),
+    )
+    .unwrap()
+    .with_proposal_extension(Some(Arc::new(ParentBoundExtension(tips))));
+    let (mut machine, _) = start_profile(profile);
+    let proposed = leader(&machine, 1)
+        .with_extension(
+            Bytes::from_static(b"parent-bound"),
+            machine.profile().codec(),
+        )
+        .unwrap();
+    let job = observe(
+        &mut machine,
+        Artifact::LeaderBlock(SignedLeaderBlock::new(proposed, attestation(0))),
+    );
+    let admitted = machine.verify(&job, true, Until::CursorAdvance);
+    let effects = machine.drain_persisting(admitted);
+    assert_eq!(
+        effects.has(|effect| matches!(
+            durable_effect(effect).and_then(EffectExt::sign_one),
+            Some(SignRequest::Vote(_))
+        )),
+        matching
+    );
+    if !matching {
+        machine
+            .views
+            .fire_timer::<Sha256>(View::new(1), &machine.chain)
+            .unwrap();
+        assert!(matches!(
+            machine.views.timeout_cutoff(View::new(1)),
+            Some(crate::multimmit::machine::view::TimeoutCutoff::Timeout)
+        ));
+    }
+}
 
 impl ProposalExtension<Digest> for TestProposalExtension {
     fn propose(&self, _: &ProposalContext<'_, Digest>) -> Option<Bytes> {
@@ -667,6 +874,35 @@ fn proposal_includes_the_da_voted_frontier_by_default() {
     let certified = machine.chain.propose_chain(genesis).unwrap();
     assert_eq!(certified.anchor(), proposal.anchor());
     assert!(certified.payloads().is_empty());
+
+    let reference = proposal.anchor().block_ref::<Sha256>();
+    let selected = machine
+        .chain
+        .propose_chain_at(genesis, reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.anchor(), proposal.anchor());
+    assert!(selected.payloads().is_empty());
+    assert!(
+        machine
+            .chain
+            .propose_chain_at(genesis, second.block_ref::<Sha256>())
+            .unwrap()
+            .is_none(),
+        "a validated DA vote is not a held DA certificate"
+    );
+    let wrong = BlockRef::new(
+        reference.chain(),
+        reference.height(),
+        digest(b"different certified identity"),
+    );
+    assert!(
+        machine
+            .chain
+            .propose_chain_at(genesis, wrong)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -982,9 +1218,29 @@ fn maximum_signed_batch_preempts_without_partial_exposure() {
     }
 }
 
-#[test]
-fn signed_valid_proposal_durably_selects_direct_vote() {
-    let mut machine = Machine::<Sha256, MinPk>::new(Harness::validator(0).profile());
+#[rstest::rstest]
+#[case::no_report(None, false)]
+#[case::report(Some(3), false)]
+#[case::typed_report(Some(3), true)]
+#[case::oversize_report(Some(17), false)]
+fn signed_valid_proposal_durably_selects_direct_vote(
+    #[case] size: Option<usize>,
+    #[case] typed: bool,
+) {
+    let profile = size.map_or_else(
+        || Harness::validator(0).profile(),
+        |size| {
+            let policy = TestVoteReport(Bytes::from(vec![7; size]));
+            let hook: Arc<dyn ProposalExtension<Digest>> = if typed {
+                crate::multimmit::extension::policy(policy, (0..=16).into())
+            } else {
+                Arc::new(policy)
+            };
+            extension_profile(None, Role::Validator(Participant::new(0)))
+                .with_proposal_extension(Some(hook))
+        },
+    );
+    let mut machine = Machine::<Sha256, MinPk>::new(profile);
     let start = machine.step(Input::Start).unwrap();
     let started = machine.persist(&start.persist_job(), Until::CursorAdvance);
     // The signing request releases with the step that stages the choice; its barrier still has
@@ -1022,6 +1278,10 @@ fn signed_valid_proposal_durably_selects_direct_vote() {
     assert_eq!(body.leader(), proposed.digest::<Sha256>());
     assert_eq!(body.positions(), &[Position::new(0)]);
     assert!(body.extensions()[0].is_empty());
+    let expected = size
+        .filter(|size| *size <= 16)
+        .map_or_else(Bytes::new, |size| Bytes::from(vec![7; size]));
+    assert_eq!(body.application(), &expected);
 }
 
 #[test]
@@ -1354,7 +1614,8 @@ fn proposal_accepts_exact_tip_history_and_rejects_an_incorrect_commitment() {
                 Activity::TransactionProposed { .. }
                 | Activity::LeaderFinalized { .. }
                 | Activity::LeaderFinalityUpdated { .. }
-                | Activity::CertificateRecorded { .. } => None,
+                | Activity::CertificateRecorded { .. }
+                | Activity::ParentPrepared { .. } => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1678,4 +1939,166 @@ fn vote_projection_uses_voted_prefix_and_extension() {
     let body = machine.chain.vote_body::<Sha256>(&leader).unwrap();
     assert_eq!(body.positions(), &[Position::new(1)]);
     assert_eq!(body.extensions()[0].payloads(), &[second.body_digest()]);
+}
+
+#[test]
+fn prepared_parent_history_requires_contextually_admitted_vqc() {
+    for valid in [false, true] {
+        let (mut machine, _) = Harness::observer().participants(6).start();
+        let certificate = view_one_vqc(&machine);
+        let round = certificate.leader().round();
+        let parent = certificate.leader().history();
+        let (next, _) = leader_extending_view_one_vqc(&machine, 2, &certificate);
+        let artifact = Artifact::Vqc(certificate);
+        let id = artifact.id::<Sha256>();
+        let verification = observe(&mut machine, artifact);
+        let admitted = machine.verify(&verification, valid, Until::CursorAdvance);
+        let prepared = admitted
+            .activities()
+            .iter()
+            .filter_map(|activity| match activity {
+                Activity::ParentPrepared {
+                    round: observed,
+                    artifact_id,
+                    commitment,
+                    record,
+                } => {
+                    assert_eq!(*observed, round);
+                    assert_eq!(*artifact_id, id);
+                    assert_eq!(*commitment, record.commitment::<Sha256>());
+                    assert_eq!(record.parent(), parent);
+                    Some((*commitment, Arc::clone(record)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prepared.len(), usize::from(valid));
+        if valid {
+            let (commitment, record) = &prepared[0];
+            assert_eq!(next.history(), *commitment);
+            let retained = machine.views.leader_history(&next).unwrap();
+            assert!(
+                Arc::ptr_eq(&retained, record),
+                "reuse the validated opening"
+            );
+        }
+    }
+}
+
+#[test]
+fn selected_parent_opening_keeps_exact_original_reports_after_restore_and_backfill() {
+    let base = Harness::observer().participants(6).profile();
+    let parameters = base
+        .protocol()
+        .parameters()
+        .as_ref()
+        .clone()
+        .with_proposal_extension_bound(64);
+    let protocol =
+        Protocol::from_parameters(Arc::new(parameters), base.protocol().genesis().clone()).unwrap();
+    let profile = Profile::new::<MinPk>(protocol, Role::Observer, Tuning::default()).unwrap();
+    let (mut machine, _) = start_profile(profile.clone());
+    let proposed = leader(&machine, 1);
+    // Each identity contributes exactly one original report. Two valid subsets
+    // can share the proposal and safe tips while committing different reports.
+    let messages = (0..6)
+        .map(|signer| {
+            let original = view_vote(&machine, &proposed, signer);
+            let body = original
+                .body()
+                .clone()
+                .with_application(Bytes::from(vec![signer as u8]), machine.profile().codec())
+                .unwrap();
+            ViewMessage::Vote(Vote::new(body, original.attestation().clone()))
+        })
+        .collect::<Vec<_>>();
+    let mut children = Vec::new();
+    let mut openings = Vec::new();
+    let mut certificates = Vec::new();
+    for subset in [&messages[..5], &messages[1..]] {
+        let certificate = vqc(&machine, proposed.clone(), subset);
+        let (child, _) = leader_extending_view_one_vqc(&machine, 2, &certificate);
+        certificates.push(certificate.clone());
+        let verification = observe(&mut machine, Artifact::Vqc(certificate));
+        let admitted = machine.verify(&verification, true, Until::CursorAdvance);
+        let opening = admitted
+            .activities()
+            .iter()
+            .find_map(|activity| match activity {
+                Activity::ParentPrepared { record, .. } => Some(Arc::clone(record)),
+                _ => None,
+            })
+            .expect("contextually admitted parent");
+        let context = ProposalContext::new::<Sha256, _>(&child).with_parent_record(&opening);
+        assert_eq!(
+            context.parent_record().unwrap().commitment::<Sha256>(),
+            child.history()
+        );
+        assert_eq!(context.parent_tips(), Some(opening.tips()));
+        assert_eq!(
+            opening.vote_reports().unwrap().reports(),
+            subset
+                .iter()
+                .map(|message| {
+                    let ViewMessage::Vote(vote) = message else {
+                        panic!("ordinary vote")
+                    };
+                    (vote.signer(), vote.body().application().clone())
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ProposalContext::new::<Sha256, _>(&child)
+                .parent_record()
+                .is_none(),
+            "initial artifact projection has no resolved parent authority"
+        );
+        children.push(child);
+        openings.push(opening);
+    }
+    assert_eq!(openings[0].tips(), openings[1].tips());
+    assert_ne!(children[0].history(), children[1].history());
+    let mut recovered =
+        Machine::<Sha256, MinPk>::restore(profile, machine.live_snapshot_for_test()).unwrap();
+    // Silent replay has not reconstructed the parent cache yet.
+    for child in &children {
+        assert!(recovered.views.leader_history(child).is_err());
+    }
+    let recovery = recovered.step(Input::RecoveryComplete).unwrap();
+    recovered.persist(&recovery.persist_job(), Until::CursorAdvance);
+    for (certificate, child) in certificates.into_iter().zip(&children) {
+        // RecoveryComplete re-admits durably retained certificates. Other
+        // remote parents still require their exact transcript from backfill.
+        if recovered.views.leader_history(child).is_err() {
+            let verification = observe(&mut recovered, Artifact::Vqc(certificate));
+            recovered.verify(&verification, true, Until::CursorAdvance);
+        } else {
+            let duplicate = recovered
+                .step(cohort::<Sha256, _>(vec![Artifact::Vqc(certificate)]))
+                .unwrap();
+            let StepStatus::Observed(results) = duplicate.status() else {
+                panic!("replayed certificate observation")
+            };
+            assert_eq!(results[0].status(), ObservationStatus::Duplicate);
+        }
+    }
+    for (child, original) in children.iter().zip(openings) {
+        let restored = recovered.views.leader_history(child).unwrap();
+        assert_eq!(restored.as_ref(), original.as_ref());
+        let repeated = recovered.views.leader_history(child).unwrap();
+        assert!(Arc::ptr_eq(&restored, &repeated));
+    }
+    let mut wrong = children[0].clone();
+    wrong = LeaderBlock::new(
+        wrong.round(),
+        wrong.parent(),
+        children[1].history(),
+        wrong.proposals().to_vec(),
+        machine.profile().codec(),
+    )
+    .unwrap();
+    assert!(
+        recovered.views.leader_history(&wrong).is_err(),
+        "equal tips cannot substitute another parent's report transcript"
+    );
 }

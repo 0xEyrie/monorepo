@@ -594,6 +594,30 @@ fn seed_message_from_subject<D: Digest>(subject: &Subject<'_, D>) -> bytes::Byte
     match subject {
         Subject::Notarize { proposal } | Subject::Finalize { proposal } => proposal.round.encode(),
         Subject::Nullify { round } => round.encode(),
+        #[cfg(not(any(
+            commonware_stability_BETA,
+            commonware_stability_GAMMA,
+            commonware_stability_DELTA,
+            commonware_stability_EPSILON,
+            commonware_stability_RESERVED
+        )))]
+        Subject::FinalizeExtension { statement } => statement.ballot.encode(),
+        #[cfg(not(any(
+            commonware_stability_BETA,
+            commonware_stability_GAMMA,
+            commonware_stability_DELTA,
+            commonware_stability_EPSILON,
+            commonware_stability_RESERVED
+        )))]
+        Subject::ExtensionStatus { promise } => promise.ballot.encode(),
+        #[cfg(not(any(
+            commonware_stability_BETA,
+            commonware_stability_GAMMA,
+            commonware_stability_DELTA,
+            commonware_stability_EPSILON,
+            commonware_stability_RESERVED
+        )))]
+        Subject::ExtensionRequest { round, .. } => round.encode(),
     }
 }
 

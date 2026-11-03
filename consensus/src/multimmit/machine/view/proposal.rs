@@ -110,7 +110,7 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
         let drive = match self.regular_sign_pass.as_mut() {
             None => return Ok(Drive::idle()),
             Some(RegularSignPass::Vote { pass, ready, .. }) => {
-                Self::step_vote::<H>(chain, pass, ready, &mut self.vote_builds, budget)?
+                Self::step_vote::<H>(profile, chain, pass, ready, &mut self.vote_builds, budget)?
             }
             Some(RegularSignPass::Proposal {
                 view,
@@ -149,10 +149,13 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
     ///
     /// It shares [`Self::drive_regular_sign_request`]'s conditions: this node can still sign, no
     /// pass for the view is in flight, and it holds a valid proposal, which makes the pass a vote.
-    pub(crate) fn vote_pass_begins(&self, view: View) -> Result<bool, ViewError> {
+    pub(crate) fn vote_pass_begins<H: Hasher<Digest = D>>(
+        &self,
+        view: View,
+    ) -> Result<bool, ViewError> {
         Ok(self.can_sign_regular(view)
             && !self.regular_pass_in_flight(view)
-            && self.valid_proposal(view)?.is_some())
+            && self.valid_proposal::<H>(view)?.is_some())
     }
 
     /// Discards the in-flight pass, reporting a vote pass that never produced its body.
@@ -166,6 +169,7 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
     ///
     /// A completed body is kept, so later drives return it again without further work.
     fn step_vote<H: Hasher<Digest = D>>(
+        profile: &Profile<D>,
         chain: &ChainState<V, D>,
         pass: &mut VoteBodyPass<V, D>,
         ready: &mut Option<VoteBody<D>>,
@@ -180,6 +184,13 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
                 .resume_vote_body_pass::<H>(pass)
                 .map_err(|_| ViewError::Chain)?
             {
+                let body = crate::multimmit::extension::vote::<H, V>(
+                    profile.proposal_extension.as_deref(),
+                    pass.leader(),
+                    pass.parent_tips(),
+                    body,
+                    profile.codec(),
+                );
                 builds.push(VoteBuild::Completed(stats));
                 *ready = Some(body.clone());
                 return Ok(Drive::done(processed, Some(SignRequest::Vote(body))));
@@ -206,6 +217,7 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
                 None => {
                     let request = Self::finish_proposal_request::<H>(
                         profile,
+                        chain,
                         round,
                         parent,
                         attach_parent,
@@ -293,9 +305,15 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
         let Some(me) = self.me else {
             return Ok(None);
         };
-        if let Some(proposal) = self.valid_proposal(view)? {
+        if let Some(proposal) = self.valid_proposal::<H>(view)? {
             let leader = proposal.block().clone();
-            let pass = chain.begin_vote_body_pass(leader);
+            let parent = self
+                .parents
+                .get(&leader.parent())
+                .ok_or(ViewError::MissingParent)?;
+            let pass = chain
+                .begin_vote_body_pass(leader)
+                .with_parent_tips(parent.tips.blocks().to_vec());
             return Ok(Some(RegularSignPass::Vote {
                 view,
                 pass,
@@ -330,6 +348,7 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
 
     fn finish_proposal_request<H: Hasher<Digest = D>>(
         profile: &Profile<D>,
+        chain: &ChainState<V, D>,
         round: Round,
         parent: &ParentRecord<V, D>,
         attach_parent: bool,
@@ -350,13 +369,65 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
             config,
         )
         .map_err(|_| ViewError::Proposal)?;
+        if let Some(hook) = &profile.proposal_extension {
+            let context =
+                ProposalContext::new::<H, V>(&block).with_parent_record(parent.tip_record()?);
+            if let Some(plan) = hook.plan(&context)
+                && plan.anchors.len() <= proposals.len()
+                && plan
+                    .anchors
+                    .windows(2)
+                    .all(|pair| pair[0].chain() < pair[1].chain())
+            {
+                let mut selected = proposals.to_vec();
+                let mut available = true;
+                for requested in plan.anchors {
+                    let index = requested.chain().index();
+                    let Some(tip) = parent.tips.blocks().get(index).copied() else {
+                        available = false;
+                        break;
+                    };
+                    let Some(proposal) = chain
+                        .propose_chain_at(tip, requested)
+                        .map_err(|_| ViewError::Chain)?
+                    else {
+                        available = false;
+                        break;
+                    };
+                    selected[index] = proposal;
+                }
+                if available {
+                    let candidate = LeaderBlock::new(
+                        round,
+                        parent.id,
+                        parent.child_history()?,
+                        selected,
+                        config,
+                    )
+                    .map_err(|_| ViewError::Proposal)?;
+                    let context = ProposalContext::new::<H, V>(&candidate)
+                        .with_parent_record(parent.tip_record()?);
+                    if hook.verify(&context, &plan.extension)
+                        && hook.verify_parent(&context, &plan.extension)
+                        && let Ok(candidate) = candidate.with_extension(plan.extension, config)
+                    {
+                        return Ok(Some(SignRequest::LeaderBlock(ProposalRequest::new(
+                            candidate,
+                            parent_proof,
+                            attach_parent,
+                        ))));
+                    }
+                }
+            }
+        }
         let extension = match &profile.proposal_extension {
             Some(hook) => {
-                let context = ProposalContext::new::<H, V>(&block);
+                let context =
+                    ProposalContext::new::<H, V>(&block).with_parent_record(parent.tip_record()?);
                 let Some(extension) = hook.propose(&context) else {
                     return Ok(None);
                 };
-                if !hook.verify(&context, &extension) {
+                if !hook.verify(&context, &extension) || !hook.verify_parent(&context, &extension) {
                     return Err(ViewError::Proposal);
                 }
                 extension
@@ -430,19 +501,30 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
         if self.timeout_cutoff(view).is_some() || !self.can_vote(view) {
             return Ok(());
         }
-        let cutoff = match (self.me, self.valid_proposal(view)?) {
-            (Some(_), Some(proposal)) => TimeoutCutoff::Vote(
-                chain
-                    .vote_body::<H>(proposal.block())
-                    .map_err(|_| ViewError::Chain)?,
-            ),
+        let cutoff = match (self.me, self.valid_proposal::<H>(view)?) {
+            (Some(_), Some(proposal)) => {
+                TimeoutCutoff::Vote(crate::multimmit::extension::vote::<H, V>(
+                    self.proposal_extension.as_deref(),
+                    proposal.block(),
+                    self.parents
+                        .get(&proposal.block().parent())
+                        .map(|parent| parent.tips.blocks()),
+                    chain
+                        .vote_body::<H>(proposal.block())
+                        .map_err(|_| ViewError::Chain)?,
+                    self.config,
+                ))
+            }
             _ => TimeoutCutoff::Timeout,
         };
         self.entry_mut(view).timeout = Some(cutoff);
         Ok(())
     }
 
-    fn valid_proposal(&self, view: View) -> Result<Option<&SignedLeaderBlock<V, D>>, ViewError> {
+    fn valid_proposal<H: Hasher<Digest = D>>(
+        &self,
+        view: View,
+    ) -> Result<Option<&SignedLeaderBlock<V, D>>, ViewError> {
         let Some(records) = self.entry(view).map(|entry| &entry.proposals) else {
             return Ok(None);
         };
@@ -472,6 +554,13 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
             || !self.proposal_extends(block, parent)?
         {
             return Ok(None);
+        }
+        if let Some(hook) = &self.proposal_extension {
+            let context =
+                ProposalContext::new::<H, V>(block).with_parent_record(parent.tip_record()?);
+            if !hook.verify_parent(&context, block.extension()) {
+                return Ok(None);
+            }
         }
         Ok(Some(proposal))
     }

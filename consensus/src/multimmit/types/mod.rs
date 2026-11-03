@@ -91,6 +91,9 @@ pub enum Error {
     /// A leader proposal's application extension exceeds the epoch's byte bound.
     #[error("proposal extension exceeds its byte bound")]
     ProposalExtensionLength,
+    /// A vote's application report exceeds the epoch's application byte bound.
+    #[error("vote application report exceeds its byte bound")]
+    VoteApplicationLength,
     /// A vote path does not fit its proposal: a position lies beyond the pipeline depth or the
     /// proposal's tip, or the position plus its extension overflows the chain height.
     #[error("vote position exceeds its proposal")]

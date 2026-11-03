@@ -13,15 +13,16 @@ use super::{
     variant::NoBuffer,
 };
 use crate::{
-    Block, Epochable, Heightable, Reporter,
+    Block, Epochable, Heightable, Reporter, Roundable,
     simplex::{
         marshal::{
             Config, Identifier as BlockID, Start, Update,
             resolver::handler::{self, Annotation, Key, Request},
             store::{Blocks, Certificates},
         },
+        phase2::Mode as _,
         scheme::Scheme,
-        types::{Finalization, Notarization, Subject, verify_certificates},
+        types::{Notarization, Subject, verify_certificates},
     },
     types::{Epoch, Epocher, Height, Round, ViewDelta},
 };
@@ -113,7 +114,7 @@ where
 
     // ---------- Message Passing ----------
     // Mailbox
-    mailbox: mailbox::Receiver<Message<P::Scheme, V>>,
+    mailbox: mailbox::Receiver<Message<P::Scheme, V, FC::Mode>>,
 
     // ---------- Configuration ----------
     // Provider for epoch-specific signing schemes
@@ -131,7 +132,7 @@ where
 
     // ---------- State ----------
     // Durable floor and floor updates not yet applied
-    floor: FloorState<P::Scheme, V::Commitment>,
+    floor: FloorState<P::Scheme, V::Commitment, FC::Mode>,
     // Application delivery cursor
     stream: Stream<E>,
     // Pending application acknowledgements
@@ -153,7 +154,7 @@ where
 
     // ---------- Storage ----------
     // Prunable cache
-    cache: cache::Manager<E, V, P::Scheme>,
+    cache: cache::Manager<E, V, P::Scheme, FC::Mode>,
     // Finalizations stored by height
     finalizations_by_height: FC,
     // Finalized blocks stored by height
@@ -183,12 +184,13 @@ where
 {
     /// Create a new application actor.
     #[boxed]
+    #[allow(clippy::type_complexity)]
     pub async fn init(
         context: E,
         finalizations_by_height: FC,
         mut finalized_blocks: FB,
-        config: Config<P, ES, T, V::ApplicationBlock, V::Block, V::Commitment>,
-    ) -> (Self, Mailbox<P::Scheme, V>, Floor) {
+        config: Config<P, ES, T, V::ApplicationBlock, V::Block, V::Commitment, FC::Mode>,
+    ) -> (Self, Mailbox<P::Scheme, V, FC::Mode>, Floor) {
         // Initialize cache
         let prunable_config = cache::Config {
             partition_prefix: format!("{}-cache", config.partition_prefix),
@@ -606,7 +608,7 @@ where
     /// Handles a single mailbox message from local consensus/application callers.
     async fn handle_mailbox_message<Buf, R>(
         mut self: Box<Self>,
-        message: Message<P::Scheme, V>,
+        message: Message<P::Scheme, V, FC::Mode>,
         resolver: &mut R,
         waiters: &mut AbortablePool<'_, Result<V::Block, SubscriptionKeyFor<V>>>,
         syncs: &mut Pool<'_, PooledSync>,
@@ -789,7 +791,7 @@ where
             }
             Message::Finalization { finalization, .. } => {
                 let round = finalization.round();
-                let commitment = finalization.proposal.payload;
+                let commitment = FC::Mode::finalization_proposal(&finalization).payload;
                 let digest = V::commitment_to_inner(commitment);
 
                 // Cache finalization by round.
@@ -1196,7 +1198,7 @@ where
     /// Verifies and installs a floor, awaiting the anchor block from the buffer or peers if needed.
     async fn install_floor<Buf, R>(
         mut self: Box<Self>,
-        finalization: Finalization<P::Scheme, V::Commitment>,
+        finalization: <FC::Mode as crate::simplex::phase2::Mode<P::Scheme,V::Commitment>>::Certificate,
         resolver: &mut R,
         buffer: &mut Buf,
         waiters: &mut AbortablePool<'_, Result<V::Block, SubscriptionKeyFor<V>>>,
@@ -1221,11 +1223,19 @@ where
             panic!("floor finalization epoch unavailable");
         };
         assert!(
-            finalization.verify(self.context.as_mut(), &scoped, &self.strategy),
+            verify_certificates(
+                self.context.as_mut(),
+                &scoped,
+                &[(
+                    FC::Mode::signed_finalization_subject(&finalization),
+                    FC::Mode::finalization_certificate(&finalization)
+                )],
+                &self.strategy
+            )[0],
             "floor finalization must verify"
         );
 
-        let commitment = finalization.proposal.payload;
+        let commitment = FC::Mode::finalization_proposal(&finalization).payload;
         let digest = V::commitment_to_inner(commitment);
         self.cache = self
             .cache
@@ -1329,7 +1339,7 @@ where
     /// Applies the floor transition that `finalization` announces using its anchor block.
     async fn apply_floor<Buf: Buffer<V>>(
         mut self: Box<Self>,
-        finalization: Finalization<P::Scheme, V::Commitment>,
+        finalization: <FC::Mode as crate::simplex::phase2::Mode<P::Scheme,V::Commitment>>::Certificate,
         block: V::Block,
         buffer: &mut Buf,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
@@ -1461,7 +1471,7 @@ where
     async fn handle_deliver<Buf: Buffer<V>>(
         mut self: Box<Self>,
         message: ResolverDelivery<V>,
-        delivers: &mut Vec<PendingVerification<P::Scheme, V>>,
+        delivers: &mut Vec<PendingVerification<P::Scheme, V, FC::Mode>>,
         buffer: &mut Buf,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
         resolver: &mut impl Resolver<Key = ResolverRequestFor<V>, Subscriber = Annotation>,
@@ -1579,9 +1589,12 @@ where
                 };
                 let certificate_codec_config = scoped.certificate_codec_config();
 
-                let Ok(finalization) =
-                    Finalization::read_cfg(&mut value, &certificate_codec_config)
-                else {
+                let Ok(finalization) = <FC::Mode as crate::simplex::phase2::Mode<
+                    P::Scheme,
+                    V::Commitment,
+                >>::Certificate::read_cfg(
+                    &mut value, &certificate_codec_config
+                ) else {
                     response.send_lossy(false);
                     return self;
                 };
@@ -1606,7 +1619,7 @@ where
                 // Once the certificate verifies, the finalization authenticates the application
                 // block, so only the height and digest are checked here. The working block is then
                 // rebuilt from the finalized commitment.
-                let commitment = finalization.proposal.payload;
+                let commitment = FC::Mode::finalization_proposal(&finalization).payload;
                 if block.height() != height || block.digest() != V::commitment_to_inner(commitment)
                 {
                     response.send_lossy(false);
@@ -1682,7 +1695,7 @@ where
     #[tracing::instrument(name = "marshal.actor.verify_delivered", level = "info", skip_all, fields(count = delivers.len().traced()))]
     async fn verify_delivered<Buf: Buffer<V>>(
         mut self: Box<Self>,
-        mut delivers: Vec<PendingVerification<P::Scheme, V>>,
+        mut delivers: Vec<PendingVerification<P::Scheme, V, FC::Mode>>,
         buffer: &mut Buf,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
         resolver: &mut impl Resolver<Key = ResolverRequestFor<V>, Subscriber = Annotation>,
@@ -1697,10 +1710,8 @@ where
             .iter()
             .map(|item| match item {
                 PendingVerification::Finalized { finalization, .. } => (
-                    Subject::Finalize {
-                        proposal: &finalization.proposal,
-                    },
-                    &finalization.certificate,
+                    FC::Mode::signed_finalization_subject(finalization),
+                    FC::Mode::finalization_certificate(finalization),
                 ),
                 PendingVerification::Notarized { notarization, .. } => (
                     Subject::Notarize {
@@ -1754,7 +1765,10 @@ where
                 } => {
                     // Valid finalization received.
                     response.send_lossy(true);
-                    let block = V::from_application_block(block, finalization.proposal.payload);
+                    let block = V::from_application_block(
+                        block,
+                        FC::Mode::finalization_proposal(&finalization).payload,
+                    );
                     let round = finalization.round();
                     let height = block.height();
                     let digest = block.digest();
@@ -2044,7 +2058,8 @@ where
     async fn get_finalization_by_height(
         &self,
         height: Height,
-    ) -> Option<Finalization<P::Scheme, V::Commitment>> {
+    ) -> Option<<FC::Mode as crate::simplex::phase2::Mode<P::Scheme, V::Commitment>>::Certificate>
+    {
         match self
             .finalizations_by_height
             .get(ArchiveID::Index(height.get()))
@@ -2073,7 +2088,7 @@ where
         if let Some(finalization) = self.get_finalization_by_height(height).await {
             return Some((
                 height,
-                V::commitment_to_inner(finalization.proposal.payload),
+                V::commitment_to_inner(FC::Mode::finalization_proposal(&finalization).payload),
             ));
         }
 
@@ -2100,7 +2115,9 @@ where
         height: Height,
         digest: <V::Block as Digestible>::Digest,
         block: &V::Block,
-        finalization: Option<Finalization<P::Scheme, V::Commitment>>,
+        finalization: Option<
+            <FC::Mode as crate::simplex::phase2::Mode<P::Scheme, V::Commitment>>::Certificate,
+        >,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
     ) -> (Box<Self>, bool) {
         // Blocks below the last processed height are not useful to us, so we ignore them (this
@@ -2175,7 +2192,7 @@ where
             .expect("finalization missing");
         Some((
             height,
-            V::commitment_to_inner(finalization.proposal.payload),
+            V::commitment_to_inner(FC::Mode::finalization_proposal(&finalization).payload),
             finalization.round(),
         ))
     }
@@ -2291,7 +2308,7 @@ where
                     .get_finalization_by_height(last_finalized)
                     .await
                     .expect("finalization missing");
-                let commitment = finalization.proposal.payload;
+                let commitment = FC::Mode::finalization_proposal(&finalization).payload;
                 if let Some(block) = self.find_block_by_commitment(buffer, commitment).await {
                     // If found, persist the block.
                     let digest = block.digest();
@@ -2474,7 +2491,7 @@ where
             return processed_round;
         };
         assert!(
-            V::stored_commitment(&block) == finalization.proposal.payload,
+            V::stored_commitment(&block) == FC::Mode::finalization_proposal(&finalization).payload,
             "successor block does not match stored finalization"
         );
         processed_round.max(finalization.round())

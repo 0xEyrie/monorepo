@@ -4,12 +4,15 @@ use super::{
     ingress::{Handler, HandlerMessage, Mailbox, MailboxMessage},
     state::{Effect, FetchReason},
 };
+#[cfg(test)]
+use crate::simplex::phase2::Plain;
 use crate::{
     Epochable, Viewable,
     simplex::{
         actors::{resolver::state::State, voter},
+        phase2::Mode,
         scheme::Scheme,
-        types::Certificate,
+        types::CertificateWith,
     },
     types::{Epoch, View},
 };
@@ -37,12 +40,17 @@ use std::{
 use tracing::{debug, info_span};
 
 /// Requests are made concurrently to multiple peers.
-pub struct Actor<
+#[cfg(test)]
+pub type Actor<E, S, B, D, T> = ActorWith<E, S, B, D, T, Plain>;
+
+/// Native certificate resolver retaining the selected certificate representation.
+pub struct ActorWith<
     E: BufferPooler + Clock + CryptoRng + Metrics + Spawner,
     S: Scheme<D>,
     B: Blocker<PublicKey = S::PublicKey>,
     D: Digest,
     T: Strategy,
+    M: Mode<S, D>,
 > {
     context: ContextCell<E>,
     scheme: S,
@@ -56,7 +64,7 @@ pub struct Actor<
     /// Certificates known between the floor and the current view. Serves
     /// [HandlerMessage::Produce] requests and emits the [Effect]s the actor
     /// applies to the resolver (see [Self::apply_effects]).
-    state: State<S, D>,
+    state: State<S, D, M>,
 
     /// Encoded nullifications retained while they cover an unfinalized view.
     /// This cache survives floor raises so asks below the floor remain servable.
@@ -77,7 +85,7 @@ pub struct Actor<
     /// verdict for delayed exact-parent asks.
     uncertifiable_notarizations: BTreeSet<View>,
 
-    mailbox_receiver: mailbox::Receiver<MailboxMessage<S, D>>,
+    mailbox_receiver: mailbox::Receiver<MailboxMessage<S, D, M>>,
 }
 
 impl<
@@ -86,9 +94,10 @@ impl<
     B: Blocker<PublicKey = S::PublicKey>,
     D: Digest,
     T: Strategy,
-> Actor<E, S, B, D, T>
+    M: Mode<S, D>,
+> ActorWith<E, S, B, D, T, M>
 {
-    pub fn new(context: E, cfg: Config<S, B, T>) -> (Self, Mailbox<S, D>) {
+    pub fn new(context: E, cfg: Config<S, B, T>) -> (Self, Mailbox<S, D, M>) {
         let (sender, receiver) = mailbox::new(context.child("mailbox"), cfg.mailbox_size);
         (
             Self {
@@ -115,7 +124,7 @@ impl<
 
     pub fn start(
         mut self,
-        voter: voter::Mailbox<S, D>,
+        voter: voter::Mailbox<S, D, M>,
         sender: impl Sender<PublicKey = S::PublicKey>,
         receiver: impl Receiver<PublicKey = S::PublicKey>,
     ) -> Handle<()> {
@@ -124,7 +133,7 @@ impl<
 
     async fn run(
         mut self,
-        mut voter: voter::Mailbox<S, D>,
+        mut voter: voter::Mailbox<S, D, M>,
         sender: impl Sender<PublicKey = S::PublicKey>,
         receiver: impl Receiver<PublicKey = S::PublicKey>,
     ) {
@@ -215,7 +224,7 @@ impl<
     fn updated<R: Resolver<Key = U64, Subscriber = Ask>>(
         &mut self,
         resolver: &mut R,
-        certificate: Certificate<S, D>,
+        certificate: CertificateWith<S, D, M>,
     ) {
         let term_length = self.state.term_length();
         let last_finalized = self.last_finalized();
@@ -224,7 +233,7 @@ impl<
         // [State] prunes at the floor, which rises sooner than finalization and
         // would hide this evidence from a peer still repairing the view.
         match &certificate {
-            Certificate::Nullification(nullification) => {
+            CertificateWith::Nullification(nullification) => {
                 let view = nullification.view();
                 if view.term_end(term_length) > last_finalized {
                     self.nullifications.insert(view, certificate.encode());
@@ -234,7 +243,7 @@ impl<
                     });
                 }
             }
-            Certificate::Notarization(notarization) => {
+            CertificateWith::Notarization(notarization) => {
                 let view = notarization.view();
                 if view > last_finalized && !self.uncertifiable_notarizations.contains(&view) {
                     if !self.certified_notarizations.contains_key(&view) {
@@ -246,7 +255,7 @@ impl<
                     });
                 }
             }
-            Certificate::Finalization(finalization) => {
+            CertificateWith::Finalization(finalization) => {
                 // Finalization is the global retirement boundary: a valid proposal
                 // can no longer name ancestry at or below it, so nothing here can
                 // still be asked for.
@@ -471,7 +480,7 @@ impl<
     fn produce_certificate(&self, view: View) -> Option<Bytes> {
         // Prefer the retained finalization because a higher notarization does
         // not settle an older ancestry request.
-        if let Some(certificate @ Certificate::Finalization(_)) = self.state.get(view) {
+        if let Some(certificate @ CertificateWith::Finalization(_)) = self.state.get(view) {
             return Some(certificate.encode());
         }
 
@@ -496,19 +505,20 @@ impl<
     /// including one that answers the other kind: rejecting it would fault a peer
     /// that answered the only question the wire key asked. Whether it
     /// settles the ask is a separate check (see [Self::settled]).
-    fn validate(&mut self, view: View, data: Bytes) -> Option<Certificate<S, D>> {
+    fn validate(&mut self, view: View, data: Bytes) -> Option<CertificateWith<S, D, M>> {
         let incoming =
-            Certificate::<S, D>::decode_cfg(data, &self.scheme.certificate_codec_config()).ok()?;
+            CertificateWith::<S, D, M>::decode_cfg(data, &self.scheme.certificate_codec_config())
+                .ok()?;
 
         // A nullification covers the rest of its term. A notarization or
         // finalization is servable from a peer's floor, which may sit above the
         // requested view.
         let servable = match &incoming {
-            Certificate::Nullification(nullification) => {
+            CertificateWith::Nullification(nullification) => {
                 nullification.view().covers(view, self.state.term_length())
             }
-            Certificate::Notarization(notarization) => notarization.view() >= view,
-            Certificate::Finalization(finalization) => finalization.view() >= view,
+            CertificateWith::Notarization(notarization) => notarization.view() >= view,
+            CertificateWith::Finalization(finalization) => finalization.view() >= view,
         };
         if !servable {
             debug!(%view, received = %incoming.view(), "certificate below requested view");
@@ -538,7 +548,7 @@ impl<
     fn handle_resolver<R: Resolver<Key = U64, Subscriber = Ask>>(
         &mut self,
         message: HandlerMessage,
-        voter: &mut voter::Mailbox<S, D>,
+        voter: &mut voter::Mailbox<S, D, M>,
         resolver: &mut R,
     ) {
         match message {
@@ -579,7 +589,7 @@ impl<
                 // replaying it cannot satisfy any outstanding repair ask.
                 let obsolete = matches!(
                     &parsed,
-                    Certificate::Notarization(notarization)
+                    CertificateWith::Notarization(notarization)
                         if self
                             .uncertifiable_notarizations
                             .contains(&notarization.view())
@@ -632,13 +642,16 @@ impl<
 }
 
 #[cfg(test)]
+commonware_macros::stability_mod!(ALPHA, mod extension_tests);
+
+#[cfg(test)]
 mod tests {
     use super::{super::test_helpers::*, *};
     use crate::{
         simplex::{
             elector::{Config as _, Elector as _, RoundRobin, RoundRobinElector},
             scheme::ed25519,
-            types::{Notarization, Notarize},
+            types::{Certificate, Notarization, Notarize},
         },
         types::{Round, TermLength, ViewDelta},
     };

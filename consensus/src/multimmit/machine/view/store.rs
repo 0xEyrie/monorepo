@@ -21,7 +21,7 @@ use crate::{
             SelectedCommitments, TipRecord, Vote, VoteBody,
         },
     },
-    types::{Attributable, Height, Participant, View},
+    types::{Attributable, Participant, View},
 };
 use bytes::Bytes;
 use commonware_cryptography::{Digest, Hasher, bls12381::primitives::variant::Variant};
@@ -71,34 +71,22 @@ pub(super) enum ParentProof<V: Variant, D: Digest> {
 pub(super) struct ParentRecord<V: Variant, D: Digest> {
     pub(super) id: CertificateId<D>,
     pub(super) view: View,
-    pub(super) history: D,
     pub(super) canonical: Bytes,
     pub(super) proof: ParentProof<V, D>,
     pub(super) tips: Arc<Tips<D>>,
     pub(super) commitments: SelectedCommitments<D>,
-    /// Each chain's proposed tip height in the view this record's V-QC certified.
-    pub(super) proposed: Vec<Height>,
     /// The commitment of [`Self::tip_record`], which a child leader block names as its history.
     /// Validation computes it once because every proposal validity check compares against it;
     /// `None` when the tips and proposed heights do not form a tip record.
     pub(super) child_history: Option<D>,
+    pub(super) history_opening: Option<Arc<TipRecord<D>>>,
     pub(super) messages: usize,
 }
 
 impl<V: Variant, D: Digest> ParentRecord<V, D> {
     /// Returns the safe-tip opening a child leader block commits to as its history.
-    pub(super) fn tip_record(&self) -> Result<TipRecord<D>, ViewError> {
-        match &self.proof {
-            ParentProof::Genesis => TipRecord::new(
-                self.history,
-                self.tips.blocks().to_vec(),
-                self.proposed.clone(),
-            ),
-            ParentProof::Vqc(proof) => {
-                TipRecord::from_leader(proof.get().leader(), self.tips.blocks().to_vec())
-            }
-        }
-        .map_err(|_| ViewError::Proposal)
+    pub(super) fn tip_record(&self) -> Result<&Arc<TipRecord<D>>, ViewError> {
+        self.history_opening.as_ref().ok_or(ViewError::Proposal)
     }
 
     /// Returns the history commitment a child leader block names.
@@ -428,17 +416,17 @@ impl<V: Variant, D: Digest> ViewState<V, D> {
             tips,
             commitments,
             child_history,
+            history_opening,
         } = validated.into_parts();
         let record = ParentRecord {
             id,
             view: certificate.view(),
-            history: certificate.leader().history(),
             canonical,
             proof: ParentProof::Vqc(held.clone()),
-            proposed: certificate.leader().proposed_heights(),
             tips,
             commitments,
             child_history,
+            history_opening,
             messages: certificate.tally().signers().count()
                 + certificate.novoters().count()
                 + certificate.conflicting_votes().len(),

@@ -20,7 +20,7 @@ use crate::{
             },
             types::{CustodyValues, LqcVerifier},
         },
-        types::{BlockRef, Body, TransactionBlock},
+        types::{BlockRef, Body, TipRecord, TransactionBlock},
     },
     types::Epoch,
 };
@@ -453,8 +453,8 @@ where
     )]
     pub(super) async fn drive<J>(
         &mut self,
-        history: H::Digest,
-        extension: Option<&bytes::Bytes>,
+        history: (H::Digest, Option<H::Digest>),
+        record: Option<&TipRecord<H::Digest>>,
         stream: &mut J,
         emitted: &[BlockRef<H::Digest>],
         forward: &[Option<Branch<H::Digest>>],
@@ -463,6 +463,12 @@ where
     where
         J: Iterator<Item = Slot<H::Digest>>,
     {
+        let (history, parent_history) = history;
+        let extension = record.and_then(TipRecord::proposal_extension);
+        let vote_reports = record
+            .and_then(TipRecord::vote_reports)
+            .cloned()
+            .map(Arc::new);
         let policy = self.ordering.clone();
         let mut cursor = policy
             .as_ref()
@@ -487,7 +493,9 @@ where
                     prefixes[chain].push(next.reference);
                     slots[chain].push(next.slot);
                 }
-                let context = OrderingContext::new(self.epoch, history, cursor.clone(), prefixes);
+                let context = OrderingContext::new(self.epoch, history, cursor.clone(), prefixes)
+                    .with_parent_history(parent_history)
+                    .with_vote_reports(vote_reports.as_ref().map(Arc::clone));
                 let context = context.with_proposal_extension(extension.cloned());
                 let ordered = policy(&context)?;
                 ordering::validate(&context, &ordered)?;

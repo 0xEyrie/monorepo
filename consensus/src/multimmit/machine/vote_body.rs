@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 /// A resumable vote-body construction for one leader block.
 pub(crate) struct VoteBodyPass<V: Variant, D: Digest> {
     leader: LeaderBlock<V, D>,
+    parent_tips: Option<Vec<BlockRef<D>>>,
     // A vote decision uses one immutable DA frontier even if later validations complete while
     // its budgeted body construction is still in progress.
     da_frontiers: Vec<Height>,
@@ -36,6 +37,19 @@ pub(crate) struct VoteBodyPass<V: Variant, D: Digest> {
 }
 
 impl<V: Variant, D: Digest> VoteBodyPass<V, D> {
+    pub(crate) fn with_parent_tips(mut self, tips: Vec<BlockRef<D>>) -> Self {
+        self.parent_tips = Some(tips);
+        self
+    }
+
+    pub(crate) fn parent_tips(&self) -> Option<&[BlockRef<D>]> {
+        self.parent_tips.as_deref()
+    }
+
+    pub(crate) const fn leader(&self) -> &LeaderBlock<V, D> {
+        &self.leader
+    }
+
     /// Returns the event that reports this pass beginning.
     pub(crate) const fn started(&self) -> VoteBuild {
         VoteBuild::Started {
@@ -133,10 +147,56 @@ impl<V: Variant, D: Digest> ChainState<V, D> {
                     .clone()
                     .map(|certificate| (certificate, certified.block))
             });
-        let (anchor, mut parent) = match certified {
+        let (anchor, parent) = match certified {
             Some((certificate, block)) => (Anchor::Certificate(certificate), block),
             None => (Anchor::Tip(tip), tip),
         };
+        self.extend_proposal(tip, anchor, parent)
+    }
+
+    /// Resolves a local policy suggestion without fetching or treating a bare reference as proof.
+    pub(crate) fn propose_chain_at(
+        &self,
+        tip: BlockRef<D>,
+        requested: BlockRef<D>,
+    ) -> Result<Option<ChainProposal<V, D>>, ChainError> {
+        if requested.chain() != tip.chain() || requested.height() < tip.height() {
+            return Ok(None);
+        }
+        let anchor = if requested == tip {
+            Anchor::Tip(tip)
+        } else {
+            let state = self
+                .da
+                .chains
+                .get(tip.chain().index())
+                .ok_or(ChainError::Context)?;
+            let Some(certificate) = state
+                .certified
+                .get(&requested.height())
+                .filter(|certified| {
+                    certified.block == requested && requested.height() > tip.height()
+                })
+                .and_then(|certified| certified.certificate.clone())
+            else {
+                return Ok(None);
+            };
+            Anchor::Certificate(certificate)
+        };
+        self.extend_proposal(tip, anchor, requested).map(Some)
+    }
+
+    fn extend_proposal(
+        &self,
+        tip: BlockRef<D>,
+        anchor: Anchor<V, D>,
+        mut parent: BlockRef<D>,
+    ) -> Result<ChainProposal<V, D>, ChainError> {
+        let state = self
+            .da
+            .chains
+            .get(tip.chain().index())
+            .ok_or(ChainError::Context)?;
         let budget = match self.proposal_policy {
             ProposalPolicy::Endorsed => self.config.pipeline_depth(),
             ProposalPolicy::Certified => 0,
@@ -164,6 +224,7 @@ impl<V: Variant, D: Digest> ChainState<V, D> {
     pub(crate) fn begin_vote_body_pass(&self, leader: LeaderBlock<V, D>) -> VoteBodyPass<V, D> {
         VoteBodyPass {
             leader,
+            parent_tips: None,
             da_frontiers: self
                 .da
                 .chains

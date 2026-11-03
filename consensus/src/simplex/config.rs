@@ -1,6 +1,7 @@
 use super::{
     elector,
-    types::{Activity, Context, Finalization},
+    phase2::{Mode, Plain},
+    types::{ActivityWith, Context},
 };
 use crate::{
     CertifiableAutomaton, Epochable, Relay, Reporter, Viewable,
@@ -92,15 +93,19 @@ impl ForwardPolicy {
 /// restarting with an earlier floor can re-enter views whose vote records
 /// were already discarded (risking equivocation). Derive the floor from
 /// application state that is persisted before the engine starts.
+pub type Floor<S, D> = FloorWith<S, D, Plain>;
+
+/// Certified startup anchor retaining the mode's exact final certificate.
+/// Validation of application interpretation and its ancestry remains required.
 #[derive(Clone, Debug)]
-pub enum Floor<S: Scheme, D: Digest> {
+pub enum FloorWith<S: Scheme, D: Digest, M: Mode<S, D>> {
     /// Start from the epoch genesis payload at view 0.
     Genesis(D),
     /// Start from an already-finalized proposal.
-    Finalized(Finalization<S, D>),
+    Finalized(M::Certificate),
 }
 
-impl<S: Scheme, D: Digest> Floor<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> FloorWith<S, D, M> {
     /// The finalized view the engine starts from (`View::zero()` for genesis).
     pub(crate) fn view(&self) -> View {
         match self {
@@ -125,7 +130,7 @@ impl<S: Scheme, D: Digest> Floor<S, D> {
                 "use Floor::Genesis for the genesis view"
             );
             assert!(
-                finalization.verify(rng, scheme, strategy),
+                M::verify(finalization, rng, scheme, strategy),
                 "floor finalization must verify"
             );
         }
@@ -133,7 +138,7 @@ impl<S: Scheme, D: Digest> Floor<S, D> {
 }
 
 /// Configuration for the consensus engine.
-pub struct Config<S, L, B, D, A, R, F, T>
+pub struct Config<S, L, B, D, A, R, F, T, M: Mode<S, D> = Plain>
 where
     S: Scheme,
     L: elector::Config<S>,
@@ -141,7 +146,7 @@ where
     D: Digest,
     A: CertifiableAutomaton<Context = Context<D, S::PublicKey>>,
     R: Relay,
-    F: Reporter<Activity = Activity<S, D>>,
+    F: Reporter<Activity = ActivityWith<S, D, M>>,
     T: Strategy,
 {
     /// Signing scheme for the consensus engine.
@@ -214,7 +219,7 @@ where
     pub epoch: Epoch,
 
     /// Certified root for the consensus engine.
-    pub floor: Floor<S, D>,
+    pub floor: FloorWith<S, D, M>,
 
     /// Number of bytes to buffer when replaying during startup.
     pub replay_buffer: NonZeroUsize,
@@ -260,9 +265,10 @@ impl<
     D: Digest,
     A: CertifiableAutomaton<Context = Context<D, S::PublicKey>>,
     R: Relay,
-    F: Reporter<Activity = Activity<S, D>>,
+    F: Reporter<Activity = ActivityWith<S, D, M>>,
     T: Strategy,
-> Config<S, L, B, D, A, R, F, T>
+    M: Mode<S, D>,
+> Config<S, L, B, D, A, R, F, T, M>
 {
     /// Assert enforces that all configuration values are valid.
     ///

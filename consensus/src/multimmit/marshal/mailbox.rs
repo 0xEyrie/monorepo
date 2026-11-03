@@ -498,6 +498,10 @@ where
     type Activity = Activity<V, H::Digest>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
+        // A possible successor parent cannot authorize canonical history or consume hint slots.
+        if matches!(activity, Activity::ParentPrepared { .. }) {
+            return Feedback::Ok;
+        }
         // A release bounds pruning, so it goes straight to the catalog's coalescing cursor lane
         // rather than the router's lossy hint queue.
         if let Activity::CertificateRecorded {

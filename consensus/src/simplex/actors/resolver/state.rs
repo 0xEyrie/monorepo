@@ -1,6 +1,9 @@
 use crate::{
     Viewable,
-    simplex::types::{Certificate, Notarization},
+    simplex::{
+        phase2::{Mode, Plain},
+        types::{CertificateWith, Notarization},
+    },
     types::{TermLength, View},
 };
 use commonware_cryptography::{Digest, certificate::Scheme};
@@ -41,18 +44,18 @@ pub(crate) enum Effect {
 
 /// Tracks certificates used to construct and repair ancestry through the
 /// current view.
-pub struct State<S: Scheme, D: Digest> {
+pub struct State<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
     /// Highest seen view.
     current_view: View,
     /// Highest certificate used as the construction floor.
-    floor: Option<Certificate<S, D>>,
+    floor: Option<CertificateWith<S, D, M>>,
     /// Highest finalization, retained across floor advances because it settles
     /// every request at or below its view.
-    finalization: Option<Certificate<S, D>>,
+    finalization: Option<CertificateWith<S, D, M>>,
     /// Notarizations pending certification (possible floors).
     notarizations: BTreeMap<View, Notarization<S, D>>,
     /// Nullifications that cover any view greater than the floor.
-    nullifications: BTreeMap<View, Certificate<S, D>>,
+    nullifications: BTreeMap<View, CertificateWith<S, D, M>>,
     /// Lowest anchor that fetch scans still need to consider (see
     /// [Self::fetch_missing]). Anchors below this cursor have already been
     /// requested or are covered by a stored nullification. A floor raise
@@ -63,7 +66,7 @@ pub struct State<S: Scheme, D: Digest> {
     term_length: TermLength,
 }
 
-impl<S: Scheme, D: Digest> State<S, D> {
+impl<S: Scheme, D: Digest, M: Mode<S, D>> State<S, D, M> {
     /// Create a new instance of [State].
     pub const fn new(term_length: TermLength) -> Self {
         Self {
@@ -83,30 +86,30 @@ impl<S: Scheme, D: Digest> State<S, D> {
     }
 
     /// Handle a new certificate and return any effects the resolver actor should apply.
-    pub fn handle(&mut self, certificate: Certificate<S, D>) -> Vec<Effect> {
+    pub fn handle(&mut self, certificate: CertificateWith<S, D, M>) -> Vec<Effect> {
         let cause = certificate.view();
         self.current_view = self.current_view.max(cause);
         let mut effects = Vec::new();
         match certificate {
-            Certificate::Nullification(nullification) => {
+            CertificateWith::Nullification(nullification) => {
                 let view = nullification.view();
                 if covers_above_floor(view, self.term_length, self.floor_view()) {
                     self.nullifications
-                        .insert(view, Certificate::Nullification(nullification));
+                        .insert(view, CertificateWith::Nullification(nullification));
                 }
             }
-            Certificate::Notarization(notarization) => {
+            CertificateWith::Notarization(notarization) => {
                 let view = notarization.view();
                 if view > self.floor_view() {
                     self.notarizations.insert(view, notarization);
                 }
             }
-            Certificate::Finalization(finalization) => {
+            CertificateWith::Finalization(finalization) => {
                 // Retain the proof, not just its view: it may need to be served
                 // while a certified notarization at the same or a higher view
                 // holds the floor.
                 let view = finalization.view();
-                let certificate = Certificate::Finalization(finalization);
+                let certificate = CertificateWith::Finalization(finalization);
                 if self
                     .finalization
                     .as_ref()
@@ -136,7 +139,7 @@ impl<S: Scheme, D: Digest> State<S, D> {
             if let Some(notarization) = self.notarizations.remove(&view)
                 && view > self.floor_view()
             {
-                self.floor = Some(Certificate::Notarization(notarization));
+                self.floor = Some(CertificateWith::Notarization(notarization));
                 effects.push(self.prune());
             }
 
@@ -165,7 +168,7 @@ impl<S: Scheme, D: Digest> State<S, D> {
     /// The retained finalization is preferred at or below its view because it
     /// settles those requests. A higher notarization may be the current floor
     /// without settling a targeted request for older ancestry.
-    pub fn get(&self, view: View) -> Option<&Certificate<S, D>> {
+    pub fn get(&self, view: View) -> Option<&CertificateWith<S, D, M>> {
         if let Some(finalization) = &self.finalization
             && view <= finalization.view()
         {
@@ -184,7 +187,7 @@ impl<S: Scheme, D: Digest> State<S, D> {
 
     /// Returns the highest finalization certificate retained independently of
     /// the construction floor.
-    pub const fn finalization(&self) -> Option<&Certificate<S, D>> {
+    pub const fn finalization(&self) -> Option<&CertificateWith<S, D, M>> {
         self.finalization.as_ref()
     }
 
@@ -192,7 +195,7 @@ impl<S: Scheme, D: Digest> State<S, D> {
     ///
     /// Since a nullification covers the rest of its term, it may be keyed at
     /// an earlier view in `view`'s term.
-    fn covering_nullification(&self, view: View) -> Option<&Certificate<S, D>> {
+    fn covering_nullification(&self, view: View) -> Option<&CertificateWith<S, D, M>> {
         self.nullifications
             .range(view.covering_range(self.term_length))
             .next_back()
@@ -272,7 +275,10 @@ fn covers_above_floor(view: View, term_length: TermLength, floor: View) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{super::test_helpers::*, *};
-    use crate::{simplex::scheme::ed25519, types::Epoch};
+    use crate::{
+        simplex::{scheme::ed25519, types::Certificate},
+        types::Epoch,
+    };
     use commonware_cryptography::{certificate::mocks::Fixture, sha256::Digest as Sha256Digest};
     use commonware_utils::{NZU32, test_rng};
     use std::collections::BTreeSet;

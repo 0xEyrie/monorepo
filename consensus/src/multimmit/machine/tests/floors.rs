@@ -284,7 +284,7 @@ fn lqc_released_by_retirement_keeps_its_leader_parent() {
         .collect::<Vec<_>>();
     let certificate = Artifact::Lqc(lqc(&machine, finalized.clone(), &votes));
     admit(&mut machine, certificate);
-    assert!(machine.views.leader_history::<Sha256>(&finalized).is_ok());
+    assert!(machine.views.leader_history(&finalized).is_ok());
 
     // Leaving view four retires view two, which drops the only live leader extending the parent
     // and releases the queued L-QC in the same pass. The released leader must keep the parent,
@@ -298,7 +298,7 @@ fn lqc_released_by_retirement_keeps_its_leader_parent() {
     assert_eq!(
         machine
             .views
-            .leader_history::<Sha256>(&finalized)
+            .leader_history(&finalized)
             .unwrap()
             .commitment::<Sha256>(),
         history
@@ -329,7 +329,7 @@ fn parent_retirement_preserves_history_for_a_retained_leader() {
     assert_eq!(
         machine
             .views
-            .leader_history::<Sha256>(&leader)
+            .leader_history(&leader)
             .unwrap()
             .commitment::<Sha256>(),
         history
@@ -353,7 +353,7 @@ fn parent_retirement_preserves_history_for_a_retained_leader() {
         machine.views.retire_parents_through(View::new(2), None),
         [parent_id]
     );
-    assert!(machine.views.leader_history::<Sha256>(&leader).is_err());
+    assert!(machine.views.leader_history(&leader).is_err());
     assert_eq!(machine.views.retained_parents(), 1);
     assert!(
         machine

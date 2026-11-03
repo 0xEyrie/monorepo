@@ -85,7 +85,7 @@ mod ingress;
 mod state;
 
 use crate::types::{Epoch, TermLength};
-pub use actor::Actor;
+pub use actor::ActorWith;
 use commonware_cryptography::certificate::Scheme;
 use commonware_p2p::Blocker;
 use commonware_parallel::Strategy;
