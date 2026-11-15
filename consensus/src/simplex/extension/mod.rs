@@ -11,6 +11,7 @@ pub mod report;
 pub mod request;
 pub mod vote;
 
+pub mod agreement;
 pub mod certificate;
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::simplex::actors::batcher::extensions::{

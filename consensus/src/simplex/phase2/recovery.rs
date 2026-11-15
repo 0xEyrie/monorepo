@@ -53,6 +53,9 @@ commonware_macros::stability_scope!(ALPHA {
     /// The voter must synchronize the record before publishing a status or vote.
     #[derive(Clone, Debug, PartialEq)]
     pub enum Record<D:Digest> {
+        /// Unsigned original final subject reserved before invoking the signer.
+        /// Replay treats this as usable authorization even if no signature was published.
+        Reserve(Statement<D>),
         /// Frozen full acceptance before entering a strictly later ballot.
         Promise { proposal:Proposal<D>, domain:D, ballot:Round, accepted:Option<Statement<D>> },
         /// Exact later-ballot subject authorized by a verified status proof.
@@ -60,9 +63,9 @@ commonware_macros::stability_scope!(ALPHA {
         Accept(Statement<D>),
     }
     impl<D:Digest> Record<D> {
-        pub const fn proposal(&self)->&Proposal<D> {match self {Self::Promise{proposal,..}=>proposal,Self::Accept(s)=>&s.proposal}}
-        pub const fn domain(&self)->D {match self {Self::Promise{domain,..}=>*domain,Self::Accept(s)=>s.domain}}
-        pub const fn ballot(&self)->Round {match self {Self::Promise{ballot,..}=>*ballot,Self::Accept(s)=>s.ballot}}
+        pub const fn proposal(&self)->&Proposal<D> {match self {Self::Promise{proposal,..}=>proposal,Self::Accept(s)|Self::Reserve(s)=>&s.proposal}}
+        pub const fn domain(&self)->D {match self {Self::Promise{domain,..}=>*domain,Self::Accept(s)|Self::Reserve(s)=>s.domain}}
+        pub const fn ballot(&self)->Round {match self {Self::Promise{ballot,..}=>*ballot,Self::Accept(s)|Self::Reserve(s)=>s.ballot}}
     }
     impl<D:Digest> Epochable for Record<D> {fn epoch(&self)->Epoch {self.proposal().round.epoch()}}
     impl<D:Digest> Viewable for Record<D> {fn view(&self)->View {self.proposal().round.view()}}
@@ -70,12 +73,13 @@ commonware_macros::stability_scope!(ALPHA {
         fn write(&self,b:&mut impl BufMut) {match self {
             Self::Promise{proposal,domain,ballot,accepted}=>{0u8.write(b);proposal.write(b);domain.write(b);ballot.write(b);accepted.write(b);}
             Self::Accept(s)=>{1u8.write(b);s.write(b);}
+            Self::Reserve(s)=>{2u8.write(b);s.write(b);}
         }}
     }
     impl<D:Digest> EncodeSize for Record<D> {
         fn encode_size(&self)->usize {1+match self {
             Self::Promise{proposal,domain,ballot,accepted}=>proposal.encode_size()+domain.encode_size()+ballot.encode_size()+accepted.encode_size(),
-            Self::Accept(s)=>s.encode_size(),
+            Self::Accept(s)|Self::Reserve(s)=>s.encode_size(),
         }}
     }
     impl<D:Digest> Read for Record<D> {
@@ -83,13 +87,18 @@ commonware_macros::stability_scope!(ALPHA {
         fn read_cfg(b:&mut impl Buf,_:&())->Result<Self,Error> {match u8::read(b)? {
             0=>Ok(Self::Promise{proposal:Proposal::read(b)?,domain:D::read(b)?,ballot:Round::read(b)?,accepted:Option::<Statement<D>>::read(b)?}),
             1=>Ok(Self::Accept(Statement::read(b)?)),
+            2=>Ok(Self::Reserve(Statement::read(b)?)),
             _=>Err(Error::Invalid("simplex recovery record","unknown kind")),
         }}
     }
     #[cfg(feature="arbitrary")]
     impl<'a,D:Digest+for<'b> arbitrary::Arbitrary<'b>> arbitrary::Arbitrary<'a> for Record<D> {
         fn arbitrary(u:&mut arbitrary::Unstructured<'a>)->arbitrary::Result<Self>{
-            Ok(if u.arbitrary()? {Self::Accept(u.arbitrary()?)} else {Self::Promise{proposal:u.arbitrary()?,domain:u.arbitrary()?,ballot:u.arbitrary()?,accepted:u.arbitrary()?}})
+            Ok(match u.int_in_range(0..=2)? {
+                0=>Self::Accept(u.arbitrary()?),
+                1=>Self::Reserve(u.arbitrary()?),
+                _=>Self::Promise{proposal:u.arbitrary()?,domain:u.arbitrary()?,ballot:u.arbitrary()?,accepted:u.arbitrary()?},
+            })
         }
     }
     /// Native round-local replay state. Application callbacks cannot clear it.
@@ -103,10 +112,26 @@ commonware_macros::stability_scope!(ALPHA {
         pub const fn allows_original(&self)->bool {self.promise.is_none()}
         pub fn accepted<'a>(&'a self,original:Option<&'a Statement<D>>)->Option<&'a Statement<D>> {self.accepted.as_ref().or(original)}
         pub const fn promise(&self)->Option<&Record<D>> {self.promise.as_ref()}
+        /// Rechecks the current fence before invoking a synchronized record's signer.
+        /// This does not establish that the record or required bodies were synced.
+        pub fn permits_release(&self,record:&Record<D>)->bool {
+            let Some(promise)=&self.promise else {return false;};
+            match record {
+                Record::Promise{..}=>promise==record,
+                Record::Accept(subject)=>promise.proposal()==&subject.proposal
+                    && promise.domain()==subject.domain && promise.ballot()==subject.ballot
+                    && self.accepted.as_ref()==Some(subject),
+                Record::Reserve(_)=>false,
+            }
+        }
         /// Checks transition consistency. A status proof and native eligibility
         /// remain prerequisites before staging a live acceptance.
         pub fn apply(&mut self, original:Option<&Statement<D>>,record:&Record<D>)->bool {
             let p=record.proposal();let ballot=record.ballot();
+            if let Record::Reserve(s)=record {
+                return ballot==p.round && self.promise.is_none() && self.accepted.is_none()
+                    && original.is_none_or(|old|old==s);
+            }
             if ballot.epoch()!=p.round.epoch() || ballot.view()<=p.round.view() {return false;}
             if let Some(old)=&self.promise {
                 if old.proposal()!=p || old.domain()!=record.domain() || old.ballot()>ballot {return false;}
@@ -123,6 +148,7 @@ commonware_macros::stability_scope!(ALPHA {
                     if let Some(old)=self.accepted(original) && old.ballot==ballot {return old==s;}
                     self.accepted=Some(s.clone());true
                 }
+                Record::Reserve(_)=>unreachable!("original reservation handled above"),
             }
         }
     }

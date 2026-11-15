@@ -313,3 +313,6 @@ mod recovered;
 
 #[path = "extension_voter_state/planning.rs"]
 mod planning;
+
+#[path = "extension_voter_state/native_policy.rs"]
+mod native_policy;

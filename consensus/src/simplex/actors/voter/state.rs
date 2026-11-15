@@ -302,7 +302,23 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
 
     /// Signs an already synchronized recovery decision; the actor owns the durability barrier.
     pub fn sign_recovery(&self, record: &M::Recovery) -> Option<M::RecoveryResponse> {
-        M::sign_recovery(&self.scheme, &self.mode_context, record)
+        let proposal = M::recovery_proposal(record);
+        if proposal.round.epoch() != self.epoch
+            || proposal.view() <= self.last_finalized
+            || !M::recovery_context(&self.mode_context, record)
+        {
+            return None;
+        }
+        let round = self.views.get(&proposal.view())?;
+        if round.proposal() != Some(proposal) {
+            return None;
+        }
+        M::sign_recovery_current(
+            &self.scheme,
+            &self.mode_context,
+            round.recovery_state(),
+            record,
+        )
     }
 
     /// Trusted interpretation context fixed when this epoch state was created.
@@ -867,6 +883,18 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         view: View,
         subject: M::FinalSubject,
     ) -> Option<M::Vote> {
+        let candidate = self.stage_finalize_with(view, subject.clone())?;
+        M::sign_finalize(&self.scheme, candidate, subject)
+    }
+
+    /// Reserves the local final choice without invoking any signing scheme.
+    /// The actor must synchronize an extension reservation before signing it.
+    pub(crate) fn stage_finalize_with(
+        &mut self,
+        view: View,
+        subject: M::FinalSubject,
+    ) -> Option<Proposal<D>> {
+        self.scheme.me()?;
         // We don't need to finalize views that are already finalized.
         if view <= self.last_finalized {
             return None;
@@ -921,15 +949,30 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
                 return None;
             }
         }
-        let candidate = self
-            .views
+        self.views
             .get_mut(&view)?
-            .construct_finalize_with(subject.clone())?
-            .clone();
+            .construct_finalize_with(subject)
+            .cloned()
+    }
 
-        // Signing can only fail if we are a verifier, so we don't need to worry about
-        // unwinding our broadcast toggle.
-        M::sign_finalize(&self.scheme, candidate, subject)
+    /// A replayed reservation may be signed only while no later fence excludes it.
+    pub(crate) fn allows_reserved_finalize(&self, view: View, subject: &M::FinalSubject) -> bool {
+        view > self.last_finalized
+            && self.views.get(&view).is_some_and(|round| {
+                M::allows_original(round.recovery_state()) && round.final_subject() == Some(subject)
+            })
+    }
+
+    /// Signs a staged exact choice after the actor has synchronized its record.
+    pub(crate) fn sign_reserved_finalize(
+        &self,
+        view: View,
+        subject: M::FinalSubject,
+    ) -> Option<M::Vote> {
+        if !self.allows_reserved_finalize(view, &subject) {
+            return None;
+        }
+        M::sign_finalize(&self.scheme, self.proposal(view)?.clone(), subject)
     }
 
     /// Construct a notarization certificate once the round has quorum.

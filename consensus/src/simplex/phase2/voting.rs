@@ -70,10 +70,21 @@ pub trait Voting<S: Scheme, D: Digest>: Mode<S, D> {
         E: commonware_runtime::Clock + rand_core::CryptoRng + commonware_runtime::Metrics,
         L: crate::simplex::elector::Elector<S>,
         S: scheme::Scheme<D>;
-    /// Signs a synchronized decision. Calling this before sync is forbidden.
+    /// Signs a caller-validated synchronized decision. Calling before sync or
+    /// without checking the latest owned recovery fence is forbidden.
     fn sign_recovery(
         scheme: &S,
         context: &Self::Context,
+        record: &Self::Recovery,
+    ) -> Option<Self::RecoveryResponse>
+    where
+        S: scheme::Scheme<D>;
+    /// Rechecks the latest owned recovery state before invoking the signer.
+    /// The actor must first synchronize the record and its required material.
+    fn sign_recovery_current(
+        scheme: &S,
+        context: &Self::Context,
+        state: &Self::RecoveryState,
         record: &Self::Recovery,
     ) -> Option<Self::RecoveryResponse>
     where
@@ -101,6 +112,11 @@ pub trait Voting<S: Scheme, D: Digest>: Mode<S, D> {
     fn final_subject(vote: &Self::Vote) -> Self::FinalSubject;
     /// Exact subject authenticated by a final certificate.
     fn finalization_subject(certificate: &Self::Certificate) -> Self::FinalSubject;
+    /// Unsigned original authorization to synchronize before invoking a signer.
+    /// Stock Simplex has no extension reservation record.
+    fn reserve_finalize(subject: &Self::FinalSubject) -> Option<Self::Recovery>;
+    /// Original subject retained by an unsigned durable reservation, if any.
+    fn reserved_subject(record: &Self::Recovery) -> Option<Self::FinalSubject>;
     /// Signs the caller-authorized subject. The caller journals before publishing.
     fn sign_finalize(
         scheme: &S,
@@ -171,6 +187,17 @@ impl<S: Scheme, D: Digest> Voting<S, D> for Plain {
     {
         match *record {}
     }
+    fn sign_recovery_current(
+        _: &S,
+        _: &(),
+        _: &(),
+        record: &Self::Recovery,
+    ) -> Option<Self::RecoveryResponse>
+    where
+        S: scheme::Scheme<D>,
+    {
+        match *record {}
+    }
     type FinalSubject = ();
     fn matches_context(_: &(), _: &()) -> bool {
         true
@@ -195,6 +222,12 @@ impl<S: Scheme, D: Digest> Voting<S, D> for Plain {
     }
     fn final_subject(_: &Self::Vote) {}
     fn finalization_subject(_: &Self::Certificate) {}
+    fn reserve_finalize(_: &()) -> Option<Self::Recovery> {
+        None
+    }
+    fn reserved_subject(record: &Self::Recovery) -> Option<()> {
+        match *record {}
+    }
     fn sign_finalize(scheme: &S, proposal: Proposal<D>, _: ()) -> Option<Self::Vote>
     where
         S: scheme::Scheme<D>,
@@ -243,6 +276,10 @@ commonware_macros::stability_scope!(ALPHA {
         where E:commonware_runtime::Clock+rand_core::CryptoRng+commonware_runtime::Metrics,L:crate::simplex::elector::Elector<S>,S:scheme::Scheme<D>{
             state.prepare_recovery_request(query,evidence).ok()
         }
+        fn sign_recovery_current(scheme:&S,context:&Self::Context,state:&Self::RecoveryState,record:&Self::Recovery)->Option<Self::RecoveryResponse> where S:scheme::Scheme<D> {
+            if context.domain!=record.domain() || !state.permits_release(record) {return None;}
+            <Self as Voting<S,D>>::sign_recovery(scheme,context,record)
+        }
         fn sign_recovery(scheme:&S,context:&Self::Context,record:&Self::Recovery)->Option<Self::RecoveryResponse> where S:scheme::Scheme<D> {
             use crate::simplex::extension::{recovery::{Promise,Status},request::Response,vote::Vote};
             match record {
@@ -251,6 +288,7 @@ commonware_macros::stability_scope!(ALPHA {
                     accepted:accepted.clone(),
                 }),
                 super::recovery::Record::Accept(subject)=>Vote::sign(scheme,subject.clone()).map(Response::Vote),
+                super::recovery::Record::Reserve(_)=>None,
             }
         }
         type FinalSubject=crate::simplex::extension::vote::Statement<D>;
@@ -278,6 +316,8 @@ commonware_macros::stability_scope!(ALPHA {
         fn same_interpretation(a:&Self::FinalSubject,b:&Self::FinalSubject)->bool {a.proposal==b.proposal && a.domain==b.domain && a.parent==b.parent && a.extension==b.extension}
         fn final_subject(vote:&Self::Vote)->Self::FinalSubject {vote.vote().statement.clone()}
         fn finalization_subject(certificate:&Self::Certificate)->Self::FinalSubject {certificate.certificate().statement.clone()}
+        fn reserve_finalize(subject:&Self::FinalSubject)->Option<Self::Recovery> {Some(super::recovery::Record::Reserve(subject.clone()))}
+        fn reserved_subject(record:&Self::Recovery)->Option<Self::FinalSubject> {match record {super::recovery::Record::Reserve(subject)=>Some(subject.clone()),_=>None}}
         fn sign_finalize(scheme:&S,proposal:Proposal<D>,subject:Self::FinalSubject)->Option<Self::Vote>
         where S:scheme::Scheme<D> {
             if !<Self as Voting<S,D>>::matches_subject(&proposal,&subject) {return None;}

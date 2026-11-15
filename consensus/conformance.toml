@@ -541,3 +541,15 @@ hash = "3a48d6e3d01e5b5a9ff7cf7da9f9f0a084f562d16a7967e88ee980ae453672d2"
 ["extension_request::conformance::CodecConformance<RecoveryResponse>"]
 n_cases = 1024
 hash = "1d9daea4c35b15d90150925395cdb42e552bd4001c468a907429c06e4936bc95"
+
+["extension_agreement::AgreementEvidenceConformance"]
+n_cases = 32
+hash = "f53526186f4f796c83e94963d2369dbaab93707981d7d7e4b7136057f5f882dc"
+
+["extension_agreement::issuance::IssuanceConformance"]
+n_cases = 32
+hash = "77379abffefcbd232b3c3df8ffbfe8196cffa038591170e653d6a6bffd9da154"
+
+["extension_agreement::recovery::RecoveryEvidenceConformance"]
+n_cases = 32
+hash = "f8c3151bd12b89fc491370164b68f06ceafa4f2f6b8f0e8b43fa7bd21c872f04"

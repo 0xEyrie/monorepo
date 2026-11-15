@@ -799,6 +799,12 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
         {
             return false;
         }
+        if let Some(subject) = M::reserved_subject(record)
+            && (self.decision.is_nullify()
+                || !M::matches_subject(M::recovery_proposal(record), &subject))
+        {
+            return false;
+        }
         let original = match &self.decision {
             Decision::Finalize(s) => Some(s),
             _ => None,
@@ -814,6 +820,17 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
                     self.stage_recovery(record),
                     "invalid recovery fence transition"
                 );
+                if let Some(subject) = M::reserved_subject(record) {
+                    assert!(
+                        !self.decision.is_nullify(),
+                        "replayed reservation conflicts with local nullify"
+                    );
+                    assert!(
+                        M::matches_subject(M::recovery_proposal(record), &subject),
+                        "replayed reservation has an invalid original subject"
+                    );
+                    self.decision = Decision::Finalize(subject);
+                }
             }
             ArtifactWith::Notarize(notarize) => {
                 assert!(

@@ -127,6 +127,14 @@ impl<'a, D: Digest> CertificateSubject for Subject<'a, D> {
                 commonware_stability_RESERVED
             )))]
             Self::ExtensionRequest { .. } => &derived.finalize,
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Self::ExtensionAgreement { .. } => &derived.finalize,
         }
     }
 
@@ -167,6 +175,16 @@ impl<'a, D: Digest> CertificateSubject for Subject<'a, D> {
             )))]
             Self::ExtensionRequest { payload, .. } => {
                 Bytes::from([crate::simplex::extension::request::SIGNING_TAG, *payload].concat())
+            }
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Self::ExtensionAgreement { payload, .. } => {
+                Bytes::from([crate::simplex::extension::agreement::SIGNING_TAG, *payload].concat())
             }
         }
     }

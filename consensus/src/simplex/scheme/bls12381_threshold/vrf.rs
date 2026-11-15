@@ -617,7 +617,9 @@ fn seed_message_from_subject<D: Digest>(subject: &Subject<'_, D>) -> bytes::Byte
             commonware_stability_EPSILON,
             commonware_stability_RESERVED
         )))]
-        Subject::ExtensionRequest { round, .. } => round.encode(),
+        Subject::ExtensionRequest { round, .. } | Subject::ExtensionAgreement { round, .. } => {
+            round.encode()
+        }
     }
 }
 

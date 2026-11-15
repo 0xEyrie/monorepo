@@ -694,7 +694,21 @@ impl<
         let Some(subject) = self.participation.final_subject(proposal) else {
             return (self, None);
         };
-        let Some(finalize) = self.state.construct_finalize_with(view, subject) else {
+        if self
+            .state
+            .stage_finalize_with(view, subject.clone())
+            .is_none()
+        {
+            return (self, None);
+        }
+
+        if let Some(reservation) = M::reserve_finalize(&subject) {
+            self = self
+                .append_journal(ArtifactWith::Recovery(reservation))
+                .await;
+            self = self.sync_journal().await;
+        }
+        let Some(finalize) = self.state.sign_reserved_finalize(view, subject) else {
             return (self, None);
         };
 
@@ -1212,6 +1226,7 @@ impl<
         // remain in the OS page cache.
         let replayed;
         let mut replay_votes = BTreeMap::new();
+        let mut replay_reservations = BTreeMap::new();
         (self, replayed) = async {
             let mut replay = journal
                 .replay(0, 0, self.replay_buffer, ReadOptions::DONT_CACHE)
@@ -1246,13 +1261,20 @@ impl<
                 // State replay has already checked that these are our own votes.
                 if M::RETAIN_INTERPRETATION {
                     match &artifact {
+                        ArtifactWith::Recovery(record) => {
+                            if let Some(subject) = M::reserved_subject(record) {
+                                replay_reservations.insert(artifact.view(), subject);
+                            }
+                        }
                         ArtifactWith::Notarize(vote) => {
                             replay_votes.insert((vote.view(), 0), VoteWith::Notarize(vote.clone()));
                         }
                         ArtifactWith::Finalize(vote) => {
+                            replay_reservations.remove(&vote.view());
                             replay_votes.insert((vote.view(), 1), VoteWith::Finalize(vote.clone()));
                         }
                         ArtifactWith::Finalization(certificate) => {
+                            replay_reservations.retain(|view, _| *view > certificate.view());
                             replay_votes.retain(|(view, _), _| *view > certificate.view());
                         }
                         _ => {}
@@ -1317,6 +1339,24 @@ impl<
         .instrument(info_span!(parent: &start_span, "simplex.voter.replay", epoch = epoch.traced()))
         .await;
         self.journal = Some(replayed);
+
+        // Restore signing permission only after the entire durable history has
+        // been replayed. Later promises may have fenced an unfinished reservation.
+        for (view, subject) in replay_reservations {
+            if !self.state.allows_reserved_finalize(view, &subject) {
+                continue;
+            }
+            let vote = self
+                .state
+                .sign_reserved_finalize(view, subject)
+                .expect("reserved signer unavailable");
+            self = self
+                .append_journal(ArtifactWith::Finalize(vote.clone()))
+                .await;
+            self = self.sync_journal().await;
+            replay_votes.insert((view, 1), VoteWith::Finalize(vote));
+        }
+        self = self.sync_journal().await;
 
         // Log current view after recovery
         let end = self.context.current();

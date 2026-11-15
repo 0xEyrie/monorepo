@@ -146,6 +146,15 @@ pub enum Subject<'a, D: Digest> {
         commonware_stability_RESERVED
     )))]
     ExtensionRequest { round: Round, payload: &'a [u8] },
+    /// ALPHA: versioned exact-value agreement, distinct from legacy recovery.
+    #[cfg(not(any(
+        commonware_stability_BETA,
+        commonware_stability_GAMMA,
+        commonware_stability_DELTA,
+        commonware_stability_EPSILON,
+        commonware_stability_RESERVED
+    )))]
+    ExtensionAgreement { round: Round, payload: &'a [u8] },
 }
 
 impl<D: Digest> Viewable for Subject<'_, D> {
@@ -178,6 +187,14 @@ impl<D: Digest> Viewable for Subject<'_, D> {
                 commonware_stability_RESERVED
             )))]
             Subject::ExtensionRequest { round, .. } => round.view(),
+            #[cfg(not(any(
+                commonware_stability_BETA,
+                commonware_stability_GAMMA,
+                commonware_stability_DELTA,
+                commonware_stability_EPSILON,
+                commonware_stability_RESERVED
+            )))]
+            Subject::ExtensionAgreement { round, .. } => round.view(),
         }
     }
 }

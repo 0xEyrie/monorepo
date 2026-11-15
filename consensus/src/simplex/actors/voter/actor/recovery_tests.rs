@@ -555,6 +555,7 @@ async fn inspect(context: deterministic::Context, cache: CacheRef, f: &Fixture<S
             match record {
                 crate::simplex::phase2::recovery::Record::Promise { .. } => promises += 1,
                 crate::simplex::phase2::recovery::Record::Accept(_) => accepts += 1,
+                crate::simplex::phase2::recovery::Record::Reserve(_) => {}
             }
         }
     }

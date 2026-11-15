@@ -59,6 +59,68 @@ fn proof(
             .collect(),
     }
 }
+
+#[test]
+fn unsigned_original_reservation_replay_fences_conflicting_final_votes() {
+    deterministic::Runner::default().start(|context| async move {
+        let f = fixture();
+        let original = original(0);
+        let reservation = A::Recovery(Record::Reserve(original.clone()));
+        let encoded = reservation.encode();
+        assert_eq!(
+            A::decode_cfg(encoded.clone(), &f.verifier.certificate_codec_config())
+                .unwrap()
+                .encode(),
+            encoded
+        );
+        for end in 0..encoded.len() {
+            assert!(
+                A::decode_cfg(encoded.slice(..end), &f.verifier.certificate_codec_config())
+                    .is_err()
+            );
+        }
+        let mut state = ready(context.child("restored"), &f, 0);
+        state.replay(&reservation);
+        state.replay(&reservation);
+        assert!(
+            state
+                .construct_finalize_with(View::new(1), original.clone())
+                .is_none()
+        );
+        let mut other = original.clone();
+        other.extension = Digest::from([17; 32]);
+        assert!(state.construct_finalize_with(View::new(1), other).is_none());
+        state
+            .construct_recovery_promise(View::new(1), ballot(2))
+            .unwrap();
+        assert_eq!(
+            state.recovery_promise(View::new(1)).unwrap().accepted,
+            Some((ballot(1), original.value::<Sha256>()))
+        );
+        assert_eq!(state.last_finalized(), View::zero());
+    });
+}
+
+#[test]
+fn unsigned_original_reservation_cannot_bypass_a_later_recovery_floor() {
+    deterministic::Runner::default().start(|context| async move {
+        let f = fixture();
+        let mut state = ready(context.child("restored"), &f, 0);
+        state
+            .construct_recovery_promise(View::new(1), ballot(2))
+            .unwrap();
+        let record = Record::Reserve(original(0));
+        let mut fence = commonware_consensus::simplex::phase2::recovery::State::EMPTY;
+        let promise = Record::Promise {
+            proposal: original(0).proposal,
+            domain: original(0).domain,
+            ballot: ballot(2),
+            accepted: None,
+        };
+        assert!(fence.apply(None, &promise));
+        assert!(!fence.apply(None, &record));
+    });
+}
 #[test]
 fn native_state_fences_original_and_conflicting_later_votes_without_granting_finality() {
     deterministic::Runner::default().start(|context| async move {
@@ -143,6 +205,77 @@ fn native_state_fences_original_and_conflicting_later_votes_without_granting_fin
             s.construct_finalize_with(View::new(1), original(0))
                 .is_none()
         );
+    });
+}
+
+#[test]
+fn recovery_release_rechecks_the_retained_choice_and_current_floor() {
+    deterministic::Runner::default().start(|context| async move {
+        let f = fixture();
+        let mut s = ready(context.child("voter"), &f, 5);
+        let prior = original(5);
+        let unstaged = Record::Promise {
+            proposal: prior.proposal.clone(),
+            domain: prior.domain,
+            ballot: ballot(2),
+            accepted: None,
+        };
+        assert!(s.sign_recovery(&unstaged).is_none());
+        s.construct_finalize_with(View::new(1), prior).unwrap();
+        let A::Recovery(promise) = s
+            .construct_recovery_promise(View::new(1), ballot(2))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(s.sign_recovery(&promise).is_some());
+        assert!(s.sign_recovery(&unstaged).is_none());
+        let mut x = original(0);
+        x.ballot = ballot(2);
+        let acceptance = Record::Accept(x.clone());
+        assert!(s.sign_recovery(&acceptance).is_none());
+        let checked = proof(&f, &x, 0..5);
+        s.construct_recovery_accept(x, &checked, &Sequential)
+            .unwrap();
+        assert!(s.sign_recovery(&acceptance).is_some());
+        // The original same-ballot snapshot stays signable after own acceptance.
+        assert!(s.sign_recovery(&promise).is_some());
+        s.add_notarization(notarization(&f, 2));
+        s.certified(View::new(2), true).unwrap();
+        let A::Recovery(later) = s
+            .construct_recovery_promise(View::new(1), ballot(3))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(s.sign_recovery(&later).is_some());
+        assert!(s.sign_recovery(&promise).is_none());
+        assert!(s.sign_recovery(&acceptance).is_none());
+        assert_eq!(s.last_finalized(), View::zero());
+    });
+}
+
+#[test]
+fn native_finality_stops_new_recovery_signatures() {
+    deterministic::Runner::default().start(|context| async move {
+        let f = fixture();
+        let mut s = ready(context.child("voter"), &f, 5);
+        let A::Recovery(promise) = s
+            .construct_recovery_promise(View::new(1), ballot(2))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(s.sign_recovery(&promise).is_some());
+        let mut foreign = promise.clone();
+        let Record::Promise { domain, .. } = &mut foreign else {
+            unreachable!()
+        };
+        *domain = Digest::from([99; 32]);
+        assert!(s.sign_recovery(&foreign).is_none());
+        assert!(s.add_finalization(certificate(&f, original(0))).0);
+        assert_eq!(s.last_finalized(), View::new(1));
+        assert!(s.sign_recovery(&promise).is_none());
     });
 }
 #[test]

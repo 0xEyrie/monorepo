@@ -45,6 +45,9 @@ type ExtActivity = ActivityWith<S, D, Extended>;
 #[path = "startup_tests.rs"]
 mod startup_tests;
 
+#[path = "reservation_tests.rs"]
+mod reservation_tests;
+
 #[path = "ancestry_tests.rs"]
 mod ancestry_tests;
 
