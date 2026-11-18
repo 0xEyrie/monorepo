@@ -1463,6 +1463,56 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
         }
         Ok(record)
     }
+    fn route_first<H: Hasher<Digest = D>>(
+        &self,
+        row: First<D>,
+        validate: impl FnOnce(&First<D>) -> bool,
+    ) -> Result<Record<D>, Error> {
+        if row.core == self.core.id::<H>()
+            || row.owner != self.owner
+            || row.input != self.input
+            || row.preference.is_some()
+        {
+            return Err(Error::Context);
+        }
+        let subject = First::route_slot::<H>(&self.core.slot, row.core, self.input);
+        row.check(self.limits)?;
+        if !validate(&row) {
+            return Err(super::Error::Policy.into());
+        }
+        let mut message = self.message::<H>(Kind::First(row));
+        message.slot = subject;
+        message.check(
+            super::Committee::new(self.context.scheme().participants().len())?,
+            self.limits,
+        )?;
+        let record = self.record(Action::Reserve {
+            message,
+            authority: None,
+        });
+        if let Some(old) = self.old(Step::First) {
+            return if *old == record {
+                Ok(old.clone())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        self.normal()?;
+        Ok(record)
+    }
+
+    /// Shares the same durable FIRST reservation and fence as the native
+    /// fixed-cohort capture. No independent signing role is introduced.
+    pub(crate) fn reserve_route_first<H: Hasher<Digest = D>>(
+        &mut self,
+        row: First<D>,
+        validate: impl FnOnce(&First<D>) -> bool,
+    ) -> Result<Record<D>, Error> {
+        self.active()?;
+        let r = self.route_first::<H>(row, validate)?;
+        Ok(self.commit::<H>(r))
+    }
+
     /// Freezes both independently ready fields. Never waits for optional preparation.
     pub fn reserve_first<H: Hasher<Digest = D>>(
         &mut self,
@@ -1495,7 +1545,14 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
         let record = self.no_first()?;
         Ok(self.commit::<H>(record))
     }
-    fn own_first(&self, body: &OriginBody<S, D>) -> Result<(), Error> {
+    fn own_first<H: Hasher<Digest = D>>(&self, body: &OriginBody<S, D>) -> Result<(), Error> {
+        if self
+            .old(Step::First)
+            .and_then(Record::message)
+            .is_some_and(|message| message.slot != self.core.slot.id::<H>())
+        {
+            return Err(Error::Authority);
+        }
         if !self.in_core() {
             return Ok(());
         }
@@ -1544,7 +1601,7 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
             };
         }
         self.normal()?;
-        self.own_first(body)?;
+        self.own_first::<H>(body)?;
         Ok(self.record(Action::Reserve {
             message: self.message::<H>(Kind::Select {
                 body: checked.body(),
@@ -1596,7 +1653,7 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
             };
         }
         self.normal()?;
-        self.own_first(&origin.body)?;
+        self.own_first::<H>(&origin.body)?;
         if self.owner == self.core.leader
             && self.old(Step::Select).and_then(Record::message) != Some(&origin.selection.message)
         {
@@ -2181,7 +2238,13 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
                         ..
                     },
                 ..
-            } => self.first::<H>(row.report.clone(), row.preference.clone(), validate_row)?,
+            } => {
+                if row.core == self.core.id::<H>() {
+                    self.first::<H>(row.report.clone(), row.preference.clone(), validate_row)?
+                } else {
+                    self.route_first::<H>(row.clone(), validate_row)?
+                }
+            }
             Action::Reserve {
                 message:
                     Message {

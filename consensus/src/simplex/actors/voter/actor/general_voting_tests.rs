@@ -187,6 +187,7 @@ fn run(n: u32, role: u8, normal: bool, records: usize) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Retry {
+    RouteFirst,
     None,
     Select,
     InitialHistory,
@@ -283,7 +284,17 @@ fn run_case(
             native
         };
         let preference = (role == 1).then(|| Bytes::from_static(EMPTY_ORDER));
-        let captured = FirstInput::new::<Sha256, _>(
+        let routed = retry == Retry::RouteFirst;
+        let captured = if routed {
+            let scope = D([75;32]);
+            let row = g::First { core:scope,input:INPUT,owner:Participant::new(owner as u32),
+                report: (role != 1).then(|| Bytes::from_static(b"prepared")), preference:None };
+            let message = g::Message {
+                slot:g::First::route_slot::<Sha256>(&slot,scope,INPUT),round:slot.proposal.round,
+                leader,kind:g::Kind::First(row.clone())
+            };
+            FirstInput::from_route::<Sha256,_>(&scheme,slot,&native,INPUT,message,LIMITS,|r|r==&row)
+        } else { FirstInput::new::<Sha256, _>(
             &scheme,
             slot,
             &native,
@@ -292,8 +303,7 @@ fn run_case(
             preference,
             LIMITS,
             |row| row_policy(&core, row),
-        )
-        .unwrap();
+        ) }.unwrap();
         let bootstrap = if foreign {
             let other = (0..n as usize)
                 .find(|&i| {
@@ -343,7 +353,13 @@ fn run_case(
                 first.native().attestation.signer,
                 Participant::new(owner as u32)
             );
-            assert_eq!(first.first().is_some(), role != 2);
+            assert_eq!(first.first().is_some(), routed || role != 2);
+            if routed {
+                let signed=first.first().unwrap();
+                let g::Kind::First(row)=&signed.message.kind else { panic!("expected route") };
+                assert_eq!(row,bootstrap.row().unwrap());
+                assert_eq!(signed.message.slot,g::First::route_slot::<Sha256>(&core.slot,row.core,INPUT));
+            }
             let (next, duplicate) = Box::pin(actor.prepare_notarize(View::new(1))).await;
             actor = next;
             assert!(duplicate.is_none());
@@ -804,6 +820,12 @@ fn run_case(
             fresh.state.replay(&row);
         }
         fresh.state.finish_notarize_replay();
+        if routed {
+            let original=first.as_ref().unwrap();
+            assert!(<G as crate::simplex::phase2::voting::Voting<S,D>>::replay_notarize_vote(fresh.state.retained_round(View::new(1)).unwrap().recovery_state(),original));
+            let stripped=FirstVote::new(original.native().clone(),None);
+            assert!(!<G as crate::simplex::phase2::voting::Voting<S,D>>::replay_notarize_vote(fresh.state.retained_round(View::new(1)).unwrap().recovery_state(),&stripped));
+        }
         if let Some(signed) = history {
             let record = history_record.expect("durable history was missing");
             let (replayed, receipt) = fresh.state.sign_recovery(&record).expect("restored history outbox");
@@ -855,6 +877,13 @@ fn run_case(
             usize::from(first_enabled)
         );
     });
+}
+
+#[test]
+fn general_route_first_journals_every_role_and_replays_the_original_vote() {
+    for role in [0, 1, 2] {
+        run_case(7, role, false, 16, true, false, Retry::RouteFirst);
+    }
 }
 
 #[test]

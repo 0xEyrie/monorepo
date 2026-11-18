@@ -674,6 +674,17 @@ pub struct First<D: Digest> {
     pub preference: Option<Bytes>,
 }
 impl<D: Digest> First<D> {
+    /// Distinct signed domain for a route-only original, binding both the
+    /// logical application scope and this attempt's exact native proposal.
+    pub fn route_slot<H: Hasher<Digest = D>>(slot: &Slot<D>, scope: D, input: D) -> D {
+        H::hash(&[
+            b"_COMMONWARE_CONSENSUS_GENERAL_ROUTE_FIRST_V1",
+            &scope.encode(),
+            &slot.id::<H>().encode(),
+            &input.encode(),
+        ])
+    }
+
     fn check(&self, l: Limits) -> Result<(), Error> {
         if usize::from(self.owner) >= 64
             || self

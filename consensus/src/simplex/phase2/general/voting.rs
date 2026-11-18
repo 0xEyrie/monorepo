@@ -46,6 +46,7 @@ pub struct FirstInput<D: Digest> {
     input: D,
     owner: Participant,
     row: Option<g::First<D>>,
+    route_scope: Option<D>,
     limits: g::Limits,
     id: D,
     bytes: usize,
@@ -64,21 +65,7 @@ impl<D: Digest> FirstInput<D> {
         limits: g::Limits,
         validate: impl FnOnce(&g::First<D>) -> bool,
     ) -> Result<Self, g::Error> {
-        let owner = scheme.me().ok_or(g::Error::Identity)?;
-        let leader = scheme
-            .participants()
-            .iter()
-            .position(|k| k == &native.leader)
-            .ok_or(g::Error::Identity)?;
-        let core = g::Core::derive::<H, S>(
-            scheme,
-            slot,
-            Participant::new(u32::try_from(leader).map_err(|_| g::Error::Identity)?),
-        )?;
-        limits.validate::<S, D>(&core)?;
-        if !native_matches::<H, S, D>(&core, scheme, &core.slot.proposal, native) {
-            return Err(g::Error::Context);
-        }
+        let (core, owner) = Self::context::<H, S>(scheme, slot, native, limits)?;
         if report
             .as_ref()
             .is_some_and(|b| b.len() > limits.report_bytes)
@@ -102,9 +89,98 @@ impl<D: Digest> FirstInput<D> {
         if row.as_ref().is_some_and(|r| !validate(r)) {
             return Err(g::Error::Policy);
         }
+        Ok(Self::capture::<H>(core, input, owner, row, limits, None))
+    }
+
+    /// Register an application-reserved logical FIRST for any validator,
+    /// including a signed absence. The native owner checks the current leader,
+    /// proposal and signer independently and journals the exact choice before signing.
+    pub fn from_route<H: Hasher<Digest = D>, S: scheme::Scheme<D>>(
+        scheme: &S,
+        slot: g::Slot<D>,
+        native: &NativeContext<D, S::PublicKey>,
+        input: D,
+        message: g::Message<D>,
+        limits: g::Limits,
+        validate: impl FnOnce(&g::First<D>) -> bool,
+    ) -> Result<Self, g::Error> {
+        let (core, owner) = Self::context::<H, S>(scheme, slot, native, limits)?;
+        if message.encode_size() > g::MAX_FIRST_BYTES {
+            return Err(g::Error::Limit);
+        }
+        let g::Kind::First(mut row) = message.kind else {
+            return Err(g::Error::Context);
+        };
+        let scope = row.core;
+        if scope == core.id::<H>()
+            || message.round != core.slot.proposal.round
+            || message.leader != core.leader
+            || row.input != input
+            || row.owner != owner
+            || row.preference.is_some()
+            || message.slot != g::First::route_slot::<H>(&core.slot, scope, input)
+        {
+            return Err(g::Error::Context);
+        }
+        if row
+            .report
+            .as_ref()
+            .is_some_and(|b| b.len() > limits.report_bytes)
+        {
+            return Err(g::Error::Limit);
+        }
+        if !validate(&row) {
+            return Err(g::Error::Policy);
+        }
+        row.report = row.report.map(|bytes| Bytes::copy_from_slice(&bytes));
+        Ok(Self::capture::<H>(
+            core,
+            input,
+            owner,
+            Some(row),
+            limits,
+            Some(scope),
+        ))
+    }
+
+    fn context<H: Hasher<Digest = D>, S: scheme::Scheme<D>>(
+        scheme: &S,
+        slot: g::Slot<D>,
+        native: &NativeContext<D, S::PublicKey>,
+        limits: g::Limits,
+    ) -> Result<(g::Core<D>, Participant), g::Error> {
+        let owner = scheme.me().ok_or(g::Error::Identity)?;
+        let leader = scheme
+            .participants()
+            .iter()
+            .position(|k| k == &native.leader)
+            .ok_or(g::Error::Identity)?;
+        let core = g::Core::derive::<H, S>(
+            scheme,
+            slot,
+            Participant::new(u32::try_from(leader).map_err(|_| g::Error::Identity)?),
+        )?;
+        limits.validate::<S, D>(&core)?;
+        if !native_matches::<H, S, D>(&core, scheme, &core.slot.proposal, native) {
+            return Err(g::Error::Context);
+        }
+        Ok((core, owner))
+    }
+
+    fn capture<H: Hasher<Digest = D>>(
+        core: g::Core<D>,
+        input: D,
+        owner: Participant,
+        row: Option<g::First<D>>,
+        limits: g::Limits,
+        route_scope: Option<D>,
+    ) -> Self {
         let captured = match &row {
             Some(r) => g::Message {
-                slot: core.slot.id::<H>(),
+                slot: route_scope.map_or_else(
+                    || core.slot.id::<H>(),
+                    |scope| g::First::route_slot::<H>(&core.slot, scope, input),
+                ),
                 round: core.slot.proposal.round,
                 leader: core.leader,
                 kind: g::Kind::First(r.clone()),
@@ -121,15 +197,16 @@ impl<D: Digest> FirstInput<D> {
             &[u8::from(row.is_some())],
             &captured,
         ]);
-        Ok(Self {
+        Self {
             core,
             input,
             owner,
             row,
+            route_scope,
             limits,
             id,
             bytes,
-        })
+        }
     }
     /// Cohort derived from the supplied actual native leader and roster.
     pub const fn core(&self) -> &g::Core<D> {
@@ -348,6 +425,7 @@ pub enum HistoryMaterial<S: commonware_cryptography::certificate::Scheme, D: Dig
 
 #[derive(Clone)]
 struct Bootstrap<D: Digest> {
+    route_scope: Option<D>,
     core: g::Core<D>,
     input: D,
     owner: Participant,
@@ -503,7 +581,11 @@ where
             return Ok(());
         }
         if let Some(old) = i.slots.get(&slot) {
-            if old.core != input.core || old.input != input.input || old.owner != input.owner {
+            if old.core != input.core
+                || old.input != input.input
+                || old.owner != input.owner
+                || old.route_scope != input.route_scope
+            {
                 return Err(g::Error::Context);
             }
         } else if i.slots.len() >= self.resources.slots {
@@ -517,6 +599,7 @@ where
                 .push(slot);
         }
         i.slots.entry(slot).or_insert_with(|| Bootstrap {
+            route_scope: input.route_scope,
             core: input.core.clone(),
             input: input.input,
             owner: input.owner,
@@ -559,7 +642,10 @@ where
             g::OriginBody::decode_cfg(body.encode(), &self.limits).map_err(|_| g::Error::Limit)?;
         let mut i = self.index.lock();
         let bootstrap = i.slots.get(&checked.slot()).ok_or(g::Error::Context)?;
-        if bootstrap.core != body.core || bootstrap.input != body.decision.input {
+        if bootstrap.route_scope.is_some()
+            || bootstrap.core != body.core
+            || bootstrap.input != body.decision.input
+        {
             return Err(g::Error::Context);
         }
         if let Some(old) = i.bodies.get(&checked.body()) {
@@ -589,7 +675,7 @@ where
             .slots
             .get(&assembly.core().slot.id::<H>())
             .ok_or(g::Error::Context)?;
-        if b.core != *assembly.core() || b.input != assembly.input() {
+        if b.route_scope.is_some() || b.core != *assembly.core() || b.input != assembly.input() {
             return Err(g::Error::Context);
         }
         if i.origins.contains_key(&id) {
@@ -893,6 +979,9 @@ where
         let l = state.slots.get_mut(&id)?;
         room(c, l, usize::from(l.first.is_none()));
         let record = match &input.row {
+            Some(row) if input.route_scope.is_some() => l
+                .ledger
+                .reserve_route_first::<H>(row.clone(), |r| input.accepts(r)),
             Some(row) => {
                 l.ledger
                     .reserve_first::<H>(row.report.clone(), row.preference.clone(), |r| {

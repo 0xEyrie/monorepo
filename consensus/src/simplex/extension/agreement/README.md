@@ -136,6 +136,13 @@ a token created by another context grants no signing authority. Restore retained
 choices and publication records before allowing additional signing. A storage
 failure requires reopening the affected owner.
 
+An application can supply a durably captured route, including explicit absence,
+through `FirstInput::from_route` for any validator. The voter binds the route
+scope and input to the native slot, reserves the same FIRST journal step used
+by fixed-Core voting, and releases the route with its original Notarize vote.
+Replay checks the same pair. This input alone grants no fixed-Core selection
+or final-vote authority.
+
 The voting adapters retain exact native/application pairs. Marshal verifies the
 mode-specific companion at fetched-finalization and explicit-floor admission.
 Application delivery must additionally retain the exact interpretation and
