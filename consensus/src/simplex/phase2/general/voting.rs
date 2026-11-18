@@ -23,6 +23,7 @@ use rand_core::CryptoRng;
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     sync::Arc,
+    time::{Duration, SystemTime},
 };
 
 /// Explicit native-adapter retention budgets. Exhaustion retires the owner;
@@ -280,6 +281,7 @@ struct Bootstrap<D: Digest> {
 }
 struct Index<S: scheme::Scheme<D>, D: Digest> {
     slots: BTreeMap<D, Bootstrap<D>>,
+    slots_by_view: BTreeMap<View, Vec<D>>,
     firsts: BTreeMap<D, FirstInput<D>>,
     bodies: BTreeMap<D, Arc<Selection<S, D>>>,
     origins: BTreeMap<D, g::normal::Assembly<S, D>>,
@@ -339,6 +341,7 @@ where
             resources,
             index: Arc::new(Mutex::new(Index {
                 slots: BTreeMap::new(),
+                slots_by_view: BTreeMap::new(),
                 firsts: BTreeMap::new(),
                 bodies: BTreeMap::new(),
                 origins: BTreeMap::new(),
@@ -391,6 +394,12 @@ where
             return Err(g::Error::Limit);
         }
         let used = self.capacity(&i, input.bytes)?;
+        if !i.slots.contains_key(&slot) {
+            i.slots_by_view
+                .entry(input.core.slot.proposal.view())
+                .or_default()
+                .push(slot);
+        }
         i.slots.entry(slot).or_insert_with(|| Bootstrap {
             core: input.core.clone(),
             input: input.input,
@@ -549,11 +558,60 @@ struct SlotLedger<S: scheme::Scheme<D>, D: Digest> {
 /// The sole round-owned collection of actual issuance ledgers, one per exact Slot.
 pub struct RecoveryState<S: scheme::Scheme<D>, D: Digest> {
     slots: BTreeMap<D, SlotLedger<S, D>>,
+    observed: BTreeMap<D, SystemTime>,
 }
 impl<S: scheme::Scheme<D>, D: Digest> RecoveryState<S, D> {
     const EMPTY: Self = Self {
+        observed: BTreeMap::new(),
         slots: BTreeMap::new(),
     };
+}
+
+// A checked body and native context may arrive in either order. Arm once on
+// their first joint observation. Queries never postpone an established deadline.
+#[allow(clippy::too_many_arguments)]
+fn observe_slot<H, S, D>(
+    scheme: &S,
+    context: &Context<S, D>,
+    state: &mut RecoveryState<S, D>,
+    p: &Proposal<D>,
+    native: &NativeContext<D, S::PublicKey>,
+    now: SystemTime,
+    timeout: Duration,
+    requested: Option<D>,
+) -> bool
+where
+    H: Hasher<Digest = D>,
+    S: scheme::Scheme<D>,
+    D: Digest,
+{
+    let candidates: Vec<_> = {
+        let registry = context.index.lock();
+        let ids = requested.as_ref().map_or_else(
+            || {
+                registry
+                    .slots_by_view
+                    .get(&p.view())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+            },
+            std::slice::from_ref,
+        );
+        ids.iter()
+            .filter_map(|id| registry.slots.get(id).map(|b| (*id, b.clone())))
+            .collect()
+    };
+    let mut due = false;
+    for (id, b) in candidates {
+        if scheme.me() != Some(b.owner) || !native_matches::<H, S, D>(&b.core, scheme, p, native) {
+            continue;
+        }
+        let first = *state.observed.entry(id).or_insert(now);
+        due |= now
+            .duration_since(first)
+            .is_ok_and(|elapsed| elapsed >= timeout);
+    }
+    due
 }
 
 fn native_matches<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest>(
@@ -1194,6 +1252,17 @@ where
             _ => false,
         }
     }
+    fn observe_recovery_nqc<E, L>(
+        state: &mut crate::simplex::actors::voter::StateWith<E, S, L, D, Self>,
+        view: View,
+    ) where
+        E: commonware_runtime::Clock + CryptoRng + commonware_runtime::Metrics,
+        L: crate::simplex::elector::Elector<S>,
+    {
+        state.observe_live_recovery(view, |s, c, r, p, n, t, d| {
+            observe_slot::<H, _, _>(s, c, r, p, n, t, d, None)
+        });
+    }
     fn validate_recovery_request<E, L>(
         state: &mut crate::simplex::actors::voter::StateWith<E, S, L, D, Self>,
         request: &SelectRequest<D>,
@@ -1211,15 +1280,21 @@ where
                 owner,
                 report,
             } => {
-                return state.initial_recovery_due(&request.proposal)
-                    && c.bootstrap(*slot).is_some_and(|b| {
-                        b.core.slot.proposal == request.proposal
-                            && b.input == *input
-                            && b.owner == *owner
+                if !c.bootstrap(*slot).is_some_and(|b| {
+                    b.core.slot.proposal == request.proposal
+                        && b.input == *input
+                        && b.owner == *owner
+                }) || report
+                    .as_ref()
+                    .is_some_and(|r| r.len() > c.limits.report_bytes)
+                {
+                    return false;
+                }
+                return state
+                    .observe_live_recovery(request.proposal.view(), |s, c, r, p, n, t, d| {
+                        observe_slot::<H, _, _>(s, c, r, p, n, t, d, Some(*slot))
                     })
-                    && report
-                        .as_ref()
-                        .is_none_or(|r| r.len() <= c.limits.report_bytes);
+                    .unwrap_or(false);
             }
         };
         let Some(body) = c.selection(body_id) else {

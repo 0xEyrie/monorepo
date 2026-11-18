@@ -24,7 +24,10 @@ clear old signing history to change profiles.
 
 ### Read the initial recovery history
 
-After the admitted original NQC and the local certification timeout,
+The voter arms a recovery-only clock when it first observes the admitted original
+NQC, checked local input, native parent and leader together. A later readiness
+request can provide that observation if custody became available after the NQC.
+After one configured certification-timeout interval from this observation,
 `Readiness::request_initial_history` freezes the local history and optional
 report. The voter journals the entry, original NQC and reservation before
 signing. It synchronizes the released outbox before returning RECOVER. The

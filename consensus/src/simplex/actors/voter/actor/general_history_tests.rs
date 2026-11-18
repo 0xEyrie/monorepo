@@ -927,3 +927,95 @@ fn retained_selected_anchor_replays_exact_body_authority_and_outbox() {
 fn retained_selected_anchor_refuses_missing_checked_body_handle() {
     selected_anchor(true, 8);
 }
+
+#[test]
+fn initial_watchdog_observes_notarized_view_never_entered_locally() {
+    deterministic::Runner::timed(Duration::from_secs(2)).start(|mut runtime| async move {
+        let f = ed25519::fixture(&mut runtime, b"_GENERAL_UNENTERED_NQC", 7);
+        let scheme = f.schemes[0].clone();
+        let epoch = Epoch::new(1);
+        let cache = CacheRef::from_pooler(&runtime, NZU16!(1024), NZUsize!(10));
+        let owner = Participant::new(0);
+        let evidence = Evidence {
+            owner,
+            capture: Default::default(),
+            captures: Default::default(),
+            assembly: Default::default(),
+        };
+        let mut cfg = config!(scheme, cache, 7u32);
+        cfg.certification_timeout = Duration::from_millis(100);
+        let handles = context(32);
+        let (mut voter, _) =
+            ActorWith::new_with(runtime.child("voter"), cfg, handles.clone(), evidence);
+        voter.state.set_genesis(D([0; 32]));
+        // Skip the local entry into view 2 before its genuine NQC arrives.
+        let next = Rnd::new(epoch, View::new(3));
+        let skips: Vec<_> = f
+            .schemes
+            .iter()
+            .take(5)
+            .map(|s| Nullify::sign::<D>(s, next).unwrap())
+            .collect();
+        let skip =
+            Nullification::from_nullifies(&f.verifier, non_empty![@&skips], &Sequential).unwrap();
+        assert!(skip.verify::<_, D>(&mut runtime, &f.verifier, &Sequential));
+        voter.state.add_nullification(skip);
+        let notarize = |p: Proposal<D>| {
+            let votes: Vec<_> = f
+                .schemes
+                .iter()
+                .take(5)
+                .map(|s| Notarize::sign(s, p.clone()).unwrap())
+                .collect();
+            Notarization::from_notarizes(&f.verifier, non_empty![@&votes], &Sequential).unwrap()
+        };
+        let parent = proposal(1);
+        voter.state.add_notarization(notarize(parent.clone()));
+        voter.state.certified(parent.view(), true).unwrap();
+        let child = proposal(2);
+        assert!(voter.state.elapsed_since_start(child.view()).is_none());
+        let elected = voter.state.leader_index(child.view()).unwrap();
+        let native = Context {
+            round: child.round,
+            leader: f.participants[usize::from(elected)].clone(),
+            parent: (parent.view(), parent.payload),
+        };
+        let slot = g::Slot {
+            profile: PROFILE,
+            domain: DOMAIN,
+            roster: g::Slot::roster::<Sha256, _>(&f.verifier),
+            cut: 2,
+            proposal: child.clone(),
+            parent: g::NativeParent::Proposal {
+                round: parent.round,
+                digest: parent.payload,
+            },
+        };
+        let capture =
+            FirstInput::new::<Sha256, _>(&scheme, slot, &native, INPUT, None, None, LIMITS, |r| {
+                r.input == INPUT && r.owner == owner
+            })
+            .unwrap();
+        handles.publish_input::<Sha256>(capture.clone()).unwrap();
+        let qc = notarize(child.clone());
+        assert!(qc.verify(&mut runtime, &f.verifier, &Sequential));
+        voter.state.add_notarization(qc.clone());
+        let request = SelectRequest::initial_history::<Sha256>(&capture, None).unwrap();
+        assert!(!<G as Voting<S, D>>::validate_recovery_request(
+            &mut voter.state,
+            &request
+        ));
+        runtime.sleep(Duration::from_millis(75)).await;
+        voter.state.add_notarization(qc);
+        assert!(!<G as Voting<S, D>>::validate_recovery_request(
+            &mut voter.state,
+            &request
+        ));
+        runtime.sleep(Duration::from_millis(26)).await;
+        assert!(<G as Voting<S, D>>::validate_recovery_request(
+            &mut voter.state,
+            &request
+        ));
+        assert!(voter.state.elapsed_since_start(child.view()).is_none());
+    });
+}

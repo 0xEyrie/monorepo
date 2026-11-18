@@ -145,6 +145,16 @@ pub trait Voting<S: Scheme, D: Digest>: Mode<S, D> {
     ) -> bool
     where
         S: scheme::Scheme<D>;
+    /// Observe a newly admitted native NQC for a mode-local recovery clock.
+    /// This does not change native timers or voting state.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn observe_recovery_nqc<E, L>(_: &mut StateWith<E, S, L, D, Self>, _: crate::types::View)
+    where
+        E: commonware_runtime::Clock + rand_core::CryptoRng + commonware_runtime::Metrics,
+        L: crate::simplex::elector::Elector<S>,
+        S: scheme::Scheme<D>,
+    {
+    }
     /// Checks native request eligibility without staging a decision or requiring custody.
     #[cfg(not(target_arch = "wasm32"))]
     fn validate_recovery_request<E, L>(

@@ -53,6 +53,9 @@ where
     S::Certificate: g::normal::CertificateSigners,
 {
     if let Some((old, _)) = &l.history {
+        if l.history_from_replay && l.ledger.outbox(old.record()).is_none() {
+            return None;
+        }
         return matches!(old.record().message().map(|m| &m.kind), Some(g::Kind::Recover(row)) if row.report == report)
             .then(|| old.clone());
     }

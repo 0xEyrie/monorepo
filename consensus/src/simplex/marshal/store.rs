@@ -2,7 +2,11 @@
 
 #[commonware_macros::stability(ALPHA)]
 use crate::simplex::{
-    extension::certificate::Finalization as ExtendedFinalization, phase2::Extended,
+    extension::{
+        agreement::general::normal::CertificateSigners,
+        certificate::Finalization as ExtendedFinalization,
+    },
+    phase2::{Extended, general},
 };
 use crate::{
     Block,
@@ -12,6 +16,8 @@ use crate::{
     },
     types::Height,
 };
+#[commonware_macros::stability(ALPHA)]
+use commonware_cryptography::sha256;
 use commonware_cryptography::{Digest, Digestible, certificate::Scheme};
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Storage};
 use commonware_storage::{
@@ -248,6 +254,50 @@ pub trait Blocks: Send + Sync + Sized + 'static {
     fn last_index(&self) -> Option<Height>;
 }
 
+macro_rules! archive_certificate_io {
+    () => {
+        async fn put(
+            self,
+            height: Height,
+            digest: Self::BlockDigest,
+            finalization: &<Self::Mode as Mode<Self::Scheme, Self::Commitment>>::Certificate,
+        ) -> Result<Self, Self::Error> {
+            Archive::put(self, height.get(), digest, finalization).await
+        }
+
+        async fn sync(self) -> Result<Self, Self::Error> {
+            Archive::sync(self).await
+        }
+
+        async fn start_sync(self) -> Result<(Self, Handle<()>), Self::Error> {
+            Archive::start_sync(self).await
+        }
+
+        async fn get(
+            &self,
+            id: Identifier<'_, Self::BlockDigest>,
+        ) -> Result<
+            Option<<Self::Mode as Mode<Self::Scheme, Self::Commitment>>::Certificate>,
+            Self::Error,
+        > {
+            <Self as Archive>::get(self, id).await
+        }
+
+        async fn has(&self, height: Height) -> Result<bool, Self::Error> {
+            <Self as Archive>::has(self, Identifier::Index(height.get())).await
+        }
+
+        fn last_index(&self) -> Option<Height> {
+            <Self as Archive>::last_index(self).map(Height::new)
+        }
+
+        fn ranges_from(&self, from: Height) -> impl Iterator<Item = (Height, Height)> {
+            <Self as Archive>::ranges_from(self, from.get())
+                .map(|(s, e)| (Height::new(s), Height::new(e)))
+        }
+    };
+}
+
 impl<E, B, C, S> Certificates for immutable::Archive<E, B, Finalization<S, C>>
 where
     E: BufferPooler + Storage + Metrics + Clock,
@@ -261,46 +311,11 @@ where
     type Mode = Plain;
     type Error = archive::Error;
 
-    async fn put(
-        self,
-        height: Height,
-        digest: Self::BlockDigest,
-        finalization: &Finalization<S, Self::Commitment>,
-    ) -> Result<Self, Self::Error> {
-        Archive::put(self, height.get(), digest, finalization).await
-    }
-
-    async fn sync(self) -> Result<Self, Self::Error> {
-        Archive::sync(self).await
-    }
-
-    async fn start_sync(self) -> Result<(Self, Handle<()>), Self::Error> {
-        Archive::start_sync(self).await
-    }
-
-    async fn get(
-        &self,
-        id: Identifier<'_, Self::BlockDigest>,
-    ) -> Result<Option<Finalization<Self::Scheme, Self::Commitment>>, Self::Error> {
-        <Self as Archive>::get(self, id).await
-    }
-
-    async fn has(&self, height: Height) -> Result<bool, Self::Error> {
-        <Self as Archive>::has(self, Identifier::Index(height.get())).await
-    }
+    archive_certificate_io!();
 
     async fn prune(self, _: Height) -> Result<Self, Self::Error> {
         // Pruning is a no-op for immutable archives.
         Ok(self)
-    }
-
-    fn last_index(&self) -> Option<Height> {
-        <Self as Archive>::last_index(self).map(Height::new)
-    }
-
-    fn ranges_from(&self, from: Height) -> impl Iterator<Item = (Height, Height)> {
-        <Self as Archive>::ranges_from(self, from.get())
-            .map(|(s, e)| (Height::new(s), Height::new(e)))
     }
 }
 
@@ -318,46 +333,35 @@ where
     type Mode = Extended;
     type Error = archive::Error;
 
-    async fn put(
-        self,
-        height: Height,
-        digest: Self::BlockDigest,
-        finalization: &ExtendedFinalization<S, Self::Commitment>,
-    ) -> Result<Self, Self::Error> {
-        Archive::put(self, height.get(), digest, finalization).await
-    }
-
-    async fn sync(self) -> Result<Self, Self::Error> {
-        Archive::sync(self).await
-    }
-
-    async fn start_sync(self) -> Result<(Self, Handle<()>), Self::Error> {
-        Archive::start_sync(self).await
-    }
-
-    async fn get(
-        &self,
-        id: Identifier<'_, Self::BlockDigest>,
-    ) -> Result<Option<ExtendedFinalization<Self::Scheme, Self::Commitment>>, Self::Error> {
-        <Self as Archive>::get(self, id).await
-    }
-
-    async fn has(&self, height: Height) -> Result<bool, Self::Error> {
-        <Self as Archive>::has(self, Identifier::Index(height.get())).await
-    }
+    archive_certificate_io!();
 
     async fn prune(self, _: Height) -> Result<Self, Self::Error> {
         // Pruning is a no-op for immutable archives.
         Ok(self)
     }
+}
 
-    fn last_index(&self) -> Option<Height> {
-        <Self as Archive>::last_index(self).map(Height::new)
-    }
+// The current General deployment uses SHA-256 commitments. Retain the entire
+// signed envelope so reopening the archive preserves both certificate subjects.
+#[commonware_macros::stability(ALPHA)]
+impl<E, B, S> Certificates for immutable::Archive<E, B, general::Finalization<S, sha256::Digest>>
+where
+    E: BufferPooler + Storage + Metrics + Clock,
+    B: Digest,
+    S: crate::simplex::scheme::Scheme<sha256::Digest>,
+    S::Certificate: CertificateSigners,
+{
+    type BlockDigest = B;
+    type Commitment = sha256::Digest;
+    type Scheme = S;
+    type Mode = general::General<sha256::Sha256>;
+    type Error = archive::Error;
 
-    fn ranges_from(&self, from: Height) -> impl Iterator<Item = (Height, Height)> {
-        <Self as Archive>::ranges_from(self, from.get())
-            .map(|(s, e)| (Height::new(s), Height::new(e)))
+    archive_certificate_io!();
+
+    async fn prune(self, _: Height) -> Result<Self, Self::Error> {
+        // Pruning is a no-op for immutable archives.
+        Ok(self)
     }
 }
 
@@ -424,45 +428,10 @@ where
     type Mode = Plain;
     type Error = archive::Error;
 
-    async fn put(
-        self,
-        height: Height,
-        digest: Self::BlockDigest,
-        finalization: &Finalization<S, Self::Commitment>,
-    ) -> Result<Self, Self::Error> {
-        Archive::put(self, height.get(), digest, finalization).await
-    }
-
-    async fn sync(self) -> Result<Self, Self::Error> {
-        Archive::sync(self).await
-    }
-
-    async fn start_sync(self) -> Result<(Self, Handle<()>), Self::Error> {
-        Archive::start_sync(self).await
-    }
-
-    async fn get(
-        &self,
-        id: Identifier<'_, Self::BlockDigest>,
-    ) -> Result<Option<Finalization<Self::Scheme, Self::Commitment>>, Self::Error> {
-        <Self as Archive>::get(self, id).await
-    }
-
-    async fn has(&self, height: Height) -> Result<bool, Self::Error> {
-        <Self as Archive>::has(self, Identifier::Index(height.get())).await
-    }
+    archive_certificate_io!();
 
     async fn prune(self, min: Height) -> Result<Self, Self::Error> {
         Self::prune(self, min.get()).await
-    }
-
-    fn last_index(&self) -> Option<Height> {
-        <Self as Archive>::last_index(self).map(Height::new)
-    }
-
-    fn ranges_from(&self, from: Height) -> impl Iterator<Item = (Height, Height)> {
-        <Self as Archive>::ranges_from(self, from.get())
-            .map(|(s, e)| (Height::new(s), Height::new(e)))
     }
 }
 
@@ -481,45 +450,35 @@ where
     type Mode = Extended;
     type Error = archive::Error;
 
-    async fn put(
-        self,
-        height: Height,
-        digest: Self::BlockDigest,
-        finalization: &ExtendedFinalization<S, Self::Commitment>,
-    ) -> Result<Self, Self::Error> {
-        Archive::put(self, height.get(), digest, finalization).await
-    }
-
-    async fn sync(self) -> Result<Self, Self::Error> {
-        Archive::sync(self).await
-    }
-
-    async fn start_sync(self) -> Result<(Self, Handle<()>), Self::Error> {
-        Archive::start_sync(self).await
-    }
-
-    async fn get(
-        &self,
-        id: Identifier<'_, Self::BlockDigest>,
-    ) -> Result<Option<ExtendedFinalization<Self::Scheme, Self::Commitment>>, Self::Error> {
-        <Self as Archive>::get(self, id).await
-    }
-
-    async fn has(&self, height: Height) -> Result<bool, Self::Error> {
-        <Self as Archive>::has(self, Identifier::Index(height.get())).await
-    }
+    archive_certificate_io!();
 
     async fn prune(self, min: Height) -> Result<Self, Self::Error> {
         Self::prune(self, min.get()).await
     }
+}
 
-    fn last_index(&self) -> Option<Height> {
-        <Self as Archive>::last_index(self).map(Height::new)
-    }
+// The current General deployment uses SHA-256 commitments. Retain the entire
+// signed envelope so reopening the archive preserves both certificate subjects.
+#[commonware_macros::stability(ALPHA)]
+impl<T, E, B, S> Certificates
+    for prunable::Archive<T, E, B, general::Finalization<S, sha256::Digest>>
+where
+    T: Translator,
+    E: BufferPooler + Storage + Metrics + Clock,
+    B: Digest,
+    S: crate::simplex::scheme::Scheme<sha256::Digest>,
+    S::Certificate: CertificateSigners,
+{
+    type BlockDigest = B;
+    type Commitment = sha256::Digest;
+    type Scheme = S;
+    type Mode = general::General<sha256::Sha256>;
+    type Error = archive::Error;
 
-    fn ranges_from(&self, from: Height) -> impl Iterator<Item = (Height, Height)> {
-        <Self as Archive>::ranges_from(self, from.get())
-            .map(|(s, e)| (Height::new(s), Height::new(e)))
+    archive_certificate_io!();
+
+    async fn prune(self, min: Height) -> Result<Self, Self::Error> {
+        Self::prune(self, min.get()).await
     }
 }
 

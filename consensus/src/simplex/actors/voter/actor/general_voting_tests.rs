@@ -551,6 +551,8 @@ fn run_case(
                 .map(|s| Notarize::sign(s, proposal(1)).unwrap()).collect();
             let nqc = Notarization::from_notarizes(&scheme, non_empty![@votes.iter()], &Sequential).unwrap();
             assert!(nqc.verify(&mut runtime, &f.verifier, &Sequential));
+            // A stale native view clock cannot authorize recovery on first NQC arrival.
+            runtime.sleep(Duration::from_millis(120)).await;
             (actor, _) = Box::pin(actor.process_message(Message::Verified {
                 span: tracing::Span::none(), certificate: CertificateWith::Notarization(nqc), from_resolver: false,
             })).await;
@@ -600,7 +602,7 @@ fn run_case(
         drop(actor);
 
         let journal =
-            Journal::<_, ArtifactWith<S, D, G>>::init(runtime.child("inspect"), journal_config)
+            Journal::<_, ArtifactWith<S, D, G>>::init(runtime.child("inspect"), journal_config.clone())
                 .await
                 .unwrap();
         let mut replay = journal
@@ -711,7 +713,9 @@ fn run_case(
         if let Some(record) = &history_record {
             let ctx = context(records);
             ctx.publish_input::<Sha256>(bootstrap.clone()).unwrap();
-            let (mut interrupted, _) = ActorWith::new_with(runtime.child("before_receipt"), config!(scheme, cache, n), ctx, evidence.clone());
+            let mut cfg = config!(scheme, cache, n);
+            cfg.certification_timeout = Duration::from_millis(100);
+            let (mut interrupted, retry_box) = ActorWith::new_with(runtime.child("before_receipt"), cfg, ctx, evidence.clone());
             interrupted.state.set_genesis(D([0; 32]));
             for item in &rows {
                 if let ArtifactWith::Notarization(nqc) = item { interrupted.state.add_notarization(nqc.clone()); }
@@ -720,6 +724,23 @@ fn run_case(
             }
             interrupted.state.finish_notarize_replay();
             assert!(interrupted.state.sign_recovery(record).is_none(), "uncertain signer invocation after crash");
+            let mut log_config = journal_config.clone();
+            log_config.partition = "interrupted-retry-appends".into();
+            interrupted.journal = Some(Journal::init(interrupted.context.child("retry_journal"),log_config).await.unwrap());
+            let section = core.slot.proposal.view().get();
+            let before = interrupted.journal.as_ref().unwrap().size(section).ok();
+            let report = Some(Bytes::from_static(b"ready"));
+            runtime.sleep(Duration::from_millis(101)).await;
+            assert!(<G as Voting<S,D>>::validate_recovery_request(&mut interrupted.state,
+                &SelectRequest::initial_history::<Sha256>(&bootstrap,report.clone()).unwrap()));
+            let mut ready = crate::simplex::engine::Readiness::new(retry_box);
+            for _ in 0..2 {
+                let reply = ready.request_initial_history(&bootstrap, report.clone());
+                let message = interrupted.mailbox_receiver.recv().await.unwrap();
+                (interrupted, _) = Box::pin(interrupted.process_message(message)).await;
+                assert!(reply.await.unwrap().is_none());
+                assert_eq!(interrupted.journal.as_ref().unwrap().size(section).ok(),before);
+            }
             for item in &rows {
                 if let ArtifactWith::Recovery(w) = item {
                     let frame = w.encode();

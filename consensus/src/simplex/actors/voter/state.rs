@@ -330,19 +330,45 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         )
     }
 
-    /// Live, unresolved original with an admitted NQC past its native failure deadline.
-    /// Historical ancestry requires separate inclusion evidence.
+    /// Observe a live notarized round, even if it was never the local current view.
+    /// Only the mode's own recovery clock is mutable here.
     #[cfg(not(target_arch = "wasm32"))]
     #[commonware_macros::stability(ALPHA)]
-    pub(crate) fn initial_recovery_due(&self, p: &Proposal<D>) -> bool {
-        p.epoch() == self.epoch
-            && p.view() > self.last_finalized
-            && self
-                .notarization(p.view())
-                .is_some_and(|n| n.proposal == *p)
-            && self
-                .elapsed_since_start(p.view())
-                .is_some_and(|d| d >= self.certification_timeout)
+    pub(crate) fn observe_live_recovery<R>(
+        &mut self,
+        view: View,
+        observe: impl FnOnce(
+            &S,
+            &M::Context,
+            &mut M::RecoveryState,
+            &Proposal<D>,
+            &Context<D, S::PublicKey>,
+            SystemTime,
+            Duration,
+        ) -> R,
+    ) -> Option<R> {
+        if view <= self.last_finalized {
+            return None;
+        }
+        let round = self.views.get(&view)?;
+        let p = round.notarization()?.proposal.clone();
+        if p.epoch() != self.epoch || p.view() != view || round.proposal() != Some(&p) {
+            return None;
+        }
+        let native = Context {
+            round: p.round,
+            leader: round.leader()?.key,
+            parent: (p.parent, self.parent_payload(&p).ok()?),
+        };
+        Some(observe(
+            &self.scheme,
+            &self.mode_context,
+            self.views.get_mut(&view)?.recovery_state_mut(),
+            &p,
+            &native,
+            self.context.current(),
+            self.certification_timeout,
+        ))
     }
 
     /// Lends the sole mode ledger after resolving current native input.
@@ -703,6 +729,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         self.set_leader(view.next(), Some(&notarization.certificate));
         let result = self.create_round(view).add_notarization(notarization);
         if result.0 {
+            M::observe_recovery_nqc(self, view);
             if view > self.last_finalized {
                 self.certification_candidates.insert(view);
             }
