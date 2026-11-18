@@ -372,6 +372,12 @@ commonware_macros::stability_scope!(ALPHA {
                 receiver
             }
         }
+        /// Poll the journal owner for its timeout WISH for the exact installed entry.
+        /// A pending deadline yields no signature. Retrying returns the durable outbox.
+        pub fn request_timeout_wish(&mut self, capture: &super::phase2::general::voting::FirstInput<D>, predecessor:D)
+            -> commonware_utils::channel::oneshot::Receiver<Option<super::extension::agreement::general::Signed<S,D>>> {
+            self.mailbox.recover_extension(super::phase2::general::voting::SelectRequest::wish::<H>(capture,predecessor))
+        }
         /// Issue a recovery endorsement, PREPARE or COMMIT for original evidence
         /// retained by the configured host. The evidence determines the role.
         pub fn request_recovery_ballot(

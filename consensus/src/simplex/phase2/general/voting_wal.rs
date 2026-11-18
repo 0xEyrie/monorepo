@@ -20,7 +20,9 @@ pub struct Wal<S: Scheme, D: Digest>(pub(super) Event<S, D>);
 impl<S: Scheme, D: Digest> PartialEq for Wal<S, D> {
     fn eq(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
-            (Event::First(a), Event::First(b)) | (Event::Select(a), Event::Select(b)) => a == b,
+            (Event::Wish(a), Event::Wish(b))
+            | (Event::First(a), Event::First(b))
+            | (Event::Select(a), Event::Select(b)) => a == b,
             (
                 Event::FirstReleased {
                     reservation: a,
@@ -105,6 +107,7 @@ impl<S: Scheme, D: Digest> Eq for Wal<S, D> {}
 #[derive(Clone, Debug)]
 pub(super) enum Event<S: Scheme, D: Digest> {
     First(g::issuance::Record<D>),
+    Wish(g::issuance::Record<D>),
     FirstReleased {
         reservation: g::issuance::Record<D>,
         receipt: Option<g::issuance::Record<D>>,
@@ -142,7 +145,7 @@ pub(super) enum Event<S: Scheme, D: Digest> {
 impl<S: Scheme, D: Digest> Wal<S, D> {
     pub(super) const fn record(&self) -> &g::issuance::Record<D> {
         match &self.0 {
-            Event::First(r) | Event::Select(r) => r,
+            Event::Wish(r) | Event::First(r) | Event::Select(r) => r,
             Event::History { reservation, .. }
             | Event::Ballot { reservation, .. }
             | Event::BallotReleased { reservation, .. }
@@ -163,7 +166,7 @@ impl<S: Scheme, D: Digest> Wal<S, D> {
     }
     fn body_size(&self) -> usize {
         1 + match &self.0 {
-            Event::First(r) | Event::Select(r) => r.encode_size(),
+            Event::Wish(r) | Event::First(r) | Event::Select(r) => r.encode_size(),
             Event::FirstReleased {
                 reservation,
                 receipt,
@@ -228,6 +231,10 @@ impl<S: Scheme, D: Digest> Write for Wal<S, D> {
                 reservation.write(w);
                 receipt.write(w);
                 vote.write(w);
+            }
+            Event::Wish(r) => {
+                10u8.write(w);
+                r.write(w);
             }
             Event::Select(r) => {
                 2u8.write(w);
@@ -306,6 +313,7 @@ impl<S: Scheme, D: Digest> Read for Wal<S, D> {
                 receipt: Option::<g::issuance::Record<D>>::read_cfg(&mut b, &WIRE_LIMITS)?,
                 vote: FirstVote::read(&mut b)?,
             },
+            10 => Event::Wish(record(&mut b)?),
             2 => Event::Select(record(&mut b)?),
             3 => Event::SelectReleased {
                 reservation: record(&mut b)?,

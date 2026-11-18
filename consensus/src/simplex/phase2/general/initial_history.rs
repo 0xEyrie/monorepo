@@ -37,6 +37,35 @@ fn bounds(n: usize) -> Option<g::entry::Bounds> {
     })
 }
 
+pub(super) fn verify_entry<'a, H, S, D, R>(
+    rng: &mut R,
+    s: &S,
+    c: &Context<S, D>,
+    ledger: &g::issuance::State<S, D>,
+    core: &'a g::Core<D>,
+    proof: &'a g::entry::Proof<S, D>,
+) -> Option<g::entry::VerifiedEntry<'a, S, D>>
+where
+    H: Hasher<Digest = D>,
+    S: scheme::Scheme<D>,
+    D: Digest,
+    R: CryptoRng,
+    S::Certificate: g::normal::CertificateSigners,
+{
+    g::entry::verify::<H, _, _, _>(
+        rng,
+        &ledger.verification_context(),
+        core,
+        ledger.input(),
+        proof,
+        c.limits,
+        bounds(s.participants().len())?,
+        |_| None,
+        &Sequential,
+    )
+    .ok()
+}
+
 pub(super) fn stage<H, S, D, R>(
     s: &S,
     c: &Context<S, D>,
@@ -62,18 +91,7 @@ where
     let core = l.ledger.core().clone();
     let input = l.ledger.input();
     let authority = proof::<H, _, _>(&core, input, nqc.clone())?;
-    let checked = g::entry::verify::<H, _, _, _>(
-        rng,
-        &l.ledger.verification_context(),
-        &core,
-        input,
-        &authority,
-        c.limits,
-        bounds(s.participants().len())?,
-        |_| None,
-        &Sequential,
-    )
-    .ok()?;
+    let checked = verify_entry::<H, _, _, _>(rng, s, c, &l.ledger, &core, &authority)?;
     if report
         .as_ref()
         .is_some_and(|r| r.len() > c.limits.report_bytes)
@@ -146,20 +164,7 @@ where
     else {
         return false;
     };
-    let Some(bounds) = bounds(s.participants().len()) else {
-        return false;
-    };
-    let Ok(checked) = g::entry::verify::<H, _, _, _>(
-        rng,
-        &l.ledger.verification_context(),
-        &core,
-        input,
-        &authority,
-        c.limits,
-        bounds,
-        |_| None,
-        &Sequential,
-    ) else {
+    let Some(checked) = verify_entry::<H, _, _, _>(rng, s, c, &l.ledger, &core, &authority) else {
         return false;
     };
     replay_room(c, l, &[entry, reservation]);

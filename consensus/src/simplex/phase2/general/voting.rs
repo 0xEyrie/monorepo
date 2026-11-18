@@ -176,6 +176,10 @@ impl<S: scheme::Scheme<D>, D: Digest> Selection<S, D> {
 #[derive(Clone, Debug)]
 enum Command<D: Digest> {
     Select(D),
+    Wish {
+        slot: D,
+        predecessor: D,
+    },
     Ballot {
         slot: D,
         evidence: D,
@@ -222,6 +226,15 @@ impl<D: Digest> SelectRequest<D> {
             },
             proposal: capture.core.slot.proposal.clone(),
         })
+    }
+    pub(crate) fn wish<H: Hasher<Digest = D>>(capture: &FirstInput<D>, predecessor: D) -> Self {
+        Self {
+            command: Command::Wish {
+                slot: capture.core.slot.id::<H>(),
+                predecessor,
+            },
+            proposal: capture.core.slot.proposal.clone(),
+        }
     }
     pub(crate) fn ballot<H: Hasher<Digest = D>>(capture: &FirstInput<D>, evidence: D) -> Self {
         Self {
@@ -333,6 +346,7 @@ pub struct Context<S: scheme::Scheme<D>, D: Digest> {
     resources: Resources,
     index: Arc<Mutex<Index<S, D>>>,
     recovery_evidence: Option<Arc<RecoveryEvidence<S, D>>>,
+    recovery_wait: Option<Duration>,
 }
 impl<S: scheme::Scheme<D>, D: Digest> Clone for Context<S, D> {
     fn clone(&self) -> Self {
@@ -345,6 +359,7 @@ impl<S: scheme::Scheme<D>, D: Digest> Clone for Context<S, D> {
             resources: self.resources,
             index: self.index.clone(),
             recovery_evidence: self.recovery_evidence.clone(),
+            recovery_wait: self.recovery_wait,
         }
     }
 }
@@ -377,6 +392,7 @@ where
             limits,
             resources,
             recovery_evidence: None,
+            recovery_wait: None,
             index: Arc::new(Mutex::new(Index {
                 slots: BTreeMap::new(),
                 slots_by_view: BTreeMap::new(),
@@ -386,6 +402,15 @@ where
                 bytes: 0,
             })),
         })
+    }
+    /// Set the trusted first recovery attempt's timeout. The native view timers
+    /// are independent. Cold startup arms a new full wait for an unreserved WISH.
+    pub fn with_initial_recovery_timeout(mut self, wait: Duration) -> Result<Self, g::Error> {
+        if wait.is_zero() {
+            return Err(g::Error::Context);
+        }
+        self.recovery_wait = Some(wait);
+        Ok(self)
     }
     /// Install the local durable evidence reader before constructing the voter.
     pub fn with_recovery_evidence(mut self, reader: Arc<RecoveryEvidence<S, D>>) -> Self {
@@ -1192,6 +1217,42 @@ where
             return false;
         };
         match &r.0 {
+            Event::Wish(record) => {
+                let Some((_, proof)) = &l.history else {
+                    return false;
+                };
+                let core = l.ledger.core().clone();
+                let Some(checked) =
+                    initial_history::verify_entry::<H, _, _, _>(rng, s, c, &l.ledger, &core, proof)
+                else {
+                    return false;
+                };
+                if !matches!(
+                    record.action(),
+                    g::issuance::Action::AdvanceWish {
+                        cause: g::issuance::WishCause::Timeout,
+                        ..
+                    }
+                ) {
+                    return false;
+                }
+                replay_room(c, l, &[record]);
+                if l.ledger
+                    .restore::<H, R>(
+                        rng,
+                        record,
+                        g::issuance::Material::Entry(&checked),
+                        |_| false,
+                        |_, _| false,
+                        &Sequential,
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+                l.replayed_ballots.insert(record.id::<H>());
+                true
+            }
             Event::Ballot { rpc, reservation } => {
                 let Some(id) = reservation.authority() else {
                     return false;
@@ -1272,7 +1333,7 @@ where
                         *record == reservation
                             && matches!(
                                 record.message().map(|m| &m.kind),
-                                Some(g::Kind::Recovery { .. })
+                                Some(g::Kind::Recovery { .. } | g::Kind::Wish(_))
                             )
                     })
                 } else if matches!(&r.0, Event::HistoryReleased { .. }) {
@@ -1368,6 +1429,14 @@ where
         let c = state.interpretation_context();
         let body_id = match &request.command {
             Command::Select(id) => *id,
+            Command::Wish { slot, .. } => {
+                return c.recovery_wait.is_some()
+                    && c.bootstrap(*slot)
+                        .is_some_and(|b| b.core.slot.proposal == request.proposal)
+                    && state
+                        .notarization(request.proposal.view())
+                        .is_some_and(|qc| qc.proposal == request.proposal);
+            }
             Command::Ballot { slot, .. } => {
                 return c.recovery_evidence.is_some()
                     && c.bootstrap(*slot)
@@ -1427,6 +1496,19 @@ where
             |s, c, rng, state, p, native, nqc| {
                 let body_id = match &request.command {
                     Command::Select(id) => *id,
+                    Command::Wish {slot,predecessor} => {
+                        let l=state.slots.get_mut(slot)?;
+                        if !native_matches::<H,S,D>(l.ledger.core(),s,p,native) {return None;}
+                        let (_,proof)=l.history.as_ref()?;
+                        if proof.artifact_id::<H>() != *predecessor {return None;}
+                        let core=l.ledger.core().clone();
+                        let checked=initial_history::verify_entry::<H,_,_,_>(rng,s,c,&l.ledger,&core,proof)?;
+                        if let Some(old)=l.ledger.records().iter().find(|r|matches!(r.message().map(|m|&m.kind), Some(g::Kind::Wish(w)) if w.predecessor == *predecessor)) { return Some(Wal(Event::Wish(old.clone()))); }
+                        if l.ledger.records().len().checked_add(2)? > c.resources.records_per_slot {return None;}
+                        l.ledger.arm_wish_timeout::<H>(rng,&checked,c.recovery_wait?).ok()?;
+                        let reservation=l.ledger.reserve_timeout_wish::<H>(rng,&checked).ok()?;
+                        return Some(Wal(Event::Wish(reservation)));
+                    }
                     Command::Ballot { slot, evidence } => {
                         let l = state.slots.get_mut(slot)?;
                         if !native_matches::<H, S, D>(l.ledger.core(), s, p, native)
@@ -1569,7 +1651,9 @@ where
         let record = r.record();
         let l = state.slots.get_mut(&record.slot().id::<H>())?;
         let held = match &r.0 {
-            Event::Ballot { .. } => l.ledger.records().iter().find(|r| *r == record),
+            Event::Wish(_) | Event::Ballot { .. } => {
+                l.ledger.records().iter().find(|r| *r == record)
+            }
             Event::Select(_) => l.select.as_ref(),
             Event::History { .. } => l.history.as_ref().map(|(wal, _)| wal.record()),
             _ => return None,
@@ -1595,22 +1679,24 @@ where
             .expect("General recovery mailbox receipt failed");
         Some((
             signed,
-            Some(Wal(if matches!(&r.0, Event::Ballot { .. }) {
-                Event::BallotReleased {
-                    reservation: record.clone(),
-                    receipt,
-                }
-            } else if matches!(&r.0, Event::History { .. }) {
-                Event::HistoryReleased {
-                    reservation: record.clone(),
-                    receipt,
-                }
-            } else {
-                Event::SelectReleased {
-                    reservation: record.clone(),
-                    receipt,
-                }
-            })),
+            Some(Wal(
+                if matches!(&r.0, Event::Wish(_) | Event::Ballot { .. }) {
+                    Event::BallotReleased {
+                        reservation: record.clone(),
+                        receipt,
+                    }
+                } else if matches!(&r.0, Event::History { .. }) {
+                    Event::HistoryReleased {
+                        reservation: record.clone(),
+                        receipt,
+                    }
+                } else {
+                    Event::SelectReleased {
+                        reservation: record.clone(),
+                        receipt,
+                    }
+                },
+            )),
         ))
     }
 }

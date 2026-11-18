@@ -190,6 +190,7 @@ enum Retry {
     None,
     Select,
     InitialHistory,
+    TimeoutWish,
 }
 
 fn run_case(
@@ -203,7 +204,8 @@ fn run_case(
 ) {
     deterministic::Runner::timed(Duration::from_secs(20)).start(move |mut runtime| async move {
         let retry_select = retry == Retry::Select;
-        let recover = retry == Retry::InitialHistory;
+        let wish = retry == Retry::TimeoutWish;
+        let recover = retry == Retry::InitialHistory || wish;
         assert!(!foreign || (!first_enabled && normal && role == 2));
         assert!(!retry_select || (first_enabled && normal && role == 0 && records == 6));
         let f = ed25519::fixture(&mut runtime, b"_COMMONWARE_CONSENSUS_GENERAL_ACTOR_TEST", n);
@@ -231,7 +233,8 @@ fn run_case(
             _ => unreachable!(),
         };
         let scheme = f.schemes[owner].clone();
-        let config_context = context(records);
+        let make_context = || { let cfg = context(records); if wish { cfg.with_initial_recovery_timeout(Duration::from_millis(100)).unwrap() } else { cfg } };
+        let config_context = make_context();
         let evidence = Evidence {
             owner: Participant::new(owner as u32),
             capture: Arc::new(Mutex::new(None)),
@@ -546,6 +549,7 @@ fn run_case(
             material = Some((selection, assembly));
         }
         let mut history = None;
+        let mut issued_wish = None;
         if recover {
             let votes: Vec<_> = f.schemes.iter().take(g::Committee::new(n as usize).unwrap().quorum())
                 .map(|s| Notarize::sign(s, proposal(1)).unwrap()).collect();
@@ -603,6 +607,26 @@ fn run_case(
             let msg = actor.mailbox_receiver.recv().await.unwrap();
             (actor, _) = Box::pin(actor.process_message(msg)).await;
             assert!(changed.await.unwrap().is_none());
+            if wish {
+                let get = readiness.history_material(HistoryQuery::new::<Sha256>(&captured,head,None));
+                let msg=actor.mailbox_receiver.recv().await.unwrap();
+                (actor,_)=Box::pin(actor.process_message(msg)).await;
+                let Some(HistoryMaterial::Entry(entry)) = get.await.unwrap() else {panic!("missing Entry")};
+                let predecessor=entry.artifact_id::<Sha256>();
+                for (id, delay, expected) in [(INPUT,0,false),(predecessor,0,false),(predecessor,99,false),(predecessor,2,true)] {
+                    runtime.sleep(Duration::from_millis(delay)).await;
+                    let pending=readiness.request_timeout_wish(&captured,id);
+                    let msg=actor.mailbox_receiver.recv().await.unwrap();
+                    (actor,_)=Box::pin(actor.process_message(msg)).await;
+                    let signed=pending.await.unwrap();
+                    assert_eq!(signed.is_some(),expected);
+                    if let Some(signed)=signed {
+                        assert!(signed.verify(&mut runtime,&f.verifier,LIMITS,&Sequential));
+                        assert!(matches!(&signed.message.kind,g::Kind::Wish(w) if w.predecessor==predecessor && w.target.attempt==1 && w.target.leader==Participant::new(1)));
+                        issued_wish=Some((predecessor,signed));
+                    }
+                }
+            }
             history = Some(signed);
         }
         drop(actor);
@@ -633,7 +657,7 @@ fn run_case(
             if foreign {
                 0
             } else if recover {
-                2 * usize::from(first_enabled) + 3
+                2 * usize::from(first_enabled) + 3 + 2 * usize::from(wish)
             } else if !first_enabled {
                 2
             } else if normal {
@@ -788,7 +812,7 @@ fn run_case(
             drop(fresh);
             // Reopen the same native partition in the actual voter startup loop.
             // Only the immutable checked application input is supplied again.
-            let restored_context = context(records);
+            let restored_context = make_context();
             restored_context.publish_input::<Sha256>(bootstrap.clone()).unwrap();
             let (network, oracle) = Network::new_with_peers(runtime.child("history_network"), NConfig {
                 max_size: 1024*1024, max_peers_per_set: std::num::NonZeroUsize::new(n as usize).unwrap(),
@@ -808,6 +832,10 @@ fn run_case(
             let published = ready.history_material(HistoryQuery::published::<Sha256>(&bootstrap)).await.unwrap();
             let Some(HistoryMaterial::Notice(old)) = published else { panic!("missing published history after startup") };
             assert_eq!(old.encode(), signed.encode());
+            if let Some((predecessor,wish))=issued_wish {
+                let recovered=ready.request_timeout_wish(&bootstrap,predecessor).await.unwrap().expect("durable WISH");
+                assert_eq!(recovered.encode(),wish.encode());
+            }
             handle.abort();
             let _ = handle.await;
             return;
@@ -912,4 +940,9 @@ fn initial_history_fences_journals_and_replays_with_seven_validators() {
             run_case(7, role, false, 8, first, false, Retry::InitialHistory);
         }
     }
+}
+
+#[test]
+fn seven_validator_timeout_wish_fences_the_old_attempt_and_survives_restart() {
+    run_case(7, 2, false, 12, false, false, Retry::TimeoutWish);
 }
