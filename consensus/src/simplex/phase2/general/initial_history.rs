@@ -206,19 +206,22 @@ where
         return None;
     };
     let published = l.ledger.outbox(reservation)?;
-    if q.head.is_none() {
-        return g::Signed::decode_cfg(published.clone(), &super::super::WIRE_LIMITS)
+    match &q.item {
+        HistoryItem::Notice => g::Signed::decode_cfg(published.clone(), &super::super::WIRE_LIMITS)
             .ok()
-            .map(HistoryMaterial::Notice);
-    }
-    if row.snapshot.head() != q.head {
-        return None;
-    }
-    if let Some(index) = q.page {
-        if index >= usize::try_from(row.snapshot.count()).ok()? {
-            return None;
+            .map(HistoryMaterial::Notice),
+        HistoryItem::Entry(head) if row.snapshot.head() == Some(*head) => {
+            Some(HistoryMaterial::Entry(proof.clone()))
         }
-        return Some(HistoryMaterial::Page(l.ledger.history_page(index)?));
+        HistoryItem::Page(head, index) if row.snapshot.head() == Some(*head) => {
+            if *index >= usize::try_from(row.snapshot.count()).ok()? {
+                return None;
+            }
+            Some(HistoryMaterial::Page(l.ledger.history_page(*index)?))
+        }
+        HistoryItem::Verification(head) if row.snapshot.head() == Some(*head) => Some(
+            HistoryMaterial::Verification(l.ledger.verification_context()),
+        ),
+        _ => None,
     }
-    Some(HistoryMaterial::Entry(proof.clone()))
 }

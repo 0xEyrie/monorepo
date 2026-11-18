@@ -231,8 +231,14 @@ pub struct HistoryQuery<D: Digest> {
     slot: D,
     input: D,
     owner: Participant,
-    head: Option<D>,
-    page: Option<usize>,
+    item: HistoryItem<D>,
+}
+
+enum HistoryItem<D> {
+    Notice,
+    Entry(D),
+    Page(D, usize),
+    Verification(D),
 }
 impl<D: Digest> HistoryQuery<D> {
     /// Read a zero-based page, or the exact original entry proof when page is None.
@@ -242,8 +248,7 @@ impl<D: Digest> HistoryQuery<D> {
             slot: input.core.slot.id::<H>(),
             input: input.input,
             owner: input.owner,
-            head: Some(head),
-            page,
+            item: page.map_or(HistoryItem::Entry(head), |i| HistoryItem::Page(head, i)),
         }
     }
     /// Look up a previously published notice, including after a lost reply.
@@ -253,8 +258,15 @@ impl<D: Digest> HistoryQuery<D> {
             slot: input.core.slot.id::<H>(),
             input: input.input,
             owner: input.owner,
-            head: None,
-            page: None,
+            item: HistoryItem::Notice,
+        }
+    }
+    /// Obtain the read-only verification scope of the local issuance owner for
+    /// this published history head. A newly opened voter has a new scope.
+    pub fn verification<H: Hasher<Digest = D>>(input: &FirstInput<D>, head: D) -> Self {
+        Self {
+            item: HistoryItem::Verification(head),
+            ..Self::published::<H>(input)
         }
     }
     /// Original native view used for read-only lookup.
@@ -267,6 +279,8 @@ impl<D: Digest> HistoryQuery<D> {
 pub enum HistoryMaterial<S: commonware_cryptography::certificate::Scheme, D: Digest> {
     /// Previously journaled outbox bytes, decoded without another signer call.
     Notice(g::Signed<S, D>),
+    /// Local verification handle only. Never serialized or returned to a peer.
+    Verification(g::VerificationContext<S>),
     /// The native NQC and its original recovery entry target.
     Entry(g::entry::Proof<S, D>),
     /// One of the hash-linked pages covered by the signed head.

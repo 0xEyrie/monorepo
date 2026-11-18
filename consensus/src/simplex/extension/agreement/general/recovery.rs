@@ -311,7 +311,9 @@ pub struct Verified<D: Digest> {
     origin: D,
 }
 impl<D: Digest> Verified<D> {
-    pub(super) fn matches_context<S: certificate::Scheme>(
+    /// Whether this receipt belongs to the same local verification context.
+    /// Revalidate the original evidence when the signing ledger is reopened.
+    pub fn matches_context<S: certificate::Scheme>(
         &self,
         context: &VerificationContext<S>,
     ) -> bool {

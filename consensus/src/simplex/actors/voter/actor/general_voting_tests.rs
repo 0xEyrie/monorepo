@@ -575,13 +575,19 @@ fn run_case(
             let g::Kind::Recover(row) = &signed.message.kind else { unreachable!() };
             let head = row.snapshot.head().unwrap();
             use crate::simplex::phase2::general::voting::{HistoryMaterial, HistoryQuery};
+            for (digest, valid) in [(head, true), (INPUT, false)] {
+                let reply = readiness.history_material(HistoryQuery::verification::<Sha256>(&captured, digest));
+                let msg = actor.mailbox_receiver.recv().await.unwrap();
+                (actor, _) = Box::pin(actor.process_message(msg)).await;
+                assert_eq!(matches!(reply.await.unwrap(), Some(HistoryMaterial::Verification(_))), valid);
+            }
             for (digest, index, valid) in [(head, None, true), (head, Some(0), true),
                 (head, Some(row.snapshot.count() as usize), false), (INPUT, None, false)] {
                 let reply = readiness.history_material(HistoryQuery::new::<Sha256>(&captured, digest, index));
                 let msg = actor.mailbox_receiver.recv().await.unwrap();
                 (actor, _) = Box::pin(actor.process_message(msg)).await;
                 match reply.await.unwrap() {
-                    Some(HistoryMaterial::Notice(_)) => panic!("expected a history witness"),
+                    Some(HistoryMaterial::Notice(_) | HistoryMaterial::Verification(_)) => panic!("expected a history witness"),
                     Some(HistoryMaterial::Entry(proof)) => {
                         assert!(valid && index.is_none());
                         assert_eq!(proof.target().id::<Sha256>(), row.entry);
