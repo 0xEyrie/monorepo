@@ -184,6 +184,11 @@ enum Command<D: Digest> {
         slot: D,
         evidence: D,
     },
+    HigherHistory {
+        slot: D,
+        entry: D,
+        report: Option<Bytes>,
+    },
     InitialHistory {
         slot: D,
         input: D,
@@ -222,6 +227,26 @@ impl<D: Digest> SelectRequest<D> {
                 slot: capture.core.slot.id::<H>(),
                 input: capture.input,
                 owner: capture.owner,
+                report,
+            },
+            proposal: capture.core.slot.proposal.clone(),
+        })
+    }
+    pub(crate) fn higher<H: Hasher<Digest = D>>(
+        capture: &FirstInput<D>,
+        entry: D,
+        report: Option<Bytes>,
+    ) -> Option<Self> {
+        if report
+            .as_ref()
+            .is_some_and(|raw| raw.len() > capture.limits.report_bytes)
+        {
+            return None;
+        }
+        Some(Self {
+            command: Command::HigherHistory {
+                slot: capture.core.slot.id::<H>(),
+                entry,
                 report,
             },
             proposal: capture.core.slot.proposal.clone(),
@@ -335,6 +360,9 @@ pub type RecoveryEvidence<S, D> = dyn Fn(&mut dyn CryptoRng, &g::VerificationCon
     + Send
     + Sync;
 
+/// Durable content-addressed entry provenance supplied by the host. Native
+/// authenticates each reachable node under its own verifier and resource limits.
+pub type EntryReader<S, D> = dyn Fn(D) -> Option<BTreeMap<D, g::entry::Proof<S, D>>> + Send + Sync;
 /// Trusted immutable deployment and a bounded index of checked application
 /// handles. The index owns no signer, issuance ledger, body archive or actor.
 pub struct Context<S: scheme::Scheme<D>, D: Digest> {
@@ -347,6 +375,7 @@ pub struct Context<S: scheme::Scheme<D>, D: Digest> {
     index: Arc<Mutex<Index<S, D>>>,
     recovery_evidence: Option<Arc<RecoveryEvidence<S, D>>>,
     recovery_wait: Option<Duration>,
+    entry_reader: Option<(g::entry::Bounds, Arc<EntryReader<S, D>>)>,
 }
 impl<S: scheme::Scheme<D>, D: Digest> Clone for Context<S, D> {
     fn clone(&self) -> Self {
@@ -360,6 +389,7 @@ impl<S: scheme::Scheme<D>, D: Digest> Clone for Context<S, D> {
             index: self.index.clone(),
             recovery_evidence: self.recovery_evidence.clone(),
             recovery_wait: self.recovery_wait,
+            entry_reader: self.entry_reader.clone(),
         }
     }
 }
@@ -393,6 +423,7 @@ where
             resources,
             recovery_evidence: None,
             recovery_wait: None,
+            entry_reader: None,
             index: Arc::new(Mutex::new(Index {
                 slots: BTreeMap::new(),
                 slots_by_view: BTreeMap::new(),
@@ -411,6 +442,15 @@ where
         }
         self.recovery_wait = Some(wait);
         Ok(self)
+    }
+    /// Install the durable successor-entry resolver used during issuance and WAL replay.
+    pub fn with_recovery_entries(
+        mut self,
+        bounds: g::entry::Bounds,
+        reader: Arc<EntryReader<S, D>>,
+    ) -> Self {
+        self.entry_reader = Some((bounds, reader));
+        self
     }
     /// Install the local durable evidence reader before constructing the voter.
     pub fn with_recovery_evidence(mut self, reader: Arc<RecoveryEvidence<S, D>>) -> Self {
@@ -1288,7 +1328,9 @@ where
                 l.replayed_ballots.insert(reservation.id::<H>());
                 true
             }
-            Event::History { .. } => initial_history::replay::<H, S, D, R>(s, c, rng, l, r),
+            Event::HigherHistory { .. } | Event::History { .. } => {
+                initial_history::replay::<H, S, D, R>(s, c, rng, l, r)
+            }
             Event::Select(record) => {
                 replay_room(c, l, &[record]);
                 let Some(body) = record.authority().and_then(|id| c.selection(id)) else {
@@ -1429,6 +1471,17 @@ where
         let c = state.interpretation_context();
         let body_id = match &request.command {
             Command::Select(id) => *id,
+            Command::HigherHistory { slot, report, .. } => {
+                return c.entry_reader.is_some()
+                    && report
+                        .as_ref()
+                        .is_none_or(|raw| raw.len() <= c.limits.report_bytes)
+                    && c.bootstrap(*slot)
+                        .is_some_and(|b| b.core.slot.proposal == request.proposal)
+                    && state
+                        .notarization(request.proposal.view())
+                        .is_some_and(|nqc| nqc.proposal == request.proposal);
+            }
             Command::Wish { slot, .. } => {
                 return c.recovery_wait.is_some()
                     && c.bootstrap(*slot)
@@ -1496,6 +1549,11 @@ where
             |s, c, rng, state, p, native, nqc| {
                 let body_id = match &request.command {
                     Command::Select(id) => *id,
+                    Command::HigherHistory {slot,entry,report}=>{
+                        let l=state.slots.get_mut(slot)?;
+                        if !native_matches::<H,S,D>(l.ledger.core(),s,p,native){return None;}
+                        return initial_history::stage_higher::<H,_,_,_>(s,c,rng,l,*entry,report.clone());
+                    }
                     Command::Wish {slot,predecessor} => {
                         let l=state.slots.get_mut(slot)?;
                         if !native_matches::<H,S,D>(l.ledger.core(),s,p,native) {return None;}
@@ -1655,7 +1713,9 @@ where
                 l.ledger.records().iter().find(|r| *r == record)
             }
             Event::Select(_) => l.select.as_ref(),
-            Event::History { .. } => l.history.as_ref().map(|(wal, _)| wal.record()),
+            Event::HigherHistory { .. } | Event::History { .. } => {
+                l.history.as_ref().map(|(wal, _)| wal.record())
+            }
             _ => return None,
         };
         if held != Some(record) {
@@ -1665,7 +1725,8 @@ where
             let signed = g::Signed::decode_cfg(frame.clone(), &c.limits).ok()?;
             return Some((signed, None));
         }
-        if (matches!(&r.0, Event::History { .. }) && l.history_from_replay)
+        if (matches!(&r.0, Event::History { .. } | Event::HigherHistory { .. })
+            && l.history_from_replay)
             || l.replayed_ballots.contains(&record.id::<H>())
         {
             // A reservation without a receipt does not say if the signer ran.
@@ -1685,7 +1746,7 @@ where
                         reservation: record.clone(),
                         receipt,
                     }
-                } else if matches!(&r.0, Event::History { .. }) {
+                } else if matches!(&r.0, Event::History { .. } | Event::HigherHistory { .. }) {
                     Event::HistoryReleased {
                         reservation: record.clone(),
                         receipt,

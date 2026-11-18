@@ -97,6 +97,16 @@ impl<S: Scheme, D: Digest> PartialEq for Wal<S, D> {
                     receipt: d,
                 },
             ) => a == c && b == d,
+            (
+                Event::HigherHistory {
+                    entry: a,
+                    reservation: b,
+                },
+                Event::HigherHistory {
+                    entry: x,
+                    reservation: y,
+                },
+            ) => a == x && b == y,
             (Event::NormalReleased(a), Event::NormalReleased(b)) => a == b,
             _ => false,
         }
@@ -136,6 +146,10 @@ pub(super) enum Event<S: Scheme, D: Digest> {
         reservation: g::issuance::Record<D>,
         nqc: bytes::Bytes,
     },
+    HigherHistory {
+        entry: g::issuance::Record<D>,
+        reservation: g::issuance::Record<D>,
+    },
     HistoryReleased {
         reservation: g::issuance::Record<D>,
         receipt: g::issuance::Record<D>,
@@ -146,7 +160,8 @@ impl<S: Scheme, D: Digest> Wal<S, D> {
     pub(super) const fn record(&self) -> &g::issuance::Record<D> {
         match &self.0 {
             Event::Wish(r) | Event::First(r) | Event::Select(r) => r,
-            Event::History { reservation, .. }
+            Event::HigherHistory { reservation, .. }
+            | Event::History { reservation, .. }
             | Event::Ballot { reservation, .. }
             | Event::BallotReleased { reservation, .. }
             | Event::HistoryReleased { reservation, .. }
@@ -186,6 +201,9 @@ impl<S: Scheme, D: Digest> Wal<S, D> {
                 reservation,
                 receipt,
             } => reservation.encode_size() + receipt.encode_size(),
+            Event::HigherHistory { entry, reservation } => {
+                entry.encode_size() + reservation.encode_size()
+            }
             Event::History {
                 entry,
                 reservation,
@@ -256,6 +274,11 @@ impl<S: Scheme, D: Digest> Write for Wal<S, D> {
                 no_first.write(w);
                 reservation.write(w);
             }
+            Event::HigherHistory { entry, reservation } => {
+                11u8.write(w);
+                entry.write(w);
+                reservation.write(w);
+            }
             Event::History {
                 entry,
                 reservation,
@@ -312,6 +335,10 @@ impl<S: Scheme, D: Digest> Read for Wal<S, D> {
                 reservation: record(&mut b)?,
                 receipt: Option::<g::issuance::Record<D>>::read_cfg(&mut b, &WIRE_LIMITS)?,
                 vote: FirstVote::read(&mut b)?,
+            },
+            11 => Event::HigherHistory {
+                entry: record(&mut b)?,
+                reservation: record(&mut b)?,
             },
             10 => Event::Wish(record(&mut b)?),
             2 => Event::Select(record(&mut b)?),

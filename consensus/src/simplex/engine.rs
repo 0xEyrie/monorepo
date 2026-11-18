@@ -372,6 +372,15 @@ commonware_macros::stability_scope!(ALPHA {
                 receiver
             }
         }
+        /// Enter a verified later recovery attempt and freeze the current signed history.
+        pub fn request_higher_history(&mut self, capture:&super::phase2::general::voting::FirstInput<D>,entry:D,report:Option<bytes::Bytes>)
+            ->commonware_utils::channel::oneshot::Receiver<Option<super::extension::agreement::general::Signed<S,D>>> {
+            if let Some(request)=super::phase2::general::voting::SelectRequest::higher::<H>(capture,entry,report){
+                self.mailbox.recover_extension(request)
+            } else {
+                let (sender,receiver)=commonware_utils::channel::oneshot::channel();let _=sender.send(None);receiver
+            }
+        }
         /// Poll the journal owner for its timeout WISH for the exact installed entry.
         /// A pending deadline yields no signature. Retrying returns the durable outbox.
         pub fn request_timeout_wish(&mut self, capture: &super::phase2::general::voting::FirstInput<D>, predecessor:D)
