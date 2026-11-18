@@ -132,6 +132,27 @@ pub trait Voting<S: Scheme, D: Digest>: Mode<S, D> {
     fn allows_original(state: &Self::RecoveryState) -> bool;
     fn recovery_proposal(record: &Self::Recovery) -> &Proposal<D>;
     fn recovery_context(context: &Self::Context, record: &Self::Recovery) -> bool;
+    /// Exact interpretation-only reservation eligible for historical release.
+    /// Normal reservations, including SELECT and FINAL, remain live-view only.
+    fn historical_slot(_: &Self::Recovery) -> Option<D> {
+        None
+    }
+    /// Resolves an included ancestor against admitted native finality and its
+    /// retained local issuance ledger. A missing ledger never opens a signer.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn historical_context<E, L>(
+        _: &StateWith<E, S, L, D, Self>,
+        _: &S,
+        _: &Proposal<D>,
+        _: D,
+    ) -> Option<NativeContext<D, S::PublicKey>>
+    where
+        S: scheme::Scheme<D>,
+        E: commonware_runtime::Clock + rand_core::CryptoRng + commonware_runtime::Metrics,
+        L: crate::simplex::elector::Elector<S>,
+    {
+        None
+    }
     /// Restores a record against the captured context and exact retained
     /// material. The RNG belongs to the native owner. Missing material must
     /// refuse replay rather than infer permission or an empty history.

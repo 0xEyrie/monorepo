@@ -1,5 +1,4 @@
-//! Original General voter adapter. Retained history grants no historical
-//! signing permission; later-ballot recovery needs its own admission path.
+//! Native General voter and interpretation-only recovery for included ancestors.
 
 use super::{
     FinalVote, Finalization, FirstVote, General, g,
@@ -268,6 +267,15 @@ impl<D: Digest> SelectRequest<D> {
                 evidence,
             },
             proposal: capture.core.slot.proposal.clone(),
+        }
+    }
+    const fn recovery_slot(&self) -> Option<D> {
+        match self.command {
+            Command::Select(_) => None,
+            Command::HigherHistory { slot, .. }
+            | Command::InitialHistory { slot, .. }
+            | Command::Wish { slot, .. }
+            | Command::Ballot { slot, .. } => Some(slot),
         }
     }
     /// Original native proposal view, not a later recovery ballot.
@@ -1452,6 +1460,75 @@ where
             _ => false,
         }
     }
+    fn historical_slot(record: &Wal<S, D>) -> Option<D> {
+        match record.0 {
+            Event::History { .. }
+            | Event::HigherHistory { .. }
+            | Event::Wish(_)
+            | Event::Ballot { .. } => Some(record.record().slot().id::<H>()),
+            _ => None,
+        }
+    }
+
+    fn historical_context<E, L>(
+        state: &crate::simplex::actors::voter::StateWith<E, S, L, D, Self>,
+        scheme: &S,
+        proposal: &Proposal<D>,
+        slot: D,
+    ) -> Option<NativeContext<D, S::PublicKey>>
+    where
+        E: commonware_runtime::Clock + CryptoRng + commonware_runtime::Metrics,
+        L: crate::simplex::elector::Elector<S>,
+    {
+        let anchor = state.history_anchor_after(proposal.view())?.inner();
+        let mut child = &anchor.origin.body.core.slot;
+        // The admitted final certificate binds its parent's native round and
+        // payload digest. Each intervening link must have its own original
+        // notarization and a locally journaled, native-context-checked FIRST.
+        while child.proposal.view() > proposal.view() {
+            let g::NativeParent::Proposal { round, digest } = child.parent else {
+                return None;
+            };
+            if round.epoch() != proposal.epoch()
+                || round.view() >= child.proposal.view()
+                || round.view() < proposal.view()
+            {
+                return None;
+            }
+            let parent = state.retained_round(round.view())?;
+            let p = &parent.notarization()?.proposal;
+            if p.round != round || p.payload != digest {
+                return None;
+            }
+            let mut links = parent.recovery_state().slots.values().filter(|l| {
+                let s = &l.ledger.core().slot;
+                s.proposal == *p
+                    && s.cut.checked_add(1) == Some(child.cut)
+                    && s.profile == child.profile
+                    && s.domain == child.domain
+                    && s.roster == child.roster
+                    && l.first_vote
+                        .as_ref()
+                        .is_some_and(|v| v.native().proposal == *p)
+            });
+            let core = links.next()?.ledger.core();
+            if links.next().is_some() {
+                return None;
+            }
+            child = &core.slot;
+            if p == proposal && child.id::<H>() == slot {
+                let parent_digest = match child.parent {
+                    g::NativeParent::Genesis(d) | g::NativeParent::Proposal { digest: d, .. } => d,
+                };
+                return Some(NativeContext {
+                    round: p.round,
+                    leader: scheme.participants().get(usize::from(core.leader))?.clone(),
+                    parent: (p.parent, parent_digest),
+                });
+            }
+        }
+        None
+    }
     fn observe_recovery_nqc<E, L>(
         state: &mut crate::simplex::actors::voter::StateWith<E, S, L, D, Self>,
         view: View,
@@ -1459,7 +1536,7 @@ where
         E: commonware_runtime::Clock + CryptoRng + commonware_runtime::Metrics,
         L: crate::simplex::elector::Elector<S>,
     {
-        state.observe_live_recovery(view, |s, c, r, p, n, t, d| {
+        state.observe_recovery(view, None, |s, c, r, p, n, t, d| {
             observe_slot::<H, _, _>(s, c, r, p, n, t, d, None)
         });
     }
@@ -1472,6 +1549,14 @@ where
         L: crate::simplex::elector::Elector<S>,
     {
         let c = state.interpretation_context();
+        let historical = request.view() <= state.last_finalized();
+        if historical
+            && state
+                .recovery_context_for(request.view(), request.recovery_slot())
+                .is_none()
+        {
+            return false;
+        }
         let body_id = match &request.command {
             Command::Select(id) => *id,
             Command::HigherHistory { slot, report, .. } => {
@@ -1482,7 +1567,8 @@ where
                     && c.bootstrap(*slot)
                         .is_some_and(|b| b.core.slot.proposal == request.proposal)
                     && state
-                        .notarization(request.proposal.view())
+                        .retained_round(request.proposal.view())
+                        .and_then(|r| r.notarization())
                         .is_some_and(|nqc| nqc.proposal == request.proposal);
             }
             Command::Wish { slot, .. } => {
@@ -1490,7 +1576,8 @@ where
                     && c.bootstrap(*slot)
                         .is_some_and(|b| b.core.slot.proposal == request.proposal)
                     && state
-                        .notarization(request.proposal.view())
+                        .retained_round(request.proposal.view())
+                        .and_then(|r| r.notarization())
                         .is_some_and(|qc| qc.proposal == request.proposal);
             }
             Command::Ballot { slot, .. } => {
@@ -1498,7 +1585,8 @@ where
                     && c.bootstrap(*slot)
                         .is_some_and(|b| b.core.slot.proposal == request.proposal)
                     && state
-                        .notarization(request.proposal.view())
+                        .retained_round(request.proposal.view())
+                        .and_then(|r| r.notarization())
                         .is_some_and(|nqc| nqc.proposal == request.proposal);
             }
             Command::InitialHistory {
@@ -1517,10 +1605,19 @@ where
                 {
                     return false;
                 }
+                // Inclusion already supplies historical entry. There is no
+                // live native round whose timeout must additionally expire.
+                if historical {
+                    return true;
+                }
                 return state
-                    .observe_live_recovery(request.proposal.view(), |s, c, r, p, n, t, d| {
-                        observe_slot::<H, _, _>(s, c, r, p, n, t, d, Some(*slot))
-                    })
+                    .observe_recovery(
+                        request.proposal.view(),
+                        Some(*slot),
+                        |s, c, r, p, n, t, d| {
+                            observe_slot::<H, _, _>(s, c, r, p, n, t, d, Some(*slot))
+                        },
+                    )
                     .unwrap_or(false);
             }
         };
@@ -1549,6 +1646,7 @@ where
         }
         state.stage_mode_recovery(
             request.proposal.view(),
+            request.recovery_slot(),
             |s, c, rng, state, p, native, nqc| {
                 let body_id = match &request.command {
                     Command::Select(id) => *id,

@@ -150,8 +150,10 @@ pub struct StateWith<
     last_finalized: View,
     genesis: Option<D>,
     views: BTreeMap<View, RoundWith<S, D, M>>,
-    // Retained data never participates in native progress or signer lookup.
+    // Retired rounds never participate in ordinary native voting or view progress.
     historical: BTreeMap<View, RoundWith<S, D, M>>,
+    // Original final anchors for retained interpretation slots, ordered by native view.
+    history_anchors: BTreeSet<View>,
     recovered: BTreeMap<View, M::Recovered>,
 
     /// Monotone cursor for the oldest entered, unfinalized view (the anchor of
@@ -262,6 +264,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
             genesis: None,
             views: BTreeMap::new(),
             historical: BTreeMap::new(),
+            history_anchors: BTreeSet::new(),
             recovered: BTreeMap::new(),
             stall_anchor: GENESIS_VIEW,
             nullify_views: BTreeSet::new(),
@@ -311,13 +314,18 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         record: &M::Recovery,
     ) -> Option<(M::RecoveryResponse, Option<M::Recovery>)> {
         let proposal = M::recovery_proposal(record);
-        if proposal.round.epoch() != self.epoch
-            || proposal.view() <= self.last_finalized
-            || !M::recovery_context(&self.mode_context, record)
+        if proposal.round.epoch() != self.epoch || !M::recovery_context(&self.mode_context, record)
         {
             return None;
         }
-        let round = self.views.get_mut(&proposal.view())?;
+        let view = proposal.view();
+        if view <= self.last_finalized {
+            M::historical_context(self, &self.scheme, proposal, M::historical_slot(record)?)?;
+        }
+        let round = self
+            .views
+            .get_mut(&view)
+            .or_else(|| self.historical.get_mut(&view))?;
         if round.proposal() != Some(proposal) {
             return None;
         }
@@ -330,13 +338,37 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         )
     }
 
-    /// Observe a live notarized round, even if it was never the local current view.
+    /// Historical interpretation can operate only on an independently resolved
+    /// exact ancestor. Live issuance still uses ordinary leader and parent rules.
+    #[commonware_macros::stability(ALPHA)]
+    pub(crate) fn recovery_context_for(
+        &self,
+        view: View,
+        slot: Option<D>,
+    ) -> Option<Context<D, S::PublicKey>> {
+        let round = self.retained_round(view)?;
+        let p = &round.notarization()?.proposal;
+        if p.epoch() != self.epoch || p.view() != view || round.proposal() != Some(p) {
+            return None;
+        }
+        if view <= self.last_finalized {
+            return M::historical_context(self, &self.scheme, p, slot?);
+        }
+        Some(Context {
+            round: p.round,
+            leader: round.leader()?.key,
+            parent: (p.parent, self.parent_payload(p).ok()?),
+        })
+    }
+
+    /// Observe an eligible notarized round, even if it was never the local current view.
     /// Only the mode's own recovery clock is mutable here.
     #[cfg(not(target_arch = "wasm32"))]
     #[commonware_macros::stability(ALPHA)]
-    pub(crate) fn observe_live_recovery<R>(
+    pub(crate) fn observe_recovery<R>(
         &mut self,
         view: View,
+        slot: Option<D>,
         observe: impl FnOnce(
             &S,
             &M::Context,
@@ -347,23 +379,16 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
             Duration,
         ) -> R,
     ) -> Option<R> {
-        if view <= self.last_finalized {
-            return None;
-        }
-        let round = self.views.get(&view)?;
+        let native = self.recovery_context_for(view, slot)?;
+        let round = self
+            .views
+            .get_mut(&view)
+            .or_else(|| self.historical.get_mut(&view))?;
         let p = round.notarization()?.proposal.clone();
-        if p.epoch() != self.epoch || p.view() != view || round.proposal() != Some(&p) {
-            return None;
-        }
-        let native = Context {
-            round: p.round,
-            leader: round.leader()?.key,
-            parent: (p.parent, self.parent_payload(&p).ok()?),
-        };
         Some(observe(
             &self.scheme,
             &self.mode_context,
-            self.views.get_mut(&view)?.recovery_state_mut(),
+            round.recovery_state_mut(),
             &p,
             &native,
             self.context.current(),
@@ -379,6 +404,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
     pub(crate) fn stage_mode_recovery(
         &mut self,
         view: View,
+        slot: Option<D>,
         stage: impl FnOnce(
             &S,
             &M::Context,
@@ -389,28 +415,18 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
             &Notarization<S, D>,
         ) -> Option<M::Recovery>,
     ) -> Option<M::Recovery> {
-        if view <= self.last_finalized {
-            return None;
-        }
-        let round = self.views.get(&view)?;
-        let proposal = round.proposal()?.clone();
-        if proposal.round.epoch() != self.epoch || proposal.view() != view {
-            return None;
-        }
+        let native = self.recovery_context_for(view, slot)?;
+        let round = self
+            .views
+            .get_mut(&view)
+            .or_else(|| self.historical.get_mut(&view))?;
         let notarization = round.notarization()?.clone();
-        if notarization.proposal != proposal {
-            return None;
-        }
-        let native = Context {
-            round: proposal.round,
-            leader: round.leader()?.key,
-            parent: (proposal.parent, self.parent_payload(&proposal).ok()?),
-        };
+        let proposal = notarization.proposal.clone();
         let record = stage(
             &self.scheme,
             &self.mode_context,
             &mut self.context,
-            self.views.get_mut(&view)?.recovery_state_mut(),
+            round.recovery_state_mut(),
             &proposal,
             &native,
             &notarization,
@@ -807,6 +823,9 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
             Some(M::finalization_election_certificate(&finalization)),
         );
         let result = self.create_round(view).add_finalization(finalization);
+        if M::RETAIN_HISTORY {
+            self.history_anchors.insert(view);
+        }
         if result.0 {
             self.wake_certification_child(view);
             self.slide_optimistic_frontier(view);
@@ -1643,6 +1662,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
             }
             ArtifactWith::Finalization(certificate) => {
                 round.add_finalization(certificate.clone());
+                self.history_anchors.insert(view);
             }
             ArtifactWith::Certification(_, _) if round.notarization().is_none() => return false,
             _ => {}
@@ -1659,6 +1679,18 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
             "native round has two recovery owners"
         );
         self.views.get(&view).or_else(|| self.historical.get(&view))
+    }
+
+    /// Closest authenticated native final anchor strictly above an unresolved
+    /// cut. A more distant moving tip cannot invalidate this retained proof.
+    #[commonware_macros::stability(ALPHA)]
+    pub(crate) fn history_anchor_after(&self, view: View) -> Option<&M::Certificate> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let anchor = *self
+            .history_anchors
+            .range((Excluded(view), Unbounded))
+            .next()?;
+        self.retained_round(anchor)?.finalization()
     }
 
     /// Returns the leader index for `view` if we already entered it.

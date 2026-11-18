@@ -40,6 +40,21 @@ reservation with no release receipt cannot publish a new signature. A RECOVER
 notice authenticates the history owner and head. A caller must retrieve and
 validate the referenced authorities before using the history to choose a value.
 
+### Recover the interpretation of an included ancestor
+
+Alignment uses the same Readiness requests after native finality passes the
+original view. The voter resolves the nearest retained descendant finalization
+and follows its authenticated parent round and payload digest back to the
+requested cut. Each link requires a matching notarization, consecutive height,
+domain, profile, roster and an existing locally journaled FIRST vote. Missing
+links or an unresolved local signing history keep that issuer unavailable.
+
+A verified ancestor can enter interpretation recovery immediately. RECOVER,
+WISH and recovery ballots use the original round's sole ledger and the same
+journal synchronization and release checks as live recovery. The authority
+does not admit SELECT or an old native FINAL. Marshal delivery independently
+checks the final anchor, full block ancestry and terminal interpretation.
+
 ### Replace a stalled recovery coordinator
 
 Configure the recovery-only timeout and a durable entry resolver before starting
