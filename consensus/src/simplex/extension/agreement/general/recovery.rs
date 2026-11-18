@@ -435,6 +435,10 @@ pub enum Error<D: Digest> {
     Limit,
     #[error("invalid recovery evidence: {0}")]
     Invalid(&'static str),
+    /// A fresh proposal cannot supersede this authenticated predecessor.
+    /// The caller must submit a new full carry for ordinary admission.
+    #[error("carry required: {0:?}")]
+    CarryRequired(D),
     #[error("terminal catchup required: {0:?}")]
     Catchup(D),
     #[error("same or higher recovery RPC already exists: {0:?}")]
@@ -1275,6 +1279,7 @@ fn admission<'a, H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest>(
                 _ => return Err(Error::Invalid("carried full Decision changed")),
             }
         }
+        (Some(authority), Choice::Fresh { .. }) => return Err(Error::CarryRequired(authority)),
         (None, Choice::Fresh { .. }) => {
             let rows = VerifiedRecoveryRows {
                 core: core.clone(),
