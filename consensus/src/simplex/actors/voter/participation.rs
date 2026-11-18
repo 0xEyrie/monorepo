@@ -81,6 +81,12 @@ pub trait Participation<S: Scheme<D>, D: Digest, M: Voting<S, D>>: Send + 'stati
     ) -> Option<M::FirstInput> {
         None
     }
+    /// True only while durable storage is syncing an already frozen local
+    /// signing choice for this exact proposal and native context. The owner
+    /// notifies Readiness on completion. Report preparation never qualifies.
+    fn syncing_first(&self, _: &Proposal<D>, _: &Context<D, S::PublicKey>) -> bool {
+        false
+    }
     /// Attach the currently available original report without altering the vote.
     fn notarize(&mut self, vote: Notarize<S, D>) -> M::Notarize;
     /// First admission of this native notarization in the current voter instance,
