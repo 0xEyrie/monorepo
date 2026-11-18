@@ -179,9 +179,7 @@ fn exercise(local: bool, finish: Finish) {
             WrappedSender::<_, Wire<S, D>>::new(context.network_buffer_pool().clone(), remote.0);
         let mut receiver = remote.1;
         let (tx, mut inbox) = mailbox::new(context.child("mailbox"), NZUsize!(32));
-        let ready = Readiness::<S, D, Extended> {
-            mailbox: Mailbox::new(tx),
-        };
+        let ready = Readiness::<S, D, Extended>::new(Mailbox::new(tx));
         let requests = Arc::new(Mutex::new(Vec::<Bytes>::new()));
         let promises = Arc::new(Mutex::new(0usize));
         let admissions = Arc::new(Mutex::new(0usize));
@@ -636,9 +634,7 @@ mod retry_bounds {
                 }
             });
         (
-            Readiness {
-                mailbox: Mailbox::new(tx),
-            },
+            Readiness::new(Mailbox::new(tx)),
             task,
         )
     }

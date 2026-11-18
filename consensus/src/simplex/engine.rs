@@ -180,7 +180,10 @@ impl<
     /// Returns a local readiness notifier. It cannot inject votes or certificates.
     #[commonware_macros::stability(ALPHA)]
     pub fn readiness(&self) -> Readiness<S, D, M> {
-        Readiness::new(self.voter_mailbox.clone())
+        Readiness {
+            mailbox: self.voter_mailbox.clone(),
+            batcher: Some(self.batcher_mailbox.clone()),
+        }
     }
 
     /// Start the `simplex` consensus engine.
@@ -336,6 +339,7 @@ commonware_macros::stability_scope!(ALPHA {
     #[derive(Clone)]
     pub struct Readiness<S: Scheme<D>, D: Digest, M: Voting<S, D>> {
         mailbox: voter::Mailbox<S, D, M>,
+        batcher: Option<batcher::Mailbox<S,D,M>>,
     }
     #[cfg(not(target_arch = "wasm32"))]
     impl<S, D, H> Readiness<S, D, super::phase2::general::General<H>>
@@ -418,8 +422,22 @@ commonware_macros::stability_scope!(ALPHA {
         }
     }
     impl<S: Scheme<D>, D: Digest, M: Voting<S, D>> Readiness<S, D, M> {
+        #[cfg(test)]
         pub(crate) const fn new(mailbox: voter::Mailbox<S, D, M>) -> Self {
-            Self { mailbox }
+            Self { mailbox, batcher: None }
+        }
+
+        /// Send checked final-vote assembly material to the existing batcher.
+        /// Admission is nonblocking. The reply distinguishes actual installation
+        /// from enqueue; a full or closed mailbox returns the original material.
+        pub fn submit_assembly(&self, material: M::Assembly)
+            -> Result<commonware_utils::channel::oneshot::Receiver<bool>,
+                commonware_utils::channel::mpsc::error::TrySendError<M::Assembly>>
+        {
+            match &self.batcher {
+                Some(batcher) => batcher.submit_assembly(material),
+                None => Err(commonware_utils::channel::mpsc::error::TrySendError::Closed(material)),
+            }
         }
 
         /// Retry this view after evidence has been authenticated and made durable.
