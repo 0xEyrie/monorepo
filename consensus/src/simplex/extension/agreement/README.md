@@ -18,9 +18,24 @@ clear old signing history to change profiles.
   authentication, checked assembly, issuance, history, and recovery-verification
   foundations. The declared resource domain is 4 through 64 equal-weight
   validators, `f = floor((n - 1) / 3)`, and `q = n - f`. This API domain is not
-  an operating-support claim. `General` still uses `NoRecovery` for recovered
-  values and recovery queries; automatic later-ballot service and Source delivery
-  remain unconnected.
+  an operating-support claim. The native General voter exposes the original
+  SELECT and live attempt-zero RECOVER through Readiness. It has no recovered
+  terminal installer or automatic later-attempt service.
+
+### Read the initial recovery history
+
+After the admitted original NQC and the local certification timeout,
+`Readiness::request_initial_history` freezes the local history and optional
+report. The voter journals the entry, original NQC and reservation before
+signing. It synchronizes the released outbox before returning RECOVER. The
+first published notice fixes the report for that attempt.
+
+Use `history_material(HistoryQuery::published(...))` to recover a lost reply.
+Use its signed head to read the entry and individual pages. This lookup also
+works in a retained historical round and never invokes the signer. A replayed
+reservation with no release receipt cannot publish a new signature. A RECOVER
+notice authenticates the history owner and head. A caller must retrieve and
+validate the referenced authorities before using the history to choose a value.
 
 ## Agreement
 

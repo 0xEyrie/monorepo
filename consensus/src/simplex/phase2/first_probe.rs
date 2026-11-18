@@ -120,6 +120,7 @@ impl<S: Scheme> Mode<S, D> for FirstProbe {
     {
         match *certificate {}
     }
+    type QueryResult = Self::RecoveryRequest;
     type RecoveryQuery = recovery::NoRecovery;
     fn recovery_query_view(query: &Self::RecoveryQuery) -> crate::types::View {
         match *query {}

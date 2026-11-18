@@ -85,6 +85,7 @@ impl<S: Scheme, D: Digest, const ACCEPT: bool, const ADMISSION: bool> Mode<S, D>
     {
         match *certificate {}
     }
+    type QueryResult = Self::RecoveryRequest;
     type RecoveryQuery = recovery::NoRecovery;
     fn recovery_query_view(query: &Self::RecoveryQuery) -> crate::types::View {
         match *query {}

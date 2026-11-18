@@ -345,6 +345,29 @@ commonware_macros::stability_scope!(ALPHA {
         D: Digest,
         H: commonware_cryptography::Hasher<Digest = D>,
     {
+        /// Reads an original entry or one frozen page after the signed RECOVER
+        /// was journaled. Reading retained history never grants signing authority.
+        pub fn history_material(
+            &mut self, query: super::phase2::general::voting::HistoryQuery<D>,
+        ) -> commonware_utils::channel::oneshot::Receiver<Option<super::phase2::general::voting::HistoryMaterial<S,D>>> {
+            self.mailbox.history_material(query)
+        }
+        /// Freezes the initial live recovery history after the original proposal's
+        /// native failure deadline. The returned signed RECOVER includes the
+        /// frozen history head. A retry must use the same optional report.
+        pub fn request_initial_history(
+            &mut self,
+            capture: &super::phase2::general::voting::FirstInput<D>,
+            report: Option<bytes::Bytes>,
+        ) -> commonware_utils::channel::oneshot::Receiver<Option<super::extension::agreement::general::Signed<S,D>>> {
+            if let Some(request) = super::phase2::general::voting::SelectRequest::initial_history::<H>(capture, report) {
+                self.mailbox.recover_extension(request)
+            } else {
+                let (sender, receiver) = commonware_utils::channel::oneshot::channel();
+                let _ = sender.send(None);
+                receiver
+            }
+        }
         /// Requests original SELECT for an already retained checked body.
         /// This is not later-ballot recovery permission. The voter governs
         /// current eligibility and journal sync before a response; closure or

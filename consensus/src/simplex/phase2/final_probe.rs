@@ -198,6 +198,7 @@ impl<S: Scheme> Mode<S, D> for FinalProbe {
     {
         match *r {}
     }
+    type QueryResult = Self::RecoveryRequest;
     type RecoveryQuery = recovery::NoRecovery;
     fn recovery_query_view(r: &Self::RecoveryQuery) -> View {
         match *r {}

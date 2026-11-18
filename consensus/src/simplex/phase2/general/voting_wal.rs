@@ -53,6 +53,28 @@ impl<S: Scheme, D: Digest> PartialEq for Wal<S, D> {
                     reservation: br,
                 },
             ) => a == b && ar == br,
+            (
+                Event::History {
+                    entry: a,
+                    reservation: b,
+                    nqc: c,
+                },
+                Event::History {
+                    entry: x,
+                    reservation: y,
+                    nqc: z,
+                },
+            ) => a == x && b == y && c == z,
+            (
+                Event::HistoryReleased {
+                    reservation: a,
+                    receipt: b,
+                },
+                Event::HistoryReleased {
+                    reservation: x,
+                    receipt: y,
+                },
+            ) => a == x && b == y,
             (Event::NormalReleased(a), Event::NormalReleased(b)) => a == b,
             _ => false,
         }
@@ -78,13 +100,24 @@ pub(super) enum Event<S: Scheme, D: Digest> {
         reservation: g::normal::Reservation<D>,
     },
     NormalReleased(g::normal::Released<S, D>),
+    History {
+        entry: g::issuance::Record<D>,
+        reservation: g::issuance::Record<D>,
+        nqc: bytes::Bytes,
+    },
+    HistoryReleased {
+        reservation: g::issuance::Record<D>,
+        receipt: g::issuance::Record<D>,
+    },
 }
 
 impl<S: Scheme, D: Digest> Wal<S, D> {
     pub(super) const fn record(&self) -> &g::issuance::Record<D> {
         match &self.0 {
             Event::First(r) | Event::Select(r) => r,
-            Event::FirstReleased { reservation, .. }
+            Event::History { reservation, .. }
+            | Event::HistoryReleased { reservation, .. }
+            | Event::FirstReleased { reservation, .. }
             | Event::SelectReleased { reservation, .. } => reservation,
             Event::Normal { reservation, .. } => reservation.agreement(),
             Event::NormalReleased(r) => r.reservation().agreement(),
@@ -115,6 +148,15 @@ impl<S: Scheme, D: Digest> Wal<S, D> {
                 reservation,
             } => no_first.encode_size() + reservation.encode_size(),
             Event::NormalReleased(r) => r.encode_size(),
+            Event::History {
+                entry,
+                reservation,
+                nqc,
+            } => entry.encode_size() + reservation.encode_size() + nqc.len(),
+            Event::HistoryReleased {
+                reservation,
+                receipt,
+            } => reservation.encode_size() + receipt.encode_size(),
         }
     }
 }
@@ -172,6 +214,24 @@ impl<S: Scheme, D: Digest> Write for Wal<S, D> {
                 no_first.write(w);
                 reservation.write(w);
             }
+            Event::History {
+                entry,
+                reservation,
+                nqc,
+            } => {
+                6u8.write(w);
+                entry.write(w);
+                reservation.write(w);
+                w.put_slice(nqc);
+            }
+            Event::HistoryReleased {
+                reservation,
+                receipt,
+            } => {
+                7u8.write(w);
+                reservation.write(w);
+                receipt.write(w);
+            }
             Event::NormalReleased(r) => {
                 5u8.write(w);
                 r.write(w);
@@ -208,6 +268,20 @@ impl<S: Scheme, D: Digest> Read for Wal<S, D> {
                 reservation: g::normal::Reservation::read_cfg(&mut b, &WIRE_LIMITS)?,
             },
             5 => Event::NormalReleased(g::normal::Released::read_cfg(&mut b, &WIRE_LIMITS)?),
+            6 => Event::History {
+                entry: record(&mut b)?,
+                reservation: record(&mut b)?,
+                nqc: {
+                    if !b.has_remaining() {
+                        return Err(Error::InvalidLength(0));
+                    }
+                    b.copy_to_bytes(b.remaining())
+                },
+            },
+            7 => Event::HistoryReleased {
+                reservation: record(&mut b)?,
+                receipt: record(&mut b)?,
+            },
             _ => return Err(Error::Invalid("G1 native WAL", "tag")),
         };
         if b.has_remaining() {

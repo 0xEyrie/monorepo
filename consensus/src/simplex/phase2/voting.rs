@@ -172,7 +172,7 @@ pub trait Voting<S: Scheme, D: Digest>: Mode<S, D> {
         state: &mut StateWith<E, S, L, D, Self>,
         query: &Self::RecoveryQuery,
         evidence: &mut impl Participation<S, D, Self>,
-    ) -> Option<Self::RecoveryRequest>
+    ) -> Option<Self::QueryResult>
     where
         E: commonware_runtime::Clock + rand_core::CryptoRng + commonware_runtime::Metrics,
         L: crate::simplex::elector::Elector<S>,

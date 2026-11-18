@@ -91,6 +91,7 @@ impl Mode<S, D> for SeparateElection {
     ) -> bool {
         match *value {}
     }
+    type QueryResult = Self::RecoveryRequest;
     type RecoveryQuery = recovery::NoRecovery;
     type RecoveryRequest = recovery::NoRecovery;
     type RecoveryResponse = recovery::NoRecovery;

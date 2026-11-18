@@ -360,7 +360,14 @@ where
     }
     type Recovery = voting_wal::Wal<S, D>;
     type Recovered = recovery::NoRecovery;
+    #[cfg(not(target_arch = "wasm32"))]
+    type RecoveryQuery = voting::HistoryQuery<D>;
+    #[cfg(not(target_arch = "wasm32"))]
+    type QueryResult = voting::HistoryMaterial<S, D>;
+    #[cfg(target_arch = "wasm32")]
     type RecoveryQuery = recovery::NoRecovery;
+    #[cfg(target_arch = "wasm32")]
+    type QueryResult = recovery::NoRecovery;
     #[cfg(not(target_arch = "wasm32"))]
     type RecoveryRequest = voting::SelectRequest<D>;
     #[cfg(target_arch = "wasm32")]
@@ -384,7 +391,10 @@ where
         match *value {}
     }
     fn recovery_query_view(value: &Self::RecoveryQuery) -> View {
-        match *value {}
+        #[cfg(not(target_arch = "wasm32"))]
+        { value.view() }
+        #[cfg(target_arch = "wasm32")]
+        { match *value {} }
     }
     fn recovery_view(value: &Self::RecoveryRequest) -> View {
         #[cfg(not(target_arch = "wasm32"))]

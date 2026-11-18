@@ -90,6 +90,7 @@ impl<S: Scheme, D: Digest> Mode<S, D> for Metadata {
     {
         <Plain as Mode<S, D>>::verify_recovered(certificate, rng, scheme, strategy)
     }
+    type QueryResult = Self::RecoveryRequest;
     type RecoveryQuery = recovery::NoRecovery;
     type RecoveryRequest = recovery::NoRecovery;
     type RecoveryResponse = recovery::NoRecovery;

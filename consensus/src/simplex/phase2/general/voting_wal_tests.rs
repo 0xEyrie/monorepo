@@ -11,7 +11,7 @@ mod conformance {
     type S = crate::simplex::scheme::ed25519::Scheme;
 
     #[test]
-    fn every_wal_tag_has_bounded_roundtrips_and_rejects_bad_frames() {
+    fn original_wal_tags_have_bounded_roundtrips_and_reject_bad_frames() {
         let mut seen = [0usize; 6];
         for seed in 0..512 {
             let mut data = vec![0u8; 32 * 1024];
@@ -28,7 +28,7 @@ mod conformance {
             extra.push(0);
             assert!(Wal::<S, D>::decode(bytes::Bytes::from(extra)).is_err());
             let mut bad = bytes.to_vec();
-            bad[8] = 6;
+            bad[8] = u8::MAX;
             assert!(Wal::<S, D>::decode(bytes::Bytes::copy_from_slice(&bad)).is_err());
             bad[8] = bytes[8];
             bad[0] ^= 1;

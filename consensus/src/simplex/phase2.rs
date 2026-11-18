@@ -88,6 +88,8 @@ pub trait Mode<S: Scheme, D: Digest>:
         S: scheme::Scheme<D>;
     /// Native recovery mailbox request; uninhabited in Plain.
     type RecoveryRequest: Send + 'static;
+    /// Typed non-voting response to a coordinator query.
+    type QueryResult: Send + 'static;
     /// Local coordinator query; uninhabited in Plain.
     type RecoveryQuery: Send + 'static;
     fn recovery_query_view(query: &Self::RecoveryQuery) -> crate::types::View;
@@ -238,6 +240,7 @@ impl<S: Scheme, D: Digest> Mode<S, D> for Plain {
     {
         match *certificate {}
     }
+    type QueryResult = Self::RecoveryRequest;
     type RecoveryQuery = recovery::NoRecovery;
     fn recovery_query_view(query: &Self::RecoveryQuery) -> crate::types::View {
         match *query {}
@@ -328,6 +331,7 @@ commonware_macros::stability_scope!(ALPHA {
             let Ok(n)=u32::try_from(scheme.participants().len()) else {return false;};
             n>0 && u64::from(n)>5*u64::from(N3f1::max_faults(n)) && S::is_attributable() && certificate.certificate().verify(rng,scheme,strategy)
         }
+        type QueryResult = Self::RecoveryRequest;
         type RecoveryQuery = super::extension::request::Query<S,D>;
         fn recovery_query_view(query:&Self::RecoveryQuery)->crate::types::View {query.view()}
         type RecoveryRequest = super::extension::request::Request<S,D>;

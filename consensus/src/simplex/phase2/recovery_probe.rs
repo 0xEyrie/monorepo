@@ -116,6 +116,7 @@ impl Mode<S, D> for RecoveryProbe {
     ) -> bool {
         match *v {}
     }
+    type QueryResult = Self::RecoveryRequest;
     type RecoveryQuery = recovery::NoRecovery;
     fn recovery_query_view(v: &Self::RecoveryQuery) -> View {
         match *v {}

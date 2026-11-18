@@ -182,7 +182,14 @@ macro_rules! config {
 
 // role 0: actual native leader; 1: Core follower; 2: outside-Core validator.
 fn run(n: u32, role: u8, normal: bool, records: usize) {
-    run_case(n, role, normal, records, true, false, false);
+    run_case(n, role, normal, records, true, false, Retry::None);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    None,
+    Select,
+    InitialHistory,
 }
 
 fn run_case(
@@ -192,9 +199,11 @@ fn run_case(
     records: usize,
     first_enabled: bool,
     foreign: bool,
-    retry_select: bool,
+    retry: Retry,
 ) {
     deterministic::Runner::timed(Duration::from_secs(20)).start(move |mut runtime| async move {
+        let retry_select = retry == Retry::Select;
+        let recover = retry == Retry::InitialHistory;
         assert!(!foreign || (!first_enabled && normal && role == 2));
         assert!(!retry_select || (first_enabled && normal && role == 0 && records == 6));
         let f = ed25519::fixture(&mut runtime, b"_COMMONWARE_CONSENSUS_GENERAL_ACTOR_TEST", n);
@@ -230,9 +239,13 @@ fn run_case(
             assembly: Arc::new(Mutex::new(None)),
         };
         let cache = CacheRef::from_pooler(&runtime, NZU16!(1024), NZUsize!(10));
+        let mut config = config!(scheme, cache, n);
+        if recover {
+            config.certification_timeout = Duration::from_millis(100);
+        }
         let (mut actor, mailbox) = ActorWith::new_with(
             runtime.child("live"),
-            config!(scheme, cache, n),
+            config,
             config_context.clone(),
             evidence.clone(),
         );
@@ -532,6 +545,58 @@ fn run_case(
             }
             material = Some((selection, assembly));
         }
+        let mut history = None;
+        if recover {
+            let votes: Vec<_> = f.schemes.iter().take(g::Committee::new(n as usize).unwrap().quorum())
+                .map(|s| Notarize::sign(s, proposal(1)).unwrap()).collect();
+            let nqc = Notarization::from_notarizes(&scheme, non_empty![@votes.iter()], &Sequential).unwrap();
+            assert!(nqc.verify(&mut runtime, &f.verifier, &Sequential));
+            (actor, _) = Box::pin(actor.process_message(Message::Verified {
+                span: tracing::Span::none(), certificate: CertificateWith::Notarization(nqc), from_resolver: false,
+            })).await;
+            let report = Some(Bytes::from_static(b"ready"));
+            let early = readiness.request_initial_history(&captured, report.clone());
+            let msg = actor.mailbox_receiver.recv().await.unwrap();
+            (actor, _) = Box::pin(actor.process_message(msg)).await;
+            assert!(early.await.unwrap().is_none());
+            runtime.sleep(Duration::from_millis(101)).await;
+            let canceled = readiness.request_initial_history(&captured, report.clone());
+            drop(canceled);
+            let msg = actor.mailbox_receiver.recv().await.unwrap();
+            (actor, _) = Box::pin(actor.process_message(msg)).await;
+            let retry = readiness.request_initial_history(&captured, report.clone());
+            let msg = actor.mailbox_receiver.recv().await.unwrap();
+            (actor, _) = Box::pin(actor.process_message(msg)).await;
+            let signed = retry.await.unwrap().unwrap();
+            assert!(signed.verify(&mut runtime, &f.verifier, LIMITS, &Sequential));
+            assert!(matches!(&signed.message.kind, g::Kind::Recover(row) if row.report == report && row.snapshot.owner() == Participant::new(owner as u32)));
+            let g::Kind::Recover(row) = &signed.message.kind else { unreachable!() };
+            let head = row.snapshot.head().unwrap();
+            use crate::simplex::phase2::general::voting::{HistoryMaterial, HistoryQuery};
+            for (digest, index, valid) in [(head, None, true), (head, Some(0), true),
+                (head, Some(row.snapshot.count() as usize), false), (INPUT, None, false)] {
+                let reply = readiness.history_material(HistoryQuery::new::<Sha256>(&captured, digest, index));
+                let msg = actor.mailbox_receiver.recv().await.unwrap();
+                (actor, _) = Box::pin(actor.process_message(msg)).await;
+                match reply.await.unwrap() {
+                    Some(HistoryMaterial::Notice(_)) => panic!("expected a history witness"),
+                    Some(HistoryMaterial::Entry(proof)) => {
+                        assert!(valid && index.is_none());
+                        assert_eq!(proof.target().id::<Sha256>(), row.entry);
+                    },
+                    Some(HistoryMaterial::Page(page)) => {
+                        assert!(valid && index.is_some());
+                        assert_eq!(page.record().slot(), &core.slot);
+                    },
+                    None => assert!(!valid),
+                }
+            }
+            let changed = readiness.request_initial_history(&captured, None);
+            let msg = actor.mailbox_receiver.recv().await.unwrap();
+            (actor, _) = Box::pin(actor.process_message(msg)).await;
+            assert!(changed.await.unwrap().is_none());
+            history = Some(signed);
+        }
         drop(actor);
 
         let journal =
@@ -559,6 +624,8 @@ fn run_case(
                 .count(),
             if foreign {
                 0
+            } else if recover {
+                2 * usize::from(first_enabled) + 3
             } else if !first_enabled {
                 2
             } else if normal {
@@ -597,7 +664,7 @@ fn run_case(
                 "physical WAL may repeat an existing logical record"
             );
         }
-        if !first_enabled && !foreign {
+        if !first_enabled && !foreign && !recover {
             // Decode the actual optional NoFirst inside the Normal WAL frame.
             // Its tag follows G1W2 + the u32 body length; the native Record
             // decoder validates the closure rather than a fabricated marker.
@@ -620,7 +687,7 @@ fn run_case(
         // Reopen the real journal, then drive native State replay explicitly.
         // This is not the Actor startup/network loop.
         let fresh_context = context(records);
-        fresh_context.publish_input::<Sha256>(bootstrap).unwrap();
+        fresh_context.publish_input::<Sha256>(bootstrap.clone()).unwrap();
         if let Some((selection, assembly)) = &material {
             fresh_context
                 .publish_selection::<Sha256>(selection.body().clone(), selection.checked().clone())
@@ -637,6 +704,31 @@ fn run_case(
         );
         fresh.state.set_genesis(D([0; 32]));
         let mut replayed_final = false;
+        let history_record = rows.iter().find_map(|r| match r {
+            ArtifactWith::Recovery(w) if w.encode()[8] == 6 => Some(w.clone()),
+            _ => None,
+        });
+        if let Some(record) = &history_record {
+            let ctx = context(records);
+            ctx.publish_input::<Sha256>(bootstrap.clone()).unwrap();
+            let (mut interrupted, _) = ActorWith::new_with(runtime.child("before_receipt"), config!(scheme, cache, n), ctx, evidence.clone());
+            interrupted.state.set_genesis(D([0; 32]));
+            for item in &rows {
+                if let ArtifactWith::Notarization(nqc) = item { interrupted.state.add_notarization(nqc.clone()); }
+                interrupted.state.replay(item);
+                if let ArtifactWith::Recovery(w) = item && w == record { break; }
+            }
+            interrupted.state.finish_notarize_replay();
+            assert!(interrupted.state.sign_recovery(record).is_none(), "uncertain signer invocation after crash");
+            for item in &rows {
+                if let ArtifactWith::Recovery(w) = item {
+                    let frame = w.encode();
+                    if matches!(frame[8], 6 | 7) {
+                        assert!(Wal::<S,D>::decode(frame.slice(..frame.len()-1)).is_err());
+                    }
+                }
+            }
+        }
         for row in rows {
             assert!(fresh.participation.accepts_replay(&row));
             if let ArtifactWith::Notarization(c) = &row {
@@ -661,6 +753,38 @@ fn run_case(
             fresh.state.replay(&row);
         }
         fresh.state.finish_notarize_replay();
+        if let Some(signed) = history {
+            let record = history_record.expect("durable history was missing");
+            let (replayed, receipt) = fresh.state.sign_recovery(&record).expect("restored history outbox");
+            assert!(receipt.is_none());
+            assert_eq!(replayed.encode(), signed.encode());
+            drop(fresh);
+            // Reopen the same native partition in the actual voter startup loop.
+            // Only the immutable checked application input is supplied again.
+            let restored_context = context(records);
+            restored_context.publish_input::<Sha256>(bootstrap.clone()).unwrap();
+            let (network, oracle) = Network::new_with_peers(runtime.child("history_network"), NConfig {
+                max_size: 1024*1024, max_peers_per_set: std::num::NonZeroUsize::new(n as usize).unwrap(),
+                disconnect_on_block: true, tracked_peer_sets: NZUsize!(1),
+            }, f.participants.clone()).await;
+            network.start();
+            let me = f.participants[owner].clone();
+            let (votes, _) = oracle.control(me.clone()).register(0, Quota::per_second(NZU32!(1000))).await.unwrap();
+            let (certificates, _) = oracle.control(me).register(1, Quota::per_second(NZU32!(1000))).await.unwrap();
+            let (restored, mailbox) = ActorWith::new_with(runtime.child("restarted_history"),
+                config!(scheme, cache, n), restored_context, evidence.clone());
+            let mut ready = crate::simplex::engine::Readiness::new(mailbox);
+            let (btx, _brx) = mailbox::new(runtime.child("history_batcher"), NZUsize!(32));
+            let (rtx, _rrx) = mailbox::new(runtime.child("history_resolver"), NZUsize!(32));
+            let handle = restored.start(batcher::Mailbox::new(btx), resolver::Mailbox::new(rtx), votes, certificates);
+            use crate::simplex::phase2::general::voting::{HistoryMaterial, HistoryQuery};
+            let published = ready.history_material(HistoryQuery::published::<Sha256>(&bootstrap)).await.unwrap();
+            let Some(HistoryMaterial::Notice(old)) = published else { panic!("missing published history after startup") };
+            assert_eq!(old.encode(), signed.encode());
+            handle.abort();
+            let _ = handle.await;
+            return;
+        }
         assert_eq!(replayed_final, final_vote.is_some());
         if final_vote.is_some() {
             assert!(fresh.state.pending_finalize(View::new(1)).is_none());
@@ -701,13 +825,13 @@ fn general_leader_select_and_normal_use_public_readiness_and_journal_across_rost
 #[test]
 fn general_outside_core_normal_before_local_first_retains_explicit_closure() {
     for n in [4, 8, 10, 13] {
-        run_case(n, 2, true, 4, false, false, false);
+        run_case(n, 2, true, 4, false, false, Retry::None);
     }
 }
 
 #[test]
 fn general_foreign_bootstrap_owner_cannot_authorize_local_normal_pair() {
-    run_case(8, 2, true, 4, false, true, false);
+    run_case(8, 2, true, 4, false, true, Retry::None);
 }
 
 // Inspect canonical WAL fields with their real decoders. The journal has
@@ -748,8 +872,17 @@ fn logical_records(w: &Wal<S, D>) -> Vec<g::issuance::Record<D>> {
 fn general_at_capacity_select_reply_retry_retains_exact_outbox() {
     // Cancel the first queued reply, then retry before and at logical capacity.
     // Check exact bytes and receipts; signer calls are not independently counted.
-    run_case(10, 0, true, 6, true, false, true);
+    run_case(10, 0, true, 6, true, false, Retry::Select);
 }
 
 #[path = "general_history_tests.rs"]
 mod history_tests;
+
+#[test]
+fn initial_history_fences_journals_and_replays_with_seven_validators() {
+    for role in 0..=2 {
+        for first in [false, true] {
+            run_case(7, role, false, 8, first, false, Retry::InitialHistory);
+        }
+    }
+}

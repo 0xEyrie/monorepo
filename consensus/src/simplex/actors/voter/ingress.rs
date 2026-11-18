@@ -24,7 +24,7 @@ pub enum Message<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
     RecoveryQuery {
         span: Span,
         query: M::RecoveryQuery,
-        reply: oneshot::Sender<Option<M::RecoveryRequest>>,
+        reply: oneshot::Sender<Option<M::QueryResult>>,
     },
     /// Read-only native eligibility check before application material retention.
     #[cfg_attr(
@@ -410,6 +410,15 @@ where
     D: Digest,
     H: commonware_cryptography::Hasher<Digest = D>,
 {
+    pub(crate) fn history_material(
+        &mut self, query: crate::simplex::phase2::general::voting::HistoryQuery<D>,
+    ) -> oneshot::Receiver<Option<crate::simplex::phase2::general::voting::HistoryMaterial<S,D>>> {
+        let (reply, receiver) = oneshot::channel();
+        let _ = self.sender.enqueue(Message::RecoveryQuery {
+            span: info_span!("simplex.voter.history_material", view=query.view().traced()), query, reply,
+        });
+        receiver
+    }
     /// Requests original SELECT for an already retained checked body. This does
     /// not request later-ballot recovery. Closure or None is not an ACK;
     /// cancellation does not undo work already accepted by the voter.

@@ -139,6 +139,10 @@ impl<D: Digest> FirstInput<D> {
     pub const fn input(&self) -> D {
         self.input
     }
+    /// Local signer bound to this capture, including when its FIRST row is absent.
+    pub const fn owner(&self) -> Participant {
+        self.owner
+    }
     /// Frozen checked row, or None only for an outside-Core owner.
     pub const fn row(&self) -> Option<&g::First<D>> {
         self.row.as_ref()
@@ -168,25 +172,104 @@ impl<S: scheme::Scheme<D>, D: Digest> Selection<S, D> {
         &self.checked
     }
 }
-/// A local typed request through the existing native recovery mailbox. This
-/// issues SELECT only; it is not later-ballot recovery permission or a wire proof.
+#[derive(Clone, Debug)]
+enum Command<D: Digest> {
+    Select(D),
+    InitialHistory {
+        slot: D,
+        input: D,
+        owner: Participant,
+        report: Option<Bytes>,
+    },
+}
+
+/// Original SELECT request. The native Readiness handle also uses this envelope
+/// internally for an initial recovery history request.
 #[derive(Clone, Debug)]
 pub struct SelectRequest<D: Digest> {
-    body: D,
+    command: Command<D>,
     proposal: Proposal<D>,
 }
 impl<D: Digest> SelectRequest<D> {
     /// References an already retained checked body through the existing mailbox.
     pub fn new<S: scheme::Scheme<D>>(selection: &Selection<S, D>) -> Self {
         Self {
-            body: selection.checked.body(),
+            command: Command::Select(selection.checked.body()),
             proposal: selection.body.core.slot.proposal.clone(),
         }
+    }
+    pub(crate) fn initial_history<H: Hasher<Digest = D>>(
+        capture: &FirstInput<D>,
+        report: Option<Bytes>,
+    ) -> Option<Self> {
+        if report
+            .as_ref()
+            .is_some_and(|r| r.len() > capture.limits.report_bytes)
+        {
+            return None;
+        }
+        Some(Self {
+            command: Command::InitialHistory {
+                slot: capture.core.slot.id::<H>(),
+                input: capture.input,
+                owner: capture.owner,
+                report,
+            },
+            proposal: capture.core.slot.proposal.clone(),
+        })
     }
     /// Original native proposal view, not a later recovery ballot.
     pub const fn view(&self) -> View {
         self.proposal.round.view()
     }
+}
+
+/// Read one original from the exact published initial RECOVER history.
+pub struct HistoryQuery<D: Digest> {
+    proposal: Proposal<D>,
+    slot: D,
+    input: D,
+    owner: Participant,
+    head: Option<D>,
+    page: Option<usize>,
+}
+impl<D: Digest> HistoryQuery<D> {
+    /// Read a zero-based page, or the exact original entry proof when page is None.
+    pub fn new<H: Hasher<Digest = D>>(input: &FirstInput<D>, head: D, page: Option<usize>) -> Self {
+        Self {
+            proposal: input.core.slot.proposal.clone(),
+            slot: input.core.slot.id::<H>(),
+            input: input.input,
+            owner: input.owner,
+            head: Some(head),
+            page,
+        }
+    }
+    /// Look up a previously published notice, including after a lost reply.
+    pub fn published<H: Hasher<Digest = D>>(input: &FirstInput<D>) -> Self {
+        Self {
+            proposal: input.core.slot.proposal.clone(),
+            slot: input.core.slot.id::<H>(),
+            input: input.input,
+            owner: input.owner,
+            head: None,
+            page: None,
+        }
+    }
+    /// Original native view used for read-only lookup.
+    pub const fn view(&self) -> View {
+        self.proposal.round.view()
+    }
+}
+/// Original evidence returned from a retained native ledger. Callers verify it
+/// against the signed history before making any recovery decision.
+pub enum HistoryMaterial<S: commonware_cryptography::certificate::Scheme, D: Digest> {
+    /// Previously journaled outbox bytes, decoded without another signer call.
+    Notice(g::Signed<S, D>),
+    /// The native NQC and its original recovery entry target.
+    Entry(g::entry::Proof<S, D>),
+    /// One of the hash-linked pages covered by the signed head.
+    Page(g::issuance::HistoryPage<D>),
 }
 
 #[derive(Clone)]
@@ -459,6 +542,8 @@ struct SlotLedger<S: scheme::Scheme<D>, D: Digest> {
     first: Option<g::issuance::Record<D>>,
     first_vote: Option<FirstVote<S, D>>,
     select: Option<g::issuance::Record<D>>,
+    history: Option<(Wal<S, D>, g::entry::Proof<S, D>)>,
+    history_from_replay: bool,
     normal: Option<g::normal::Reservation<D>>,
 }
 /// The sole round-owned collection of actual issuance ledgers, one per exact Slot.
@@ -535,6 +620,8 @@ where
                 first: None,
                 first_vote: None,
                 select: None,
+                history: None,
+                history_from_replay: false,
                 normal: None,
             },
         );
@@ -585,8 +672,8 @@ where
     type RecoveryState = RecoveryState<S, D>;
     const EMPTY_RECOVERY: Self::RecoveryState = RecoveryState::EMPTY;
     type FinalSubject = FinalSubject<D>;
-    fn allows_original(_: &Self::RecoveryState) -> bool {
-        true
+    fn allows_original(state: &Self::RecoveryState) -> bool {
+        state.slots.values().all(|slot| slot.history.is_none())
     }
     fn recovery_proposal(r: &Wal<S, D>) -> &Proposal<D> {
         r.proposal()
@@ -621,6 +708,8 @@ where
                 first: None,
                 first_vote: None,
                 select: None,
+                history: None,
+                history_from_replay: false,
                 normal: None,
             });
         }
@@ -906,6 +995,8 @@ where
                     first: None,
                     first_vote: None,
                     select: None,
+                    history: None,
+                    history_from_replay: false,
                     normal: None,
                 });
             }
@@ -996,6 +1087,7 @@ where
             return false;
         };
         match &r.0 {
+            Event::History { .. } => initial_history::replay::<H, S, D, R>(s, c, rng, l, r),
             Event::Select(record) => {
                 replay_room(c, l, &[record]);
                 let Some(body) = record.authority().and_then(|id| c.selection(id)) else {
@@ -1019,6 +1111,10 @@ where
             Event::SelectReleased {
                 reservation,
                 receipt,
+            }
+            | Event::HistoryReleased {
+                reservation,
+                receipt,
             } => {
                 let g::issuance::Action::Released {
                     reservation: released,
@@ -1027,7 +1123,12 @@ where
                 else {
                     return false;
                 };
-                if l.select.as_ref() != Some(reservation) || *released != reservation.id::<H>() {
+                let held = if matches!(&r.0, Event::HistoryReleased { .. }) {
+                    l.history.as_ref().map(|(wal, _)| wal.record())
+                } else {
+                    l.select.as_ref()
+                };
+                if held != Some(reservation) || *released != reservation.id::<H>() {
                     return false;
                 }
                 replay_room(c, l, &[receipt]);
@@ -1102,7 +1203,26 @@ where
         L: crate::simplex::elector::Elector<S>,
     {
         let c = state.interpretation_context();
-        let Some(body) = c.selection(request.body) else {
+        let body_id = match &request.command {
+            Command::Select(id) => *id,
+            Command::InitialHistory {
+                slot,
+                input,
+                owner,
+                report,
+            } => {
+                return state.initial_recovery_due(&request.proposal)
+                    && c.bootstrap(*slot).is_some_and(|b| {
+                        b.core.slot.proposal == request.proposal
+                            && b.input == *input
+                            && b.owner == *owner
+                    })
+                    && report
+                        .as_ref()
+                        .is_none_or(|r| r.len() <= c.limits.report_bytes);
+            }
+        };
+        let Some(body) = c.selection(body_id) else {
             return false;
         };
         body.body.core.slot.proposal == request.proposal
@@ -1125,34 +1245,82 @@ where
         if !Self::validate_recovery_request(state, request) {
             return None;
         }
-        state.stage_mode_recovery(request.proposal.view(), |s, c, rng, state, p, native, _| {
-            let body = c.selection(request.body)?;
-            if s.me() != Some(body.body.core.leader)
-                || !native_matches::<H, S, D>(&body.body.core, s, p, native)
-            {
-                return None;
-            }
-            let id = body.body.core.slot.id::<H>();
-            let l = state.slots.get_mut(&id)?;
-            room(c, l, usize::from(l.select.is_none()));
-            let record = l
-                .ledger
-                .reserve_select_checked::<H, E>(rng, &body.body, &body.checked, &Sequential)
-                .ok()?;
-            l.select = Some(record.clone());
-            Some(Wal(Event::Select(record)))
-        })
+        state.stage_mode_recovery(
+            request.proposal.view(),
+            |s, c, rng, state, p, native, nqc| {
+                let body_id = match &request.command {
+                    Command::Select(id) => *id,
+                    Command::InitialHistory { slot, report, .. } => {
+                        let b = c.bootstrap(*slot)?;
+                        if s.me() != Some(b.owner)
+                            || !native_matches::<H, S, D>(&b.core, s, p, native)
+                        {
+                            return None;
+                        }
+                        // This is the current live round after full voter replay.
+                        // No lookup miss in archived state may open a signing ledger.
+                        if !state.slots.contains_key(slot) && state.slots.len() >= c.resources.slots
+                        {
+                            return None;
+                        }
+                        let l = match state.slots.entry(*slot) {
+                            Entry::Occupied(old) => old.into_mut(),
+                            Entry::Vacant(v) => v.insert(SlotLedger {
+                                ledger: g::issuance::State::new::<H>(
+                                    s.clone(),
+                                    b.core,
+                                    b.input,
+                                    c.limits,
+                                )
+                                .ok()?,
+                                first: None,
+                                first_vote: None,
+                                select: None,
+                                normal: None,
+                                history: None,
+                                history_from_replay: false,
+                            }),
+                        };
+                        return initial_history::stage::<H, S, D, E>(
+                            s,
+                            c,
+                            rng,
+                            l,
+                            nqc,
+                            report.clone(),
+                        );
+                    }
+                };
+                let body = c.selection(body_id)?;
+                if s.me() != Some(body.body.core.leader)
+                    || !native_matches::<H, S, D>(&body.body.core, s, p, native)
+                {
+                    return None;
+                }
+                let id = body.body.core.slot.id::<H>();
+                let l = state.slots.get_mut(&id)?;
+                room(c, l, usize::from(l.select.is_none()));
+                let record = l
+                    .ledger
+                    .reserve_select_checked::<H, E>(rng, &body.body, &body.checked, &Sequential)
+                    .ok()?;
+                l.select = Some(record.clone());
+                Some(Wal(Event::Select(record)))
+            },
+        )
     }
     fn prepare_recovery_request<E, L>(
-        _: &mut crate::simplex::actors::voter::StateWith<E, S, L, D, Self>,
-        q: &Self::RecoveryQuery,
+        state: &mut crate::simplex::actors::voter::StateWith<E, S, L, D, Self>,
+        query: &Self::RecoveryQuery,
         _: &mut impl Participation<S, D, Self>,
-    ) -> Option<SelectRequest<D>>
+    ) -> Option<Self::QueryResult>
     where
         E: commonware_runtime::Clock + CryptoRng + commonware_runtime::Metrics,
         L: crate::simplex::elector::Elector<S>,
     {
-        match *q {}
+        let round = state.retained_round(query.view())?;
+        let ledger = round.recovery_state().slots.get(&query.slot)?;
+        initial_history::material(ledger, query)
     }
     fn sign_recovery(_: &S, _: &Self::Context, _: &Wal<S, D>) -> Option<g::Signed<S, D>> {
         None
@@ -1164,28 +1332,42 @@ where
         state: &mut Self::RecoveryState,
         r: &Wal<S, D>,
     ) -> Option<(g::Signed<S, D>, Option<Wal<S, D>>)> {
-        let Event::Select(record) = &r.0 else {
-            return None;
-        };
+        let record = r.record();
         let l = state.slots.get_mut(&record.slot().id::<H>())?;
-        if l.select.as_ref() != Some(record) {
+        let held = match &r.0 {
+            Event::Select(_) => l.select.as_ref(),
+            Event::History { .. } => l.history.as_ref().map(|(wal, _)| wal.record()),
+            _ => return None,
+        };
+        if held != Some(record) {
             return None;
         }
         if let Some(frame) = l.ledger.outbox(record) {
             let signed = g::Signed::decode_cfg(frame.clone(), &c.limits).ok()?;
             return Some((signed, None));
         }
+        if matches!(&r.0, Event::History { .. }) && l.history_from_replay {
+            // A reservation without a receipt does not say if the signer ran.
+            return None;
+        }
         room(c, l, 1);
         let signed = l.ledger.sign_reserved(record).ok()?;
         let receipt = l
             .ledger
             .record_signed::<H, R>(rng, record, &signed, &Sequential)
-            .expect("General SELECT receipt failed");
+            .expect("General recovery mailbox receipt failed");
         Some((
             signed,
-            Some(Wal(Event::SelectReleased {
-                reservation: record.clone(),
-                receipt,
+            Some(Wal(if matches!(&r.0, Event::History { .. }) {
+                Event::HistoryReleased {
+                    reservation: record.clone(),
+                    receipt,
+                }
+            } else {
+                Event::SelectReleased {
+                    reservation: record.clone(),
+                    receipt,
+                }
             })),
         ))
     }
@@ -1194,3 +1376,6 @@ where
 #[cfg(test)]
 #[path = "voting_replay_tests.rs"]
 mod replay_tests;
+
+#[path = "initial_history.rs"]
+mod initial_history;

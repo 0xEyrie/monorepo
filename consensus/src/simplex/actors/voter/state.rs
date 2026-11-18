@@ -330,6 +330,21 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         )
     }
 
+    /// Live, unresolved original with an admitted NQC past its native failure deadline.
+    /// Historical ancestry requires separate inclusion evidence.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[commonware_macros::stability(ALPHA)]
+    pub(crate) fn initial_recovery_due(&self, p: &Proposal<D>) -> bool {
+        p.epoch() == self.epoch
+            && p.view() > self.last_finalized
+            && self
+                .notarization(p.view())
+                .is_some_and(|n| n.proposal == *p)
+            && self
+                .elapsed_since_start(p.view())
+                .is_some_and(|d| d >= self.certification_timeout)
+    }
+
     /// Lends the sole mode ledger after resolving current native input.
     /// The closure must validate its mode-specific authority and leave the
     /// ledger unchanged on refusal. It must not sign or publish. The caller
@@ -1609,7 +1624,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         true
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, not(target_arch = "wasm32")))]
     #[commonware_macros::stability(ALPHA)]
     pub(crate) fn retained_round(&self, view: View) -> Option<&RoundWith<S, D, M>> {
         assert!(
