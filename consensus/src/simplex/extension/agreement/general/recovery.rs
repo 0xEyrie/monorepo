@@ -1330,6 +1330,54 @@ pub fn verify<'a, H, S, D, R>(
     core: &'a Core<D>,
     input: D,
     root: D,
+    resolve: impl FnMut(&D) -> Option<&'a Material<S, D>>,
+    limits: Limits,
+    bounds: Bounds,
+    validate_first: impl FnMut(&First<D>) -> bool,
+    validate_original_build: impl FnMut(&VerifiedRows<S, D>, &OriginBody<S, D>) -> bool,
+    validate_fresh: impl FnMut(&VerifiedRecoveryRows<S, D>, &ProposalBody<D>) -> bool,
+    strategy: &impl Strategy,
+) -> Result<Verified<D>, Error<D>>
+where
+    H: Hasher<Digest = D>,
+    S: scheme::Scheme<D>,
+    D: Digest,
+    R: CryptoRng,
+{
+    match verify_root::<H, S, D, R>(
+        rng,
+        context,
+        core,
+        input,
+        root,
+        resolve,
+        limits,
+        bounds,
+        validate_first,
+        validate_original_build,
+        validate_fresh,
+        strategy,
+    )? {
+        VerifiedRoot::Authority(value) => Ok(value),
+        VerifiedRoot::History => Err(Error::Invalid("recovery authority root role")),
+    }
+}
+
+/// Result of replaying a complete evidence closure. A verified history alone
+/// cannot be used as signing authority.
+pub enum VerifiedRoot<D: Digest> {
+    History,
+    Authority(Verified<D>),
+}
+
+/// Replay a peer history before counting it, or verify an authority root.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_root<'a, H, S, D, R>(
+    rng: &mut R,
+    context: &VerificationContext<S>,
+    core: &'a Core<D>,
+    input: D,
+    root: D,
     mut resolve: impl FnMut(&D) -> Option<&'a Material<S, D>>,
     limits: Limits,
     bounds: Bounds,
@@ -1337,7 +1385,7 @@ pub fn verify<'a, H, S, D, R>(
     mut validate_original_build: impl FnMut(&VerifiedRows<S, D>, &OriginBody<S, D>) -> bool,
     mut validate_fresh: impl FnMut(&VerifiedRecoveryRows<S, D>, &ProposalBody<D>) -> bool,
     strategy: &impl Strategy,
-) -> Result<Verified<D>, Error<D>>
+) -> Result<VerifiedRoot<D>, Error<D>>
 where
     H: Hasher<Digest = D>,
     S: scheme::Scheme<D>,
@@ -1594,10 +1642,11 @@ where
         };
         checked.insert(id, result);
     }
-    let Checked::Value(result) = checked.remove(&root).ok_or(Error::Missing(root))? else {
-        return Err(Error::Invalid("recovery authority root role"));
-    };
-    Ok(result)
+    match checked.remove(&root).ok_or(Error::Missing(root))? {
+        Checked::History { .. } => Ok(VerifiedRoot::History),
+        Checked::Value(value) => Ok(VerifiedRoot::Authority(value)),
+        _ => Err(Error::Invalid("recovery authority root role")),
+    }
 }
 
 #[cfg(feature = "arbitrary")]
