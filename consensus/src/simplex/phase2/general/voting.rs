@@ -1549,22 +1549,55 @@ where
             |s, c, rng, state, p, native, nqc| {
                 let body_id = match &request.command {
                     Command::Select(id) => *id,
-                    Command::HigherHistory {slot,entry,report}=>{
-                        let l=state.slots.get_mut(slot)?;
-                        if !native_matches::<H,S,D>(l.ledger.core(),s,p,native){return None;}
-                        return initial_history::stage_higher::<H,_,_,_>(s,c,rng,l,*entry,report.clone());
+                    Command::HigherHistory {
+                        slot,
+                        entry,
+                        report,
+                    } => {
+                        let l = state.slots.get_mut(slot)?;
+                        if !native_matches::<H, S, D>(l.ledger.core(), s, p, native) {
+                            return None;
+                        }
+                        return initial_history::stage_higher::<H, _, _, _>(
+                            s,
+                            c,
+                            rng,
+                            l,
+                            *entry,
+                            report.clone(),
+                        );
                     }
-                    Command::Wish {slot,predecessor} => {
-                        let l=state.slots.get_mut(slot)?;
-                        if !native_matches::<H,S,D>(l.ledger.core(),s,p,native) {return None;}
-                        let (_,proof)=l.history.as_ref()?;
-                        if proof.artifact_id::<H>() != *predecessor {return None;}
-                        let core=l.ledger.core().clone();
-                        let checked=initial_history::verify_entry::<H,_,_,_>(rng,s,c,&l.ledger,&core,proof)?;
-                        if let Some(old)=l.ledger.records().iter().find(|r|matches!(r.message().map(|m|&m.kind), Some(g::Kind::Wish(w)) if w.predecessor == *predecessor)) { return Some(Wal(Event::Wish(old.clone()))); }
-                        if l.ledger.records().len().checked_add(2)? > c.resources.records_per_slot {return None;}
-                        l.ledger.arm_wish_timeout::<H>(rng,&checked,c.recovery_wait?).ok()?;
-                        let reservation=l.ledger.reserve_timeout_wish::<H>(rng,&checked).ok()?;
+                    Command::Wish { slot, predecessor } => {
+                        let l = state.slots.get_mut(slot)?;
+                        if !native_matches::<H, S, D>(l.ledger.core(), s, p, native) {
+                            return None;
+                        }
+                        let (_, proof) = l.history.as_ref()?;
+                        if proof.artifact_id::<H>() != *predecessor {
+                            return None;
+                        }
+                        let core = l.ledger.core().clone();
+                        let checked = initial_history::verify_entry::<H, _, _, _>(
+                            rng, s, c, &l.ledger, &core, proof,
+                        )?;
+                        if let Some(old) = l.ledger.records().iter().find(|record| {
+                            matches!(record.message().map(|message| &message.kind),
+                                Some(g::Kind::Wish(wish)) if wish.predecessor == *predecessor)
+                        }) {
+                            if l.replayed_ballots.contains(&old.id::<H>())
+                                && l.ledger.outbox(old).is_none()
+                            {
+                                return None;
+                            }
+                            return Some(Wal(Event::Wish(old.clone())));
+                        }
+                        if l.ledger.records().len().checked_add(2)? > c.resources.records_per_slot {
+                            return None;
+                        }
+                        l.ledger
+                            .arm_wish_timeout::<H>(rng, &checked, c.recovery_wait?)
+                            .ok()?;
+                        let reservation = l.ledger.reserve_timeout_wish::<H>(rng, &checked).ok()?;
                         return Some(Wal(Event::Wish(reservation)));
                     }
                     Command::Ballot { slot, evidence } => {

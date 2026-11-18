@@ -126,11 +126,13 @@ where
     Some(wal)
 }
 
+type ProofGraph<S, D> = BTreeMap<D, g::entry::Proof<S, D>>;
+
 // The provider owns retention; its return value grants no vote.
 fn originals<S: scheme::Scheme<D>, D: Digest>(
     c: &Context<S, D>,
     root: D,
-) -> Option<(g::entry::Bounds, BTreeMap<D, g::entry::Proof<S, D>>)> {
+) -> Option<(g::entry::Bounds, ProofGraph<S, D>)> {
     let (budget, reader) = c.entry_reader.as_ref()?;
     let graph = reader(root)?;
     if graph.len() > budget.nodes as usize || !graph.contains_key(&root) {

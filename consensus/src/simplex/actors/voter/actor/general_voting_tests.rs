@@ -737,11 +737,11 @@ fn run_case(
         fresh.state.set_genesis(D([0; 32]));
         let mut replayed_final = false;
         let history_record = rows.iter().find_map(|r| match r {
-            ArtifactWith::Recovery(w) if w.encode()[8] == 6 => Some(w.clone()),
+            ArtifactWith::Recovery(w) if w.encode()[8] == if wish {10} else {6} => Some(w.clone()),
             _ => None,
         });
         if let Some(record) = &history_record {
-            let ctx = context(records);
+            let ctx = make_context();
             ctx.publish_input::<Sha256>(bootstrap.clone()).unwrap();
             let mut cfg = config!(scheme, cache, n);
             cfg.certification_timeout = Duration::from_millis(100);
@@ -765,7 +765,7 @@ fn run_case(
                 &SelectRequest::initial_history::<Sha256>(&bootstrap,report.clone()).unwrap()));
             let mut ready = crate::simplex::engine::Readiness::new(retry_box);
             for _ in 0..2 {
-                let reply = ready.request_initial_history(&bootstrap, report.clone());
+                let reply = if let Some((predecessor,_)) = &issued_wish {ready.request_timeout_wish(&bootstrap,*predecessor)} else {ready.request_initial_history(&bootstrap, report.clone())};
                 let message = interrupted.mailbox_receiver.recv().await.unwrap();
                 (interrupted, _) = Box::pin(interrupted.process_message(message)).await;
                 assert!(reply.await.unwrap().is_none());
@@ -774,7 +774,7 @@ fn run_case(
             for item in &rows {
                 if let ArtifactWith::Recovery(w) = item {
                     let frame = w.encode();
-                    if matches!(frame[8], 6 | 7) {
+                    if matches!(frame[8], 6 | 7 | 9 | 10) {
                         assert!(Wal::<S,D>::decode(frame.slice(..frame.len()-1)).is_err());
                     }
                 }
@@ -808,7 +808,8 @@ fn run_case(
             let record = history_record.expect("durable history was missing");
             let (replayed, receipt) = fresh.state.sign_recovery(&record).expect("restored history outbox");
             assert!(receipt.is_none());
-            assert_eq!(replayed.encode(), signed.encode());
+            let expected = issued_wish.as_ref().map_or(&signed, |(_, vote)| vote);
+            assert_eq!(replayed.encode(), expected.encode());
             drop(fresh);
             // Reopen the same native partition in the actual voter startup loop.
             // Only the immutable checked application input is supplied again.

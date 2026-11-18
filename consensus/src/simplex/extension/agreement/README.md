@@ -19,8 +19,8 @@ clear old signing history to change profiles.
   foundations. The declared resource domain is 4 through 64 equal-weight
   validators, `f = floor((n - 1) / 3)`, and `q = n - f`. This API domain is not
   an operating-support claim. The native General voter exposes the original
-  SELECT and live attempt-zero RECOVER through Readiness. It has no recovered
-  terminal installer or automatic later-attempt service.
+  SELECT, RECOVER, recovery ballots and timeout WISH through Readiness.
+  Alignment collects recovery evidence and drives attempts.
 
 ### Read the initial recovery history
 
@@ -39,6 +39,21 @@ works in a retained historical round and never invokes the signer. A replayed
 reservation with no release receipt cannot publish a new signature. A RECOVER
 notice authenticates the history owner and head. A caller must retrieve and
 validate the referenced authorities before using the history to choose a value.
+
+### Replace the first recovery coordinator
+
+Configure the recovery-only timeout and a durable entry resolver before starting
+the voter. After the initial RECOVER, request a WISH for the exact predecessor
+artifact. Repeated calls leave the deadline fixed. The voter signs after expiry,
+persists the receipt, and returns the same bytes on retry. A crash between the
+reservation and its receipt leaves that signature unavailable.
+
+Alignment collects WISHes from distinct validators and retains the complete
+successor entry, including each signer's original entry proof. On a
+`request_higher_history` call the voter verifies this graph and its quorum,
+fences older ballots in the journal, then signs a new RECOVER. Restore the same
+entry resolver before voter replay. A successor entry alone authorizes no
+PREPARE, COMMIT, native finalization or Marshal delivery.
 
 ## Agreement
 
