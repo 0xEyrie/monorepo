@@ -40,7 +40,7 @@ reservation with no release receipt cannot publish a new signature. A RECOVER
 notice authenticates the history owner and head. A caller must retrieve and
 validate the referenced authorities before using the history to choose a value.
 
-### Replace the first recovery coordinator
+### Replace a stalled recovery coordinator
 
 Configure the recovery-only timeout and a durable entry resolver before starting
 the voter. After the initial RECOVER, request a WISH for the exact predecessor
@@ -52,7 +52,9 @@ Alignment collects WISHes from distinct validators and retains the complete
 successor entry, including each signer's original entry proof. On a
 `request_higher_history` call the voter verifies this graph and its quorum,
 fences older ballots in the journal, then signs a new RECOVER. Restore the same
-entry resolver before voter replay. A successor entry alone authorizes no
+entry resolver before voter replay. For a WISH after the first handoff, both
+live issuance and replay load the bounded predecessor graph through that
+resolver. Missing ancestors prevent release. A successor entry alone authorizes no
 PREPARE, COMMIT, native finalization or Marshal delivery.
 
 ## Agreement

@@ -1262,9 +1262,12 @@ where
                     return false;
                 };
                 let core = l.ledger.core().clone();
-                let Some(checked) =
-                    initial_history::verify_entry::<H, _, _, _>(rng, s, c, &l.ledger, &core, proof)
-                else {
+                let Some(evidence) = initial_history::entry_evidence::<H, _, _>(s, c, proof) else {
+                    return false;
+                };
+                let Some(checked) = initial_history::verify_entry::<H, _, _, _>(
+                    rng, c, &l.ledger, &core, proof, &evidence,
+                ) else {
                     return false;
                 };
                 if !matches!(
@@ -1577,8 +1580,9 @@ where
                             return None;
                         }
                         let core = l.ledger.core().clone();
+                        let evidence = initial_history::entry_evidence::<H, _, _>(s, c, proof)?;
                         let checked = initial_history::verify_entry::<H, _, _, _>(
-                            rng, s, c, &l.ledger, &core, proof,
+                            rng, c, &l.ledger, &core, proof, &evidence,
                         )?;
                         if let Some(old) = l.ledger.records().iter().find(|record| {
                             matches!(record.message().map(|message| &message.kind),

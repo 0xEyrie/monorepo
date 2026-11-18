@@ -37,13 +37,26 @@ fn bounds(n: usize) -> Option<g::entry::Bounds> {
     })
 }
 
+/// Initial entries carry their NQC inline. A WISH on a later entry must
+/// verify every predecessor in its bounded custody graph, both live and on replay.
+pub(super) fn entry_evidence<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest>(
+    s: &S,
+    c: &Context<S, D>,
+    proof: &g::entry::Proof<S, D>,
+) -> Option<(g::entry::Bounds, ProofGraph<S, D>)> {
+    match proof {
+        g::entry::Proof::Initial { .. } => Some((bounds(s.participants().len())?, BTreeMap::new())),
+        g::entry::Proof::Higher { .. } => originals(c, proof.artifact_id::<H>()),
+    }
+}
+
 pub(super) fn verify_entry<'a, H, S, D, R>(
     rng: &mut R,
-    s: &S,
     c: &Context<S, D>,
     ledger: &g::issuance::State<S, D>,
     core: &'a g::Core<D>,
     proof: &'a g::entry::Proof<S, D>,
+    evidence: &'a (g::entry::Bounds, ProofGraph<S, D>),
 ) -> Option<g::entry::VerifiedEntry<'a, S, D>>
 where
     H: Hasher<Digest = D>,
@@ -59,8 +72,8 @@ where
         ledger.input(),
         proof,
         c.limits,
-        bounds(s.participants().len())?,
-        |_| None,
+        evidence.0,
+        |id| evidence.1.get(id),
         &Sequential,
     )
     .ok()
@@ -94,7 +107,8 @@ where
     let core = l.ledger.core().clone();
     let input = l.ledger.input();
     let authority = proof::<H, _, _>(&core, input, nqc.clone())?;
-    let checked = verify_entry::<H, _, _, _>(rng, s, c, &l.ledger, &core, &authority)?;
+    let evidence = entry_evidence::<H, _, _>(s, c, &authority)?;
+    let checked = verify_entry::<H, _, _, _>(rng, c, &l.ledger, &core, &authority, &evidence)?;
     if report
         .as_ref()
         .is_some_and(|r| r.len() > c.limits.report_bytes)
