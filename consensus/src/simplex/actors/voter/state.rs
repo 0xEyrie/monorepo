@@ -942,10 +942,12 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
                     .expect("first reservation native parent unavailable"),
             ),
         };
-        let Some(input) = evidence.capture_notarize(&candidate, &native) else {
-            assert!(evidence.syncing_first(&candidate, &native), "mandatory first input unavailable");
+        if evidence.syncing_first(&candidate, &native) {
             return None;
-        };
+        }
+        let input = evidence
+            .capture_notarize(&candidate, &native)
+            .expect("mandatory first input unavailable");
         let record = M::reserve_notarize(
             &self.scheme,
             &self.mode_context,
