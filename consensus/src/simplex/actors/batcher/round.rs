@@ -23,6 +23,9 @@ use rand_core::CryptoRng;
 use std::sync::Arc;
 use tracing::Span;
 
+#[cfg(test)]
+mod metadata_tests;
+
 /// Stock per-view state with native vote and certificate representations.
 pub type Round<S, B, D, R> = RoundWith<S, B, D, R, Plain>;
 
@@ -85,6 +88,12 @@ impl<
 
             span: ViewSpan::new(),
         }
+    }
+
+    /// Installs checked local material without changing native proposal selection.
+    /// Returns false when the phase is complete or bounded retention rejects it.
+    pub(super) fn install_assembly(&mut self, material: M::Assembly) -> bool {
+        self.verifier.install_assembly(material)
     }
 
     /// Returns the root span of the view.
@@ -336,7 +345,7 @@ impl<
                             self.reporter
                                 .report(ActivityWith::ConflictingFinalize(activity));
                             commonware_p2p::block!(self.blocker, sender, "conflicting finalize");
-                        } else if previous != &finalize {
+                        } else if !M::equivalent_finalize(previous, &finalize) {
                             commonware_p2p::block!(self.blocker, sender, "invalid signature");
                         }
                         false

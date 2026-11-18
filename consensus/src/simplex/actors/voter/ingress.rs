@@ -402,6 +402,31 @@ impl<S: Scheme, D: Digest, M: Mode<S, D>> Mailbox<S, D, M> {
 }
 
 commonware_macros::stability_scope!(ALPHA {
+#[cfg(not(target_arch = "wasm32"))]
+impl<S, D, H> Mailbox<S, D, crate::simplex::phase2::general::General<H>>
+where
+    S: crate::simplex::scheme::Scheme<D>,
+    S::Certificate: crate::simplex::extension::agreement::general::normal::CertificateSigners,
+    D: Digest,
+    H: commonware_cryptography::Hasher<Digest = D>,
+{
+    /// Requests original SELECT for an already retained checked body. This does
+    /// not request later-ballot recovery. Closure or None is not an ACK;
+    /// cancellation does not undo work already accepted by the voter.
+    pub fn recover_extension(
+        &mut self,
+        request: crate::simplex::phase2::general::voting::SelectRequest<D>,
+    ) -> oneshot::Receiver<Option<crate::simplex::extension::agreement::general::Signed<S, D>>> {
+        let (reply, receiver) = oneshot::channel();
+        let _ = self.sender.enqueue(Message::Recovery {
+            span: info_span!("simplex.voter.recovery", view = request.view().traced()),
+            request,
+            reply,
+        });
+        receiver
+    }
+}
+
 impl<S: crate::simplex::scheme::Scheme<D>, D: Digest> Mailbox<S,D,crate::simplex::phase2::Extended> {
     /// Checks native eligibility without mutating recovery state or signing a response.
     pub(crate) fn validate_recovery(&mut self, request: crate::simplex::extension::request::Request<S,D>) -> oneshot::Receiver<bool> {
@@ -719,5 +744,176 @@ mod tests {
             })
         ));
         assert!(overflow.is_empty());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod general {
+        use super::*;
+        use crate::{
+            simplex::{
+                extension::agreement::general as g,
+                phase2::general::{General, voting},
+                types::Context,
+            },
+            types::Participant,
+        };
+        use bytes::Bytes;
+        use commonware_cryptography::sha256::Sha256;
+        use commonware_runtime::{Runner as _, deterministic};
+        use core::panic;
+        use std::num::NonZeroUsize;
+
+        fn request() -> voting::SelectRequest<Sha256Digest> {
+            let mut rng = test_rng();
+            let fixture = ed25519::fixture(&mut rng, b"voter-general-mailbox", 8);
+            let limits = g::Limits {
+                report_bytes: 128,
+                order_bytes: 128,
+                build_bytes: 128,
+                material_bytes: 0,
+                origin_bytes: g::MAX_EVIDENCE_BYTES,
+            };
+            let input = Sha256Digest::from([11; 32]);
+            let slot = g::Slot {
+                profile: Sha256Digest::from([12; 32]),
+                domain: Sha256Digest::from([13; 32]),
+                roster: g::Slot::roster::<Sha256, _>(&fixture.verifier),
+                cut: 1,
+                proposal: proposal(View::new(1)),
+                parent: g::NativeParent::Genesis(Sha256Digest::from([0; 32])),
+            };
+            let core =
+                g::Core::derive::<Sha256, _>(&fixture.verifier, slot.clone(), Participant::new(0))
+                    .unwrap();
+            let native = Context {
+                round: slot.proposal.round,
+                leader: fixture.verifier.participants()[0].clone(),
+                parent: (View::zero(), Sha256Digest::from([0; 32])),
+            };
+            let row_policy = |row: &g::First<Sha256Digest>| {
+                row.core == core.id::<Sha256>()
+                    && row.input == input
+                    && row.report.is_none()
+                    && if row.owner == core.leader {
+                        row.preference.is_none()
+                    } else {
+                        row.preference.as_deref() == Some(&[0, 0, 0, 0])
+                    }
+            };
+            let capture = voting::FirstInput::new::<Sha256, _>(
+                &fixture.schemes[0],
+                slot.clone(),
+                &native,
+                input,
+                None,
+                None,
+                limits,
+                row_policy,
+            )
+            .unwrap();
+            let context = voting::Context::new(
+                EPOCH,
+                slot.profile,
+                slot.domain,
+                native.parent.1,
+                limits,
+                voting::Resources {
+                    slots: 1,
+                    handles: 2,
+                    bytes: g::MAX_EVIDENCE_BYTES,
+                    records_per_slot: 4,
+                },
+            )
+            .unwrap();
+            context.publish_input::<Sha256>(capture).unwrap();
+            let mut owners = core.followers.clone();
+            owners.push(core.leader);
+            owners.sort_unstable();
+            let firsts = owners
+                .into_iter()
+                .map(|owner| {
+                    g::Signed::sign(
+                        &fixture.schemes[usize::from(owner)],
+                        g::Message {
+                            slot: slot.id::<Sha256>(),
+                            round: slot.proposal.round,
+                            leader: core.leader,
+                            kind: g::Kind::First(g::First {
+                                core: core.id::<Sha256>(),
+                                input,
+                                owner,
+                                report: None,
+                                preference: (owner != core.leader)
+                                    .then(|| Bytes::from_static(&[0, 0, 0, 0])),
+                            }),
+                        },
+                        limits,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let body = g::OriginBody {
+                decision: g::Decision {
+                    slot,
+                    input,
+                    order: Bytes::from_static(&[0, 0, 0, 0]),
+                },
+                core: core.clone(),
+                firsts,
+                population: input,
+                build: Bytes::from_static(b"mailbox-empty-cut"),
+                material: Bytes::new(),
+            };
+            let checked = body
+                .verify::<Sha256, _>(
+                    &mut rng,
+                    &fixture.verifier,
+                    &core,
+                    input,
+                    limits,
+                    row_policy,
+                    |rows, body| {
+                        rows.core() == &core
+                            && rows.input() == input
+                            && body.population == input
+                            && body.decision.order.as_ref() == [0, 0, 0, 0]
+                            && body.build.as_ref() == b"mailbox-empty-cut"
+                            && body.material.is_empty()
+                    },
+                    &Sequential,
+                )
+                .unwrap();
+            let selection = context.publish_selection::<Sha256>(body, checked).unwrap();
+            voting::SelectRequest::new(&selection)
+        }
+
+        #[test]
+        fn select_frontend_retains_canceled_request_and_original_view() {
+            deterministic::Runner::default().start(|context| async move {
+                let (sender, mut receiver) =
+                    commonware_actor::mailbox::new(context, NonZeroUsize::new(1).unwrap());
+                let mailbox = Mailbox::<TestScheme, Sha256Digest, General<Sha256>>::new(sender);
+                let mut readiness = crate::simplex::engine::Readiness::new(mailbox);
+                let request = request();
+
+                let canceled = readiness.request_selection(request.clone());
+                let response = readiness.request_selection(request.clone());
+                drop(canceled);
+                let message = receiver.recv().await.unwrap();
+                assert_eq!(message.view(), View::new(1));
+                let Message::Recovery { reply, .. } = message else {
+                    panic!("recovery")
+                };
+                assert!(reply.send(None).is_err());
+                let Message::Recovery { reply, .. } = receiver.recv().await.unwrap() else {
+                    panic!("recovery")
+                };
+                reply.send(None).unwrap();
+                assert!(response.await.unwrap().is_none());
+
+                drop(receiver);
+                assert!(readiness.request_selection(request).await.is_err());
+            });
+        }
     }
 }

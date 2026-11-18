@@ -18,14 +18,16 @@ use commonware_codec::{
 };
 use commonware_cryptography::{
     Digest, Hasher,
-    certificate::{self, Attestation},
+    certificate::{self, Attestation, Scoped, Verifier as _},
 };
 use commonware_parallel::Strategy;
-use commonware_utils::iter::NonEmpty;
+use commonware_utils::{iter::NonEmpty, ordered::Set};
 use rand_core::CryptoRng;
 use std::collections::BTreeSet;
 
+pub mod general;
 pub mod issuance;
+pub mod normal;
 pub mod recovery;
 
 pub(crate) const SIGNING_TAG: &[u8] = b"_COMMONWARE_CONSENSUS_SIMPLEX_EXTENSION_AGREEMENT_V2";
@@ -34,6 +36,70 @@ const SLOT_TAG: &[u8] = b"_COMMONWARE_CONSENSUS_SIMPLEX_AGREEMENT_SLOT_V2";
 const CORE_TAG: &[u8] = b"_COMMONWARE_CONSENSUS_SIMPLEX_AGREEMENT_CORE_V2";
 const ROW_TAG: &[u8] = b"_COMMONWARE_CONSENSUS_SIMPLEX_AGREEMENT_ROW_V2";
 const VALUE_TAG: &[u8] = b"_COMMONWARE_CONSENSUS_SIMPLEX_AGREEMENT_VALUE_V2";
+
+// A captured verifier-only scope supplies exactly the same read-only checks as
+// the epoch scheme. Neither branch exposes a signer to proof verification.
+enum VerificationSource<'a, S: certificate::Scheme> {
+    Scheme(&'a S),
+    Scoped(&'a Scoped<S>),
+}
+impl<S: certificate::Scheme> VerificationSource<'_, S> {
+    fn participants(&self) -> &Set<S::PublicKey> {
+        match self {
+            Self::Scheme(scheme) => scheme.participants(),
+            Self::Scoped(scoped) => scoped.participants(),
+        }
+    }
+    fn roster<H: Hasher>(&self) -> H::Digest {
+        H::hash(&[
+            ROSTER_TAG,
+            &self
+                .participants()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .encode(),
+        ])
+    }
+    fn verify_attestation<R: CryptoRng, D: Digest>(
+        &self,
+        rng: &mut R,
+        subject: Subject<'_, D>,
+        attestation: &Attestation<S>,
+        strategy: &impl Strategy,
+    ) -> bool
+    where
+        S: scheme::Scheme<D>,
+    {
+        match self {
+            Self::Scheme(scheme) => {
+                scheme.verify_attestation::<_, D>(rng, subject, attestation, strategy)
+            }
+            Self::Scoped(scoped) => {
+                scoped.verify_attestation::<_, D>(rng, subject, attestation, strategy)
+            }
+        }
+    }
+    fn verify_certificate<R: CryptoRng, D: Digest>(
+        &self,
+        rng: &mut R,
+        subject: Subject<'_, D>,
+        certificate: &S::Certificate,
+        strategy: &impl Strategy,
+    ) -> bool
+    where
+        S: scheme::Scheme<D>,
+    {
+        match self {
+            Self::Scheme(scheme) => {
+                scheme.verify_certificate::<_, D>(rng, subject, certificate, strategy)
+            }
+            Self::Scoped(scoped) => {
+                scoped.verify_certificate::<_, D>(rng, subject, certificate, strategy)
+            }
+        }
+    }
+}
 
 /// Per-field decoding limits. They must agree with the authenticated deployment.
 /// Complete recovery history is referenced in pages, not truncated to these bounds.
@@ -64,24 +130,22 @@ impl<D: Digest> Slot<D> {
         H::hash(&[SLOT_TAG, &self.encode()])
     }
     pub fn roster<H: Hasher<Digest = D>, S: certificate::Scheme>(scheme: &S) -> D {
-        H::hash(&[
-            ROSTER_TAG,
-            &scheme
-                .participants()
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .encode(),
-        ])
+        VerificationSource::Scheme(scheme).roster::<H>()
     }
     pub fn check_roster<H: Hasher<Digest = D>, S: certificate::Scheme>(
         &self,
         scheme: &S,
     ) -> Result<(), Error> {
-        if scheme.participants().len() != 7 || !S::is_attributable() {
+        self.check_roster_with::<H, S>(&VerificationSource::Scheme(scheme))
+    }
+    fn check_roster_with<H: Hasher<Digest = D>, S: certificate::Scheme>(
+        &self,
+        source: &VerificationSource<'_, S>,
+    ) -> Result<(), Error> {
+        if source.participants().len() != 7 || !S::is_attributable() {
             return Err(Error::Roster);
         }
-        if self.roster != Self::roster::<H, S>(scheme) {
+        if self.roster != source.roster::<H>() {
             return Err(Error::Context);
         }
         Ok(())
@@ -149,7 +213,15 @@ impl<D: Digest> Core<D> {
         expected: &Slot<D>,
         leader: Participant,
     ) -> Result<(), Error> {
-        expected.check_roster::<H, S>(scheme)?;
+        self.check_with::<H, S>(&VerificationSource::Scheme(scheme), expected, leader)
+    }
+    fn check_with<H: Hasher<Digest = D>, S: certificate::Scheme>(
+        &self,
+        source: &VerificationSource<'_, S>,
+        expected: &Slot<D>,
+        leader: Participant,
+    ) -> Result<(), Error> {
+        expected.check_roster_with::<H, S>(source)?;
         if self.slot != *expected
             || self.leader != leader
             || usize::from(leader) >= 7
@@ -507,11 +579,19 @@ impl<S: scheme::Scheme<D>, D: Digest> Signed<S, D> {
         })
     }
     pub fn verify<R: CryptoRng>(&self, rng: &mut R, scheme: &S, strategy: &impl Strategy) -> bool {
+        self.verify_with(rng, &VerificationSource::Scheme(scheme), strategy)
+    }
+    fn verify_with<R: CryptoRng>(
+        &self,
+        rng: &mut R,
+        source: &VerificationSource<'_, S>,
+        strategy: &impl Strategy,
+    ) -> bool {
         let bytes = self.message.encode();
-        scheme.participants().len() == 7
+        source.participants().len() == 7
             && S::is_attributable()
             && usize::from(self.message.leader) < 7
-            && scheme.verify_attestation::<_, D>(
+            && source.verify_attestation::<_, D>(
                 rng,
                 Subject::ExtensionAgreement {
                     round: self.message.round,
@@ -582,12 +662,20 @@ impl<S: scheme::Scheme<D>, D: Digest> Quorum<S, D> {
         })
     }
     pub fn verify<R: CryptoRng>(&self, rng: &mut R, scheme: &S, strategy: &impl Strategy) -> bool {
+        self.verify_with(rng, &VerificationSource::Scheme(scheme), strategy)
+    }
+    fn verify_with<R: CryptoRng>(
+        &self,
+        rng: &mut R,
+        source: &VerificationSource<'_, S>,
+        strategy: &impl Strategy,
+    ) -> bool {
         let bytes = self.message.encode();
-        scheme.participants().len() == 7
+        source.participants().len() == 7
             && S::is_attributable()
             && usize::from(self.message.leader) < 7
             && self.message.kind.voted_value().is_some()
-            && scheme.verify_certificate::<_, D>(
+            && source.verify_certificate::<_, D>(
                 rng,
                 Subject::ExtensionAgreement {
                     round: self.message.round,
@@ -646,8 +734,29 @@ impl<S: scheme::Scheme<D>, D: Digest> FastProof<S, D> {
         quorum: &Quorum<S, D>,
         strategy: &impl Strategy,
     ) -> Result<VerifiedFinal<D>, Error> {
-        self.verify::<H, R>(rng, scheme, expected, leader, limits, policy, strategy)?
-            .finalize(rng, scheme, quorum, strategy)
+        let source = VerificationSource::Scheme(scheme);
+        self.verify_with::<H, R>(rng, &source, expected, leader, limits, policy, strategy)?
+            .finalize_with(rng, &source, quorum, strategy)
+    }
+
+    /// Checks the complete original proof and FAST quorum with a captured scope.
+    /// The scope supplies no signing authority; expected Slot, native leader,
+    /// policy and complete material custody remain caller prerequisites.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_finalization_scoped<H: Hasher<Digest = D>, R: CryptoRng>(
+        &self,
+        rng: &mut R,
+        scoped: &Scoped<S>,
+        expected: &Slot<D>,
+        leader: Participant,
+        limits: Limits,
+        policy: impl FnOnce(&Value<D>) -> bool,
+        quorum: &Quorum<S, D>,
+        strategy: &impl Strategy,
+    ) -> Result<VerifiedFinal<D>, Error> {
+        let source = VerificationSource::Scoped(scoped);
+        self.verify_with::<H, R>(rng, &source, expected, leader, limits, policy, strategy)?
+            .finalize_with(rng, &source, quorum, strategy)
     }
 
     /// Verifies crypto, the fixed report population, exact semantics and policy.
@@ -663,7 +772,54 @@ impl<S: scheme::Scheme<D>, D: Digest> FastProof<S, D> {
         policy: impl FnOnce(&Value<D>) -> bool,
         strategy: &impl Strategy,
     ) -> Result<VerifiedOrigin<D>, Error> {
-        self.core.check::<H, S>(scheme, expected, leader)?;
+        self.verify_with::<H, R>(
+            rng,
+            &VerificationSource::Scheme(scheme),
+            expected,
+            leader,
+            limits,
+            policy,
+            strategy,
+        )
+    }
+
+    /// Verifies the full origin using a captured public-only scope.
+    /// Exact Slot, native elected leader and deterministic policy are checked
+    /// by the same path as scheme-based verification.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_scoped<H: Hasher<Digest = D>, R: CryptoRng>(
+        &self,
+        rng: &mut R,
+        scoped: &Scoped<S>,
+        expected: &Slot<D>,
+        leader: Participant,
+        limits: Limits,
+        policy: impl FnOnce(&Value<D>) -> bool,
+        strategy: &impl Strategy,
+    ) -> Result<VerifiedOrigin<D>, Error> {
+        self.verify_with::<H, R>(
+            rng,
+            &VerificationSource::Scoped(scoped),
+            expected,
+            leader,
+            limits,
+            policy,
+            strategy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_with<H: Hasher<Digest = D>, R: CryptoRng>(
+        &self,
+        rng: &mut R,
+        source: &VerificationSource<'_, S>,
+        expected: &Slot<D>,
+        leader: Participant,
+        limits: Limits,
+        policy: impl FnOnce(&Value<D>) -> bool,
+        strategy: &impl Strategy,
+    ) -> Result<VerifiedOrigin<D>, Error> {
+        self.core.check_with::<H, S>(source, expected, leader)?;
         self.value.check(limits)?;
         let slot = expected.id::<H>();
         let core = self.core.id::<H>();
@@ -704,7 +860,7 @@ impl<S: scheme::Scheme<D>, D: Digest> FastProof<S, D> {
             if owner == leader && Core::<D>::row::<H>(report) != self.core.leader_report {
                 return Err(Error::Value);
             }
-            if !first.verify(rng, scheme, strategy) {
+            if !first.verify_with(rng, source, strategy) {
                 return Err(Error::Signature);
             }
             rows.push(Row {
@@ -727,7 +883,7 @@ impl<S: scheme::Scheme<D>, D: Digest> FastProof<S, D> {
         {
             return Err(Error::Value);
         }
-        if !self.selection.verify(rng, scheme, strategy) {
+        if !self.selection.verify_with(rng, source, strategy) {
             return Err(Error::Signature);
         }
         if !policy(&self.value) {
@@ -826,10 +982,10 @@ impl<D: Digest> VerifiedOrigin<D> {
 
     /// Binds a checked origin to its exact original FAST_FINAL certificate.
     /// The caller retains both complete proof bodies before terminal delivery.
-    fn finalize<S: scheme::Scheme<D>, R: CryptoRng>(
+    fn finalize_with<S: scheme::Scheme<D>, R: CryptoRng>(
         &self,
         rng: &mut R,
-        scheme: &S,
+        source: &VerificationSource<'_, S>,
         quorum: &Quorum<S, D>,
         strategy: &impl Strategy,
     ) -> Result<VerifiedFinal<D>, Error> {
@@ -843,7 +999,7 @@ impl<D: Digest> VerifiedOrigin<D> {
         {
             return Err(Error::Context);
         }
-        if !quorum.verify(rng, scheme, strategy) {
+        if !quorum.verify_with(rng, source, strategy) {
             return Err(Error::Signature);
         }
         Ok(VerifiedFinal {

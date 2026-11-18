@@ -1,3 +1,4 @@
+use super::assembly;
 use crate::{
     Viewable,
     simplex::{
@@ -8,6 +9,7 @@ use crate::{
 };
 use commonware_actor::mailbox::{Overflow, Policy, Sender};
 use commonware_cryptography::{Digest, certificate::Scheme};
+use commonware_utils::channel::{mpsc::error::TrySendError, oneshot};
 use std::collections::VecDeque;
 use tracing::Span;
 
@@ -170,12 +172,41 @@ impl<S: Scheme, D: Digest, M: Mode<S, D>> Policy for Message<S, D, M> {
 #[derive(Clone)]
 pub struct Mailbox<S: Scheme, D: Digest, M: Mode<S, D> = Plain> {
     sender: Sender<Message<S, D, M>>,
+    assembly: Option<assembly::Sender<M::Assembly>>,
 }
 
 impl<S: Scheme, D: Digest, M: Mode<S, D>> Mailbox<S, D, M> {
     /// Create a new mailbox.
     pub const fn new(sender: Sender<Message<S, D, M>>) -> Self {
-        Self { sender }
+        Self {
+            sender,
+            assembly: None,
+        }
+    }
+
+    pub(super) const fn with_assembly(
+        sender: Sender<Message<S, D, M>>,
+        assembly: Option<assembly::Sender<M::Assembly>>,
+    ) -> Self {
+        Self { sender, assembly }
+    }
+
+    /// Submits immutable application-checked material without waiting for capacity.
+    ///
+    /// Full or closed ports return the original material. Successful submission
+    /// transfers custody to the actor; the reply reports actual installation.
+    /// Dropping the reply does not cancel accepted work. A cancelled reply means
+    /// the actor stopped before acknowledging it, not that installation failed.
+    /// Mailboxes created with [`Self::new`] have no assembly port.
+    pub fn submit_assembly(
+        &self,
+        material: M::Assembly,
+    ) -> Result<oneshot::Receiver<bool>, TrySendError<M::Assembly>> {
+        let Some(sender) = &self.assembly else {
+            return Err(TrySendError::Closed(material));
+        };
+        let bytes = M::assembly_size(&material);
+        sender.submit(material, bytes)
     }
 
     /// Send an update message.
@@ -214,11 +245,26 @@ mod tests {
     };
     use commonware_actor::mailbox::Policy;
     use commonware_cryptography::{certificate::mocks::Fixture, sha256::Digest as Sha256Digest};
+    use commonware_runtime::{Runner as _, deterministic};
     use commonware_utils::test_rng;
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, num::NonZeroUsize};
 
     type TestScheme = ed25519::Scheme;
     const EPOCH: Epoch = Epoch::new(1);
+
+    #[test]
+    fn plain_mailbox_constructor_has_no_assembly_port_and_keeps_vote_delivery() {
+        deterministic::Runner::default().start(|context| async move {
+            let (sender, mut receiver) =
+                commonware_actor::mailbox::new(context, NonZeroUsize::new(1).unwrap());
+            let mut mailbox = Mailbox::<TestScheme, Sha256Digest>::new(sender);
+            assert!(mailbox.assembly.is_none());
+            let vote = nullify_vote(View::new(2));
+            mailbox.constructed(vote.clone());
+            assert!(matches!(receiver.recv().await,
+                Some(Message::Constructed(actual)) if actual == vote));
+        });
+    }
 
     fn scheme() -> TestScheme {
         let mut rng = test_rng();

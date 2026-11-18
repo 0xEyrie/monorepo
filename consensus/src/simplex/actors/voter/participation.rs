@@ -12,7 +12,7 @@ use crate::{
     simplex::{
         phase2::{Plain, voting::Voting},
         scheme::Scheme,
-        types::{ArtifactWith, Notarization, Notarize, Proposal},
+        types::{ArtifactWith, Context, Notarization, Notarize, Proposal},
     },
     types::View,
 };
@@ -71,6 +71,16 @@ pub trait Participation<S: Scheme<D>, D: Digest, M: Voting<S, D>>: Send + 'stati
     /// grants no application readiness, vote, certificate or delivery authority.
     #[commonware_macros::stability(ALPHA)]
     fn replayed(&mut self) {}
+    /// Captures independently ready optional fields without waiting. The exact
+    /// public input must already be retained by mandatory validation. Absence
+    /// here is operational failure for an opted-in mode, not signed absence.
+    fn capture_notarize(
+        &mut self,
+        _: &Proposal<D>,
+        _: &Context<D, S::PublicKey>,
+    ) -> Option<M::FirstInput> {
+        None
+    }
     /// Attach the currently available original report without altering the vote.
     fn notarize(&mut self, vote: Notarize<S, D>) -> M::Notarize;
     /// First admission of this native notarization in the current voter instance,
@@ -80,7 +90,11 @@ pub trait Participation<S: Scheme<D>, D: Digest, M: Voting<S, D>>: Send + 'stati
     /// Return an authenticated, durable leader selection for this exact proposal.
     fn final_subject(&mut self, proposal: &Proposal<D>) -> Option<M::FinalSubject>;
     /// Check retained application evidence for an already signature-verified QC.
+    /// This immediate, idempotent predicate may run again during replay or after
+    /// a readiness notification. It must not run selection or wait for work.
     /// Missing evidence must schedule retrieval and return false, never fallback.
+    /// Native-parent anchoring does not replace this check. Trusted sparse floor
+    /// bootstrap separately invokes it before installing the floor anchor.
     fn accepts_finalization(&mut self, certificate: &M::Certificate) -> bool;
     /// Check that durable evidence required by this replayed artifact is present.
     fn accepts_replay(&mut self, artifact: &ArtifactWith<S, D, M>) -> bool;

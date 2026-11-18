@@ -10,7 +10,7 @@ use commonware_consensus::{
             report::{MAX_REPORT_BYTES, Notarize as ExtendedNotarize},
             vote::{Certificate as ExtensionCertificate, Statement, Vote as ExtensionVote},
         },
-        phase2::Extended,
+        phase2::{Extended, voting::ExtendedContext},
         scheme::ed25519,
         types::{
             Artifact, ArtifactWith, Certificate, CertificateWith, Finalization, Finalize,
@@ -21,7 +21,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{
     certificate::{Verifier as _, mocks::Fixture},
-    sha256::Digest,
+    sha256::{Digest, Sha256},
 };
 use commonware_parallel::Sequential;
 use commonware_utils::{TestRng, iter::NonEmpty};
@@ -308,7 +308,9 @@ fn existing_native_journal_replays_the_full_extension_subject() {
             }
             let _journal = journal.sync(2).await.unwrap();
         });
-    deterministic::Runner::from(checkpoint).start(move |context| async move {
+    deterministic::Runner::from(checkpoint).start(move |mut context| async move {
+        let mode_context =
+            ExtendedContext::new::<Sha256>(Digest::from([2; 32]), Digest::from([3; 32]));
         let cfg = Config {
             partition: "extension-native-wal".into(),
             compression: None,
@@ -335,7 +337,7 @@ fn existing_native_journal_replays_the_full_extension_subject() {
             if let EArtifact::Finalization(cert) = &record {
                 round.add_finalization(cert.clone());
             }
-            round.replay(&record);
+            round.replay(&mode_context, &mut context, &record);
             match record {
                 EArtifact::Notarize(vote) => {
                     assert_eq!(

@@ -37,6 +37,7 @@ impl<S: Scheme<D>, D: Digest> Aggregation<S, D> for Extended {
 impl<S: Scheme<D>, D: Digest> FinalBuffer<S, D> for Groups<S, D> {
     type Vote = Finalize<S, D>;
     type Certificate = Finalization<S, D>;
+    type Assembly = crate::simplex::phase2::recovery::NoRecovery;
     fn new(quorum: usize, participants: usize) -> Self {
         assert!(
             quorum > 0 && quorum <= participants,

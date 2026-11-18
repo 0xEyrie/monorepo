@@ -100,6 +100,7 @@ pub struct RoundWith<S: Scheme, D: Digest, M: Voting<S, D>> {
     proposal: ProposalSlot<D>,
 
     decision: Decision<M::FinalSubject>,
+    complete_finalize: bool,
     recovery: M::RecoveryState,
 
     // Same-term stall anchor armed by `Self::set_deadlines`. Unlike the
@@ -110,6 +111,7 @@ pub struct RoundWith<S: Scheme, D: Digest, M: Voting<S, D>> {
     // Certificates received from batcher (constructed or from network).
     notarization: Option<Notarization<S, D>>,
     broadcast_notarize: bool,
+    reserved_notarize: Option<Proposal<D>>,
     broadcast_notarization: bool,
     nullification: Option<Nullification<S>>,
     broadcast_nullification: bool,
@@ -138,10 +140,12 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
                 certification: None,
                 latch: None,
             },
+            complete_finalize: false,
             recovery: M::EMPTY_RECOVERY,
             stall_deadline: None,
             notarization: None,
             broadcast_notarize: false,
+            reserved_notarize: None,
             broadcast_notarization: false,
             nullification: None,
             broadcast_nullification: false,
@@ -724,6 +728,7 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
         // we have observed equivocation (where the proposal would be set to
         // ProposalStatus::Equivocated) or if verification hasn't completed yet.
         !self.broadcast_notarize
+            && self.reserved_notarize.is_none()
             && !self.decision.is_nullify()
             && matches!(self.proposal.status(), ProposalStatus::Verified)
     }
@@ -739,16 +744,107 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
         self.proposal.proposal()
     }
 
-    /// Returns a proposal candidate for finalization if we're ready to vote.
-    ///
-    /// Marks that we've broadcast our finalize vote to prevent duplicates.
-    pub fn construct_finalize_with(&mut self, subject: M::FinalSubject) -> Option<&Proposal<D>> {
+    pub(super) fn reserve_notarize(&mut self, proposal: &Proposal<D>) -> bool {
+        if !self.can_construct_notarize() || self.proposal.proposal() != Some(proposal) {
+            return false;
+        }
+        self.reserved_notarize = Some(proposal.clone());
+        true
+    }
+
+    pub(super) const fn reserved_notarize(&self) -> Option<&Proposal<D>> {
+        self.reserved_notarize.as_ref()
+    }
+
+    pub(super) const fn pending_notarize(&self) -> bool {
+        self.reserved_notarize.is_some() && !self.broadcast_notarize
+    }
+
+    pub(super) fn permits_reserved_notarize(&self, proposal: &Proposal<D>) -> bool {
+        self.reserved_notarize.as_ref() == Some(proposal)
+            && !self.broadcast_notarize
+            && !self.decision.is_nullify()
+            && matches!(self.proposal.status(), ProposalStatus::Verified)
+            && self.proposal.proposal() == Some(proposal)
+    }
+
+    pub(super) fn complete_notarize(&mut self, proposal: &Proposal<D>) {
+        assert!(self.permits_reserved_notarize(proposal));
+        self.broadcast_notarize = true;
+    }
+
+    pub(super) fn replay_notarize<R: rand_core::CryptoRng>(
+        &mut self,
+        context: &M::Context,
+        rng: &mut R,
+        record: &M::Recovery,
+    ) where
+        S: crate::simplex::scheme::Scheme<D>,
+    {
+        let proposal = M::notarize_record(record).expect("first record missing proposal");
+        assert_eq!(
+            proposal.round, self.round,
+            "first record belongs to another round"
+        );
+        if M::reserved_notarize(record).is_some() {
+            assert!(
+                !self.decision.is_nullify(),
+                "first reservation follows local nullify"
+            );
+            assert!(
+                self.reserved_notarize
+                    .as_ref()
+                    .is_none_or(|old| old == proposal),
+                "replayed conflicting first reservations"
+            );
+        }
+        assert!(
+            M::replay_notarize(&self.scheme, context, rng, &mut self.recovery, record),
+            "invalid first reservation transition"
+        );
+        if M::reserved_notarize(record).is_some() {
+            self.reserved_notarize = Some(proposal.clone());
+            // A later NQC can select another proposal. Retain the own first pin
+            // without replacing the certificate-selected proposal.
+            if self.proposal.proposal().is_none() {
+                self.proposal.record_verified(proposal.clone());
+            } else if self.proposal.proposal() == Some(proposal)
+                && self.proposal.status() == ProposalStatus::Unverified
+            {
+                self.proposal.request_verify();
+                assert!(self.proposal.mark_verified());
+            }
+        }
+    }
+
+    pub(super) fn finish_notarize_replay(&mut self) -> bool {
+        M::finish_notarize_replay(&mut self.recovery)
+    }
+
+    pub(super) const fn recovery_state_mut(&mut self) -> &mut M::RecoveryState {
+        &mut self.recovery
+    }
+
+    /// Checks the round's final-vote eligibility without consuming its choice.
+    pub(super) fn can_construct_finalize_with(&self, subject: &M::FinalSubject) -> bool {
         // Ensure we haven't already broadcast a finalize vote or nullify vote.
         // The nullify check is the never-healing base case of same-term vote
         // safety (see the module documentation).
         if !self.decision.is_pending() || !M::allows_original(&self.recovery) {
-            return None;
+            return false;
         }
+        self.finalize_ready(subject)
+    }
+
+    /// Checks a pinned, unsigned choice without consuming it again.
+    pub(super) fn can_release_finalize_with(&self, subject: &M::FinalSubject) -> bool {
+        !self.complete_finalize
+            && self.final_subject() == Some(subject)
+            && M::allows_original(&self.recovery)
+            && self.finalize_ready(subject)
+    }
+
+    fn finalize_ready(&self, subject: &M::FinalSubject) -> bool {
         // We do not check for an observed finalization here: the caller only
         // requests finalize votes for views above the last finalized view,
         // a premise of the same-term vote safety argument (see the module
@@ -757,24 +853,44 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
         // If we have a proposal and we have not yet detected equivocation, we are willing
         // to consider constructing a finalize vote.
         if !self.proposal.has_unequivocated_proposal() {
-            return None;
+            return false;
         }
 
-        // If there doesn't exist a notarization certificate, return None.
-        self.notarization.as_ref()?;
+        // An original final vote requires a notarization certificate.
+        if self.notarization.is_none() {
+            return false;
+        }
 
-        // If we haven't certified the proposal, return None.
+        // Local certification is also required.
         //
         // Note, this does not require verification.
         if !self.is_certified() {
-            return None;
+            return false;
         }
 
-        if !M::matches_subject(self.proposal.proposal()?, &subject) {
+        self.proposal
+            .proposal()
+            .is_some_and(|proposal| M::matches_subject(proposal, subject))
+    }
+
+    /// Reserves the round's exact final choice if it remains eligible.
+    pub fn construct_finalize_with(&mut self, subject: M::FinalSubject) -> Option<&Proposal<D>> {
+        if !self.can_construct_finalize_with(&subject) {
             return None;
         }
         self.decision = Decision::Finalize(subject);
         self.proposal.proposal()
+    }
+
+    pub(super) fn pending_finalize(&self) -> Option<&M::FinalSubject> {
+        (!self.complete_finalize)
+            .then(|| self.final_subject())
+            .flatten()
+    }
+
+    pub(super) fn complete_finalize(&mut self, subject: &M::FinalSubject) {
+        assert_eq!(self.final_subject(), Some(subject));
+        self.complete_finalize = true;
     }
 
     /// The exact locally accepted final subject, including after journal replay.
@@ -793,7 +909,15 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
 
     /// Stages a checked local recovery decision. The actor must journal and sync
     /// before exposing any resulting status or vote; failure is fatal to the actor.
-    pub fn stage_recovery(&mut self, record: &M::Recovery) -> bool {
+    pub fn stage_recovery<R: rand_core::CryptoRng>(
+        &mut self,
+        context: &M::Context,
+        rng: &mut R,
+        record: &M::Recovery,
+    ) -> bool
+    where
+        S: crate::simplex::scheme::Scheme<D>,
+    {
         if self.notarization.is_none()
             || self.proposal.proposal() != Some(M::recovery_proposal(record))
         {
@@ -809,15 +933,29 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
             Decision::Finalize(s) => Some(s),
             _ => None,
         };
-        M::replay_recovery(&mut self.recovery, original, record)
+        M::replay_recovery(
+            &self.scheme,
+            context,
+            rng,
+            &mut self.recovery,
+            original,
+            record,
+        )
     }
 
-    pub fn replay(&mut self, artifact: &ArtifactWith<S, D, M>) {
+    pub fn replay<R: rand_core::CryptoRng>(
+        &mut self,
+        context: &M::Context,
+        rng: &mut R,
+        artifact: &ArtifactWith<S, D, M>,
+    ) where
+        S: crate::simplex::scheme::Scheme<D>,
+    {
         match artifact {
             ArtifactWith::Recovered(_) => {}
             ArtifactWith::Recovery(record) => {
                 assert!(
-                    self.stage_recovery(record),
+                    self.stage_recovery(context, rng, record),
                     "invalid recovery fence transition"
                 );
                 if let Some(subject) = M::reserved_subject(record) {
@@ -829,6 +967,12 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
                         M::matches_subject(M::recovery_proposal(record), &subject),
                         "replayed reservation has an invalid original subject"
                     );
+                    if let Some(previous) = self.final_subject() {
+                        assert_eq!(
+                            previous, &subject,
+                            "replayed conflicting final reservations"
+                        );
+                    }
                     self.decision = Decision::Finalize(subject);
                 }
             }
@@ -839,8 +983,20 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
                 );
 
                 // Our journaled notarize records a locally verified proposal.
-                self.proposal
-                    .record_verified(M::notarize(notarize).proposal.clone());
+                if M::RESERVE_NOTARIZE {
+                    assert_eq!(
+                        self.reserved_notarize.as_ref(),
+                        Some(&M::notarize(notarize).proposal),
+                        "complete first vote lacks its exact reservation"
+                    );
+                    assert!(
+                        M::replay_notarize_vote(&self.recovery, notarize),
+                        "complete first vote conflicts with its retained outbox"
+                    );
+                } else {
+                    self.proposal
+                        .record_verified(M::notarize(notarize).proposal.clone());
+                }
                 self.broadcast_notarize = true;
             }
             ArtifactWith::Nullify(nullify) => {
@@ -859,7 +1015,8 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
             }
             ArtifactWith::Finalize(finalize) => {
                 assert!(
-                    M::allows_original(&self.recovery),
+                    M::allows_original(&self.recovery)
+                        || (M::JOINT_FINALIZE && M::replay_finalize_vote(&self.recovery, finalize)),
                     "original final vote after recovery promise"
                 );
                 assert!(
@@ -877,7 +1034,15 @@ impl<S: Scheme, D: Digest, M: Voting<S, D>> RoundWith<S, D, M> {
                 if let Decision::Finalize(previous) = &self.decision {
                     assert_eq!(previous, &subject, "replayed conflicting final subjects");
                 }
+                if M::JOINT_FINALIZE {
+                    assert!(
+                        self.final_subject() == Some(&subject)
+                            && M::replay_finalize_vote(&self.recovery, finalize),
+                        "complete final vote lacks its retained joint outbox"
+                    );
+                }
                 self.decision = Decision::Finalize(subject);
+                self.complete_finalize = true;
             }
             ArtifactWith::Notarization(_) => {
                 self.broadcast_notarization = true;
@@ -1135,7 +1300,7 @@ mod tests {
 
         // Restart: replay our journaled notarize for the leader's first proposal.
         let notarize = Notarize::sign(&schemes[1], proposal_x).expect("notarize");
-        round.replay(&Artifact::Notarize(notarize));
+        round.replay(&(), &mut rng, &Artifact::Notarize(notarize));
 
         // The rebuilt batcher re-forwards the leader's notarize, now carrying
         // the conflicting proposal.
@@ -1183,7 +1348,7 @@ mod tests {
 
         // Restart: replay our journaled notarize for the leader's first proposal.
         let notarize = Notarize::sign(&schemes[1], proposal_x).expect("notarize");
-        round.replay(&Artifact::Notarize(notarize));
+        round.replay(&(), &mut rng, &Artifact::Notarize(notarize));
 
         // The rebuilt batcher re-forwards the leader's notarize, now carrying
         // the conflicting proposal.
@@ -1378,21 +1543,25 @@ mod tests {
         // Replay messages and verify broadcast flags
         let mut round = Round::new(local_scheme, round);
         round.set_leader(Participant::new(0));
-        round.replay(&Artifact::Notarize(notarize_local));
+        round.replay(&(), &mut rng, &Artifact::Notarize(notarize_local));
         assert!(round.broadcast_notarize);
-        round.replay(&Artifact::Notarization(notarization.clone()));
+        round.replay(&(), &mut rng, &Artifact::Notarization(notarization.clone()));
         assert!(round.broadcast_notarization);
-        round.replay(&Artifact::Nullification(nullification.clone()));
+        round.replay(
+            &(),
+            &mut rng,
+            &Artifact::Nullification(nullification.clone()),
+        );
         assert!(round.broadcast_nullification);
-        round.replay(&Artifact::Finalization(finalization.clone()));
+        round.replay(&(), &mut rng, &Artifact::Finalization(finalization.clone()));
         assert!(round.broadcast_finalization);
 
         // Replaying the certificate again should keep the flags set.
-        round.replay(&Artifact::Notarization(notarization));
+        round.replay(&(), &mut rng, &Artifact::Notarization(notarization));
         assert!(round.broadcast_notarization);
-        round.replay(&Artifact::Nullification(nullification));
+        round.replay(&(), &mut rng, &Artifact::Nullification(nullification));
         assert!(round.broadcast_nullification);
-        round.replay(&Artifact::Finalization(finalization));
+        round.replay(&(), &mut rng, &Artifact::Finalization(finalization));
         assert!(round.broadcast_finalization);
     }
 
@@ -1409,8 +1578,8 @@ mod tests {
         let finalize = Finalize::sign(&schemes[0], proposal).expect("finalize");
         let mut round = Round::new(schemes[0].clone(), round_info);
 
-        round.replay(&Artifact::Nullify(nullify));
-        round.replay(&Artifact::Finalize(finalize));
+        round.replay(&(), &mut rng, &Artifact::Nullify(nullify));
+        round.replay(&(), &mut rng, &Artifact::Finalize(finalize));
     }
 
     /// A journal holding our nullify after our finalize for one view is
@@ -1426,8 +1595,8 @@ mod tests {
         let finalize = Finalize::sign(&schemes[0], proposal).expect("finalize");
         let mut round = Round::new(schemes[0].clone(), round_info);
 
-        round.replay(&Artifact::Finalize(finalize));
-        round.replay(&Artifact::Nullify(nullify));
+        round.replay(&(), &mut rng, &Artifact::Finalize(finalize));
+        round.replay(&(), &mut rng, &Artifact::Nullify(nullify));
     }
 
     /// Replaying a local notarize vote for a leader-owned proposal should
@@ -1449,7 +1618,7 @@ mod tests {
         // Replay the local notarize into a fresh round.
         let mut round = Round::new(local_scheme, round_info);
         round.set_leader(Participant::new(0));
-        round.replay(&Artifact::Notarize(notarize_local));
+        round.replay(&(), &mut rng, &Artifact::Notarize(notarize_local));
 
         // Proposal should be restored as verified.
         assert_eq!(round.proposal.proposal(), Some(&proposal));
@@ -1498,7 +1667,7 @@ mod tests {
         // Replay finalize and verify nullify is blocked
         let mut round = Round::new(local_scheme, round_info);
         round.set_leader(Participant::new(0));
-        round.replay(&Artifact::Finalize(finalize_local));
+        round.replay(&(), &mut rng, &Artifact::Finalize(finalize_local));
 
         // Check that construct_nullify returns None
         assert!(round.construct_nullify().is_none());

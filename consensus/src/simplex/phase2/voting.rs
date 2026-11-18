@@ -13,6 +13,8 @@ pub use crate::simplex::actors::voter::{
     RoundWith, StateConfig, StateWith, VoterRound,
     participation::{NoExtension, Participation},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::simplex::types::{Context as NativeContext, Notarize};
 use crate::simplex::{
     scheme,
     types::{Finalize, Proposal},
@@ -23,8 +25,105 @@ use std::fmt::Debug;
 /// Native-owned local decision representation. Plain retains its unit marker;
 /// Extended keeps the exact accepted interpretation for replay and recovery.
 pub trait Voting<S: Scheme, D: Digest>: Mode<S, D> {
-    /// Requires an exact parent interpretation in addition to native ancestry.
+    /// Reserves the native first choice in the journal before either signer.
+    const RESERVE_NOTARIZE: bool = false;
+    /// Requires the journaled joint final reservation and current release path.
+    const JOINT_FINALIZE: bool = false;
+    /// Preserves native-owned issuance data after the activity horizon. Retained
+    /// data grants no historical signing or absence authority. An opted-in mode
+    /// keeps its journal until a separately verified release contract exists.
+    const RETAIN_HISTORY: bool = false;
+    /// Synchronously captured application data, never native voting authority.
+    type FirstInput: Send + 'static;
+    /// Stages an exact first choice without signing. An opted-in mode must
+    /// return a record; missing mandatory data retires the voter, not the vote.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reserve_notarize(
+        _: &S,
+        _: &Self::Context,
+        _: &mut Self::RecoveryState,
+        _: &Proposal<D>,
+        _: &NativeContext<D, S::PublicKey>,
+        _: Self::FirstInput,
+    ) -> Option<Self::Recovery>
+    where
+        S: scheme::Scheme<D>,
+    {
+        None
+    }
+    /// First-phase local records, including retained signature receipts.
+    fn notarize_record(_: &Self::Recovery) -> Option<&Proposal<D>> {
+        None
+    }
+    /// Unsigned first reservation, distinct from a later receipt or fence.
+    fn reserved_notarize(_: &Self::Recovery) -> Option<&Proposal<D>> {
+        None
+    }
+    /// Restores one first-phase record before any NQC is required, using the
+    /// native owner's RNG and captured context for exact material validation.
+    fn replay_notarize<R: rand_core::CryptoRng>(
+        _: &S,
+        _: &Self::Context,
+        _: &mut R,
+        _: &mut Self::RecoveryState,
+        _: &Self::Recovery,
+    ) -> bool
+    where
+        S: scheme::Scheme<D>,
+    {
+        false
+    }
+    /// Ends issuance replay only after the native owner consumed the log.
+    fn finish_notarize_replay(_: &mut Self::RecoveryState) -> bool {
+        true
+    }
+    /// Checks an exact complete vote against the restored first-phase outbox.
+    fn replay_notarize_vote(_: &Self::RecoveryState, _: &Self::Notarize) -> bool {
+        true
+    }
+    /// Releases a synchronized first choice through its current owner fence.
+    /// The native context is resolved again for this exact proposal. Opted-in
+    /// modes must match their retained capture before calling either signer.
+    /// No await may separate the native preflight from this call. A returned
+    /// receipt and the complete vote must be synchronized before publication.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sign_notarize_current<R: rand_core::CryptoRng>(
+        scheme: &S,
+        _: &Self::Context,
+        _: &mut R,
+        _: &mut Self::RecoveryState,
+        proposal: Proposal<D>,
+        _: &NativeContext<D, S::PublicKey>,
+        evidence: &mut impl Participation<S, D, Self>,
+    ) -> Option<(Self::Notarize, Option<Self::Recovery>)>
+    where
+        S: scheme::Scheme<D>,
+    {
+        let base = Notarize::sign(scheme, proposal)?;
+        let vote = evidence.notarize(base.clone());
+        assert_eq!(
+            Self::notarize(&vote),
+            &base,
+            "extension changed native first vote"
+        );
+        Some((vote, None))
+    }
+    /// Requires an exact parent execution interpretation in addition to native ancestry.
     const REQUIRE_PARENT_INTERPRETATION: bool;
+    /// Requires retained application evidence before installing a final QC.
+    /// This does not require a parent execution interpretation. Modes using the
+    /// interpretation dependency retain the default admission requirement.
+    const REQUIRE_FINALIZATION_ADMISSION: bool = Self::REQUIRE_PARENT_INTERPRETATION;
+    /// Checks a subject against an already resolved native parent anchor. This
+    /// is separate from parent execution interpretation and runs only for modes
+    /// requiring finalization admission. Genesis is its native view/root pair.
+    fn matches_native_parent(
+        _: &Self::Context,
+        _: &Self::FinalSubject,
+        _: (crate::types::View, D),
+    ) -> bool {
+        true
+    }
     /// Trusted interpretation configuration for this epoch.
     type Context: Send + Sync + 'static;
     /// Local recovery fence; Plain has no additional state.
@@ -33,11 +132,19 @@ pub trait Voting<S: Scheme, D: Digest>: Mode<S, D> {
     fn allows_original(state: &Self::RecoveryState) -> bool;
     fn recovery_proposal(record: &Self::Recovery) -> &Proposal<D>;
     fn recovery_context(context: &Self::Context, record: &Self::Recovery) -> bool;
-    fn replay_recovery(
+    /// Restores a record against the captured context and exact retained
+    /// material. The RNG belongs to the native owner. Missing material must
+    /// refuse replay rather than infer permission or an empty history.
+    fn replay_recovery<R: rand_core::CryptoRng>(
+        scheme: &S,
+        context: &Self::Context,
+        rng: &mut R,
         state: &mut Self::RecoveryState,
         original: Option<&Self::FinalSubject>,
         record: &Self::Recovery,
-    ) -> bool;
+    ) -> bool
+    where
+        S: scheme::Scheme<D>;
     /// Checks native request eligibility without staging a decision or requiring custody.
     #[cfg(not(target_arch = "wasm32"))]
     fn validate_recovery_request<E, L>(
@@ -79,14 +186,20 @@ pub trait Voting<S: Scheme, D: Digest>: Mode<S, D> {
     ) -> Option<Self::RecoveryResponse>
     where
         S: scheme::Scheme<D>;
-    /// Rechecks the latest owned recovery state before invoking the signer.
-    /// The actor must first synchronize the record and its required material.
-    fn sign_recovery_current(
+    /// Releases an exact response through the current native-owned ledger.
+    /// The actor first synchronizes the reservation and required material. A
+    /// mode retaining a signed outbox must stage its release receipt here and
+    /// return it with the response. The actor synchronizes that receipt before
+    /// replying, even if the receiver was canceled. Retained responses may be
+    /// returned without signing; a current fence must reject any new signing.
+    /// A partial signing or ledger failure must retire the native owner.
+    fn sign_recovery_current<R: rand_core::CryptoRng>(
         scheme: &S,
         context: &Self::Context,
-        state: &Self::RecoveryState,
+        rng: &mut R,
+        state: &mut Self::RecoveryState,
         record: &Self::Recovery,
-    ) -> Option<Self::RecoveryResponse>
+    ) -> Option<(Self::RecoveryResponse, Option<Self::Recovery>)>
     where
         S: scheme::Scheme<D>;
     /// Immutable local final-vote subject, after caller-owned eligibility checks.
@@ -115,6 +228,27 @@ pub trait Voting<S: Scheme, D: Digest>: Mode<S, D> {
     /// Unsigned original authorization to synchronize before invoking a signer.
     /// Stock Simplex has no extension reservation record.
     fn reserve_finalize(subject: &Self::FinalSubject) -> Option<Self::Recovery>;
+    /// Stages an unsigned extension authorization after pure native preflight.
+    /// Outer `None` refuses this attempt without consuming the native decision;
+    /// `Some(None)` permits a mode with no additional reservation record.
+    /// The borrowed ledger is the sole native-owned issuance state. Joint modes
+    /// receive a freshly resolved native context and must pin their exact choice
+    /// there before returning the record. No signature may be released here.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stage_final_reservation<R: rand_core::CryptoRng>(
+        _: &S,
+        _: &Self::Context,
+        _: &mut R,
+        _: &mut Self::RecoveryState,
+        _: &Proposal<D>,
+        _: Option<&NativeContext<D, S::PublicKey>>,
+        subject: &Self::FinalSubject,
+    ) -> Option<Option<Self::Recovery>>
+    where
+        S: scheme::Scheme<D>,
+    {
+        Some(Self::reserve_finalize(subject))
+    }
     /// Original subject retained by an unsigned durable reservation, if any.
     fn reserved_subject(record: &Self::Recovery) -> Option<Self::FinalSubject>;
     /// Signs the caller-authorized subject. The caller journals before publishing.
@@ -125,8 +259,42 @@ pub trait Voting<S: Scheme, D: Digest>: Mode<S, D> {
     ) -> Option<Self::Vote>
     where
         S: scheme::Scheme<D>;
+    /// Returns only an already signed, retained joint pair, without signing or
+    /// granting fresh permission. The owner may retransmit it after a fence.
+    fn retained_finalize(_: &Self::RecoveryState, _: &Self::FinalSubject) -> Option<Self::Vote> {
+        None
+    }
+    /// Checks a complete final vote against its restored joint outbox.
+    fn replay_finalize_vote(_: &Self::RecoveryState, _: &Self::Vote) -> bool {
+        !Self::JOINT_FINALIZE
+    }
+    /// Releases a synchronized original choice through its current owner fence.
+    /// Joint modes receive the freshly resolved native context and must compare
+    /// their retained capture before either signer. A refusal returns before
+    /// signing; a partial signing failure must retire the owner. The returned
+    /// receipt precedes the complete vote in the synchronized native journal.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sign_finalize_current<R: rand_core::CryptoRng>(
+        scheme: &S,
+        _: &Self::Context,
+        _: &mut R,
+        _: &mut Self::RecoveryState,
+        proposal: Proposal<D>,
+        _: Option<&NativeContext<D, S::PublicKey>>,
+        subject: Self::FinalSubject,
+    ) -> Option<(Self::Vote, Option<Self::Recovery>)>
+    where
+        S: scheme::Scheme<D>,
+    {
+        assert!(
+            !Self::JOINT_FINALIZE,
+            "joint final release hook unavailable"
+        );
+        Self::sign_finalize(scheme, proposal, subject).map(|vote| (vote, None))
+    }
 }
 impl<S: Scheme, D: Digest> Voting<S, D> for Plain {
+    type FirstInput = ();
     const REQUIRE_PARENT_INTERPRETATION: bool = false;
     type Context = ();
     type RecoveryState = ();
@@ -140,7 +308,17 @@ impl<S: Scheme, D: Digest> Voting<S, D> for Plain {
     fn recovery_context(_: &(), record: &Self::Recovery) -> bool {
         match *record {}
     }
-    fn replay_recovery(_: &mut (), _: Option<&()>, record: &Self::Recovery) -> bool {
+    fn replay_recovery<R: rand_core::CryptoRng>(
+        _: &S,
+        _: &(),
+        _: &mut R,
+        _: &mut (),
+        _: Option<&()>,
+        record: &Self::Recovery,
+    ) -> bool
+    where
+        S: scheme::Scheme<D>,
+    {
         match *record {}
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -187,12 +365,13 @@ impl<S: Scheme, D: Digest> Voting<S, D> for Plain {
     {
         match *record {}
     }
-    fn sign_recovery_current(
+    fn sign_recovery_current<R: rand_core::CryptoRng>(
         _: &S,
         _: &(),
-        _: &(),
+        _: &mut R,
+        _: &mut (),
         record: &Self::Recovery,
-    ) -> Option<Self::RecoveryResponse>
+    ) -> Option<(Self::RecoveryResponse, Option<Self::Recovery>)>
     where
         S: scheme::Scheme<D>,
     {
@@ -254,6 +433,7 @@ commonware_macros::stability_scope!(ALPHA {
         }
     }
     impl<S:Scheme,D:Digest> Voting<S,D> for super::Extended {
+        type FirstInput=();
         const REQUIRE_PARENT_INTERPRETATION:bool=true;
         type Context=ExtendedContext<D>;
         type RecoveryState=super::recovery::State<D>;
@@ -261,7 +441,7 @@ commonware_macros::stability_scope!(ALPHA {
         fn allows_original(state:&Self::RecoveryState)->bool{state.allows_original()}
         fn recovery_proposal(record:&Self::Recovery)->&Proposal<D>{record.proposal()}
         fn recovery_context(context:&Self::Context,record:&Self::Recovery)->bool{context.domain==record.domain()}
-        fn replay_recovery(state:&mut Self::RecoveryState,original:Option<&Self::FinalSubject>,record:&Self::Recovery)->bool{state.apply(original,record)}
+        fn replay_recovery<R:rand_core::CryptoRng>(_:&S,_:&Self::Context,_:&mut R,state:&mut Self::RecoveryState,original:Option<&Self::FinalSubject>,record:&Self::Recovery)->bool where S:scheme::Scheme<D>{state.apply(original,record)}
         #[cfg(not(target_arch="wasm32"))]
         fn validate_recovery_request<E,L>(state:&mut StateWith<E,S,L,D,Self>,request:&Self::RecoveryRequest)->bool
         where E:commonware_runtime::Clock+rand_core::CryptoRng+commonware_runtime::Metrics,L:crate::simplex::elector::Elector<S>,S:scheme::Scheme<D>{
@@ -276,9 +456,9 @@ commonware_macros::stability_scope!(ALPHA {
         where E:commonware_runtime::Clock+rand_core::CryptoRng+commonware_runtime::Metrics,L:crate::simplex::elector::Elector<S>,S:scheme::Scheme<D>{
             state.prepare_recovery_request(query,evidence).ok()
         }
-        fn sign_recovery_current(scheme:&S,context:&Self::Context,state:&Self::RecoveryState,record:&Self::Recovery)->Option<Self::RecoveryResponse> where S:scheme::Scheme<D> {
+        fn sign_recovery_current<R:rand_core::CryptoRng>(scheme:&S,context:&Self::Context,_:&mut R,state:&mut Self::RecoveryState,record:&Self::Recovery)->Option<(Self::RecoveryResponse,Option<Self::Recovery>)> where S:scheme::Scheme<D> {
             if context.domain!=record.domain() || !state.permits_release(record) {return None;}
-            <Self as Voting<S,D>>::sign_recovery(scheme,context,record)
+            <Self as Voting<S,D>>::sign_recovery(scheme,context,record).map(|response|(response,None))
         }
         fn sign_recovery(scheme:&S,context:&Self::Context,record:&Self::Recovery)->Option<Self::RecoveryResponse> where S:scheme::Scheme<D> {
             use crate::simplex::extension::{recovery::{Promise,Status},request::Response,vote::Vote};

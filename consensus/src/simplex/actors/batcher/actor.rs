@@ -1,4 +1,4 @@
-use super::{Config, Mailbox, Message, RoundWith, verifier::Batch};
+use super::{Config, Mailbox, Message, RoundWith, assembly, verifier::Batch};
 #[cfg(test)]
 use crate::simplex::phase2::Plain;
 use crate::{
@@ -93,6 +93,7 @@ where
     required_active: usize,
 
     mailbox_receiver: mailbox::Receiver<Message<S, D, M>>,
+    assembly_receiver: Option<assembly::Receiver<M::Assembly>>,
 
     added: Counter,
     processed: Counter,
@@ -141,6 +142,8 @@ where
             "number of optimistic assembly attempts returning attestation verification results",
         );
         let (sender, receiver) = mailbox::new(context.child("mailbox"), cfg.mailbox_size);
+        let (assembly_sender, assembly_receiver) =
+            assembly::channel(cfg.mailbox_size, M::ASSEMBLY_BUDGET);
         let mut required_active = participants.quorum::<N3f1>() as usize;
         if scheme.me().is_some() {
             // We are live by construction (we never observe our own messages).
@@ -170,6 +173,7 @@ where
                 floor: cfg.floor,
 
                 mailbox_receiver: receiver,
+                assembly_receiver,
 
                 added,
                 processed,
@@ -179,7 +183,7 @@ where
                 construct_latency: histogram::Timed::new(construct_latency),
                 construct_fallback,
             },
-            Mailbox::new(sender),
+            Mailbox::with_assembly(sender, assembly_sender),
         )
     }
 
@@ -422,6 +426,26 @@ where
             },
             on_stopped => {
                 debug!("context shutdown, stopping batcher");
+            },
+            request = assembly::recv(&mut self.assembly_receiver) => {
+                let material = request.material();
+                let view = material.view();
+                let admitted = assembly::admitted(
+                    self.epoch,
+                    self.viewport(finalized, current.view),
+                    material,
+                );
+                request.complete(|material| {
+                    if !admitted {
+                        return false;
+                    }
+                    let round = self.round_for_view(&current, &mut work, view);
+                    let installed = round.install_assembly(material);
+                    if installed {
+                        dirty_views.push(view);
+                    }
+                    installed
+                });
             },
             Some(message) = self.mailbox_receiver.recv() else break => {
                 let view = message.view();

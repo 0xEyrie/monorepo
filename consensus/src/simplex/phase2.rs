@@ -11,12 +11,17 @@ use super::{
 };
 use crate::{Epochable, Viewable, types::Attributable};
 use commonware_codec::{EncodeSize, Read, Write};
-use commonware_cryptography::{Digest, certificate::Scheme};
+use commonware_cryptography::{
+    Digest,
+    certificate::{Scheme, Scoped},
+};
 use commonware_parallel::Strategy;
 use rand_core::CryptoRng;
 use std::fmt::Debug;
 
 pub mod recovery;
+
+commonware_macros::stability_mod!(ALPHA, pub mod general);
 
 mod sealed {
     pub trait Sealed {}
@@ -30,6 +35,20 @@ pub trait Mode<S: Scheme, D: Digest>:
     /// Keeps report and interpretation evidence until the containing view is pruned.
     /// Compact proposal-match bits alone cannot represent extension subjects.
     const RETAIN_INTERPRETATION: bool;
+    /// Maximum retained canonical assembly bytes; zero disables the local port.
+    /// Container and allocator metadata have separate roster/shape bounds.
+    const ASSEMBLY_BUDGET: usize = 0;
+    /// Immutable application-checked input for exact certificate assembly.
+    /// It is not a peer-decoded message or native signing authorization.
+    type Assembly: Clone + Debug + PartialEq + Epochable + Viewable + Send + Sync + 'static;
+    /// Original native proposal authenticated by the checked material.
+    fn assembly_proposal(assembly: &Self::Assembly) -> &Proposal<D>;
+    /// Canonical retained byte charge used for bounded local admission.
+    fn assembly_size(assembly: &Self::Assembly) -> usize;
+    /// Coalesces alternate proofs of one exact semantic decision.
+    fn equivalent_assembly(a: &Self::Assembly, b: &Self::Assembly) -> bool {
+        a == b
+    }
     /// Local slow-path decision encoded in the native journal; uninhabited in Plain.
     type Recovery: Clone
         + Debug
@@ -83,13 +102,46 @@ pub trait Mode<S: Scheme, D: Digest>:
     fn finalize_proposal(vote: &Self::Vote) -> &Proposal<D>;
     /// Original proposal referenced by an original-round certificate.
     fn finalization_proposal(certificate: &Self::Certificate) -> &Proposal<D>;
-    /// Native certificate used by the existing leader-election scheme.
+    /// Native certificate authenticating [`Self::signed_finalization_subject`].
     fn finalization_certificate(certificate: &Self::Certificate) -> &S::Certificate;
+    /// Authenticated native witness used to elect the original proposal's successor.
+    ///
+    /// Modes with a distinct witness must verify its exact proposal and epoch in
+    /// [`Self::verify_companion`]. It must yield the same election result as the
+    /// certificates that independently unlock that successor. This accessor does
+    /// not replace the certificate authenticating the signed finalization subject.
+    fn finalization_election_certificate(certificate: &Self::Certificate) -> &S::Certificate {
+        Self::finalization_certificate(certificate)
+    }
     /// Exact signed phase-two subject, retaining extension interpretation bytes.
     fn signed_finalization_subject(certificate: &Self::Certificate) -> Subject<'_, D>;
+    /// Validates evidence carried outside the native signed subject and quorum.
+    ///
+    /// Call after authenticating the native quorum under this same epoch scope.
+    /// This must check all companion evidence required by this representation;
+    /// a valid native quorum alone does not authenticate that evidence. Missing
+    /// verification capabilities or required material must return false. Native
+    /// ancestry and application execution policy remain separate checks.
+    fn verify_companion<R: CryptoRng>(
+        certificate: &Self::Certificate,
+        rng: &mut R,
+        scoped: &Scoped<S>,
+        strategy: &impl Strategy,
+    ) -> bool
+    where
+        S: scheme::Scheme<D>;
     /// Different signed subjects in the same protocol domain. The evidence
     /// constructor separately checks the same round and participant.
     fn conflicting_finalize_subjects(a: &Self::Vote, b: &Self::Vote) -> bool;
+    /// Recognizes a retransmission after signed-subject conflict classification.
+    ///
+    /// The default requires exact vote equality. A representation may ignore
+    /// unauthenticated retrieval metadata, but must retain exact signed fields,
+    /// owner identities and attestations. This does not replace the first vote
+    /// or authorize another contribution from its owner.
+    fn equivalent_finalize(a: &Self::Vote, b: &Self::Vote) -> bool {
+        a == b
+    }
     /// Authenticates an individual final vote over its exact native subject.
     fn verify_finalize<R: CryptoRng>(
         vote: &Self::Vote,
@@ -154,6 +206,13 @@ pub struct Plain;
 impl sealed::Sealed for Plain {}
 impl<S: Scheme, D: Digest> Mode<S, D> for Plain {
     const RETAIN_INTERPRETATION: bool = false;
+    type Assembly = recovery::NoRecovery;
+    fn assembly_proposal(value: &Self::Assembly) -> &Proposal<D> {
+        match *value {}
+    }
+    fn assembly_size(value: &Self::Assembly) -> usize {
+        match *value {}
+    }
     type Recovery = recovery::NoRecovery;
     type Recovered = recovery::NoRecovery;
     fn read_recovered(
@@ -208,6 +267,17 @@ impl<S: Scheme, D: Digest> Mode<S, D> for Plain {
             proposal: &certificate.proposal,
         }
     }
+    fn verify_companion<R: CryptoRng>(
+        _: &Self::Certificate,
+        _: &mut R,
+        _: &Scoped<S>,
+        _: &impl Strategy,
+    ) -> bool
+    where
+        S: scheme::Scheme<D>,
+    {
+        true
+    }
     fn conflicting_finalize_subjects(a: &Self::Vote, b: &Self::Vote) -> bool {
         a.proposal != b.proposal
     }
@@ -246,6 +316,9 @@ commonware_macros::stability_scope!(ALPHA {
     impl sealed::Sealed for Extended {}
     impl<S:Scheme,D:Digest> Mode<S,D> for Extended {
         const RETAIN_INTERPRETATION: bool = true;
+        type Assembly = recovery::NoRecovery;
+        fn assembly_proposal(value: &Self::Assembly) -> &Proposal<D> { match *value {} }
+        fn assembly_size(value: &Self::Assembly) -> usize { match *value {} }
         type Recovery = recovery::Record<D>;
         type Recovered = super::extension::certificate::Recovered<S,D>;
         fn read_recovered(reader:&mut impl commonware_codec::Buf,cfg:&<S::Certificate as Read>::Cfg)->Result<Self::Recovered,commonware_codec::Error>{Self::Recovered::read_cfg(reader,cfg)}
@@ -266,6 +339,7 @@ commonware_macros::stability_scope!(ALPHA {
         fn finalization_proposal(certificate:&Self::Certificate)->&Proposal<D> {&certificate.certificate().statement.proposal}
         fn finalization_certificate(certificate:&Self::Certificate)->&S::Certificate {&certificate.certificate().certificate}
         fn signed_finalization_subject(certificate:&Self::Certificate)->Subject<'_,D> {Subject::FinalizeExtension{statement:&certificate.certificate().statement}}
+        fn verify_companion<R:CryptoRng>(_:&Self::Certificate,_:&mut R,_:&Scoped<S>,_:&impl Strategy)->bool where S:scheme::Scheme<D> {true}
         fn conflicting_finalize_subjects(a:&Self::Vote,b:&Self::Vote)->bool {
             a.vote().statement.domain==b.vote().statement.domain && a.vote().statement!=b.vote().statement
         }
@@ -284,3 +358,21 @@ pub mod aggregation;
 
 /// Local vote subject representation and native signing.
 pub mod voting;
+
+#[cfg(test)]
+pub(crate) mod companion_probe;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod first_probe;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod final_probe;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod metadata_probe;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod recovery_probe;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod election_tests;

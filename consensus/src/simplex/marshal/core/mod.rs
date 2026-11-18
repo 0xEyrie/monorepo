@@ -12,6 +12,10 @@
 //! The actor uses that same mode for its mailbox, cache, floors and resolver
 //! verification. Recovery witnesses are not finalization inputs. Applications
 //! must retain and verify ancestor interpretation material before execution.
+//! Untrusted fetched finalizations and explicit floor anchors authenticate both
+//! the native quorum and the mode's companion evidence before admission. Local
+//! consensus reports and admitted durable archives retain their native trust
+//! boundary; a new mode must establish complete validation before using it.
 //!
 //! # Components
 //!

@@ -1,11 +1,8 @@
-//! Focused tests of the production tracker and mailbox modules. Including these
-//! modules runs their private lifecycle regressions without monomorphizing the
-//! unrelated consensus network tests. The library also compiles these same files.
+//! Focused production-tracker lifecycle tests without the full network graph.
+//! Batcher ingress policies are exercised by their existing native unit tests,
+//! where the complete sibling queue/actor graph is available.
 pub use commonware_consensus::{Viewable, simplex, types};
 
-#[allow(dead_code)]
-#[path = "../src/simplex/actors/batcher/ingress.rs"]
-mod ingress;
 #[allow(dead_code)]
 #[path = "../src/simplex/types/tracker.rs"]
 mod tracker;

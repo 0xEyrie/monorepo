@@ -1234,6 +1234,15 @@ where
             )[0],
             "floor finalization must verify"
         );
+        assert!(
+            FC::Mode::verify_companion(
+                &finalization,
+                self.context.as_mut(),
+                &scoped,
+                &self.strategy,
+            ),
+            "floor finalization companion must verify"
+        );
 
         let commitment = FC::Mode::finalization_proposal(&finalization).payload;
         let digest = V::commitment_to_inner(commitment);
@@ -1741,7 +1750,18 @@ where
             let results =
                 verify_certificates(self.context.as_mut(), scoped, &group, &self.strategy);
             for (j, &idx) in indices.iter().enumerate() {
-                verified[idx] = results[j];
+                verified[idx] = results[j]
+                    && match &delivers[idx] {
+                        PendingVerification::Finalized { finalization, .. } => {
+                            FC::Mode::verify_companion(
+                                finalization,
+                                self.context.as_mut(),
+                                delivers[idx].scoped(),
+                                &self.strategy,
+                            )
+                        }
+                        PendingVerification::Notarized { .. } => true,
+                    };
             }
         }
 

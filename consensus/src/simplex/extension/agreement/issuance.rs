@@ -7,7 +7,8 @@
 //! Replay restores every retained record before any signer is enabled.
 
 use super::{
-    Core, Kind, Limits, Message, Signed, Slot,
+    Core, FastProof, Kind, Limits, Message, Signed, Slot, Value,
+    normal::{self, Reservation},
     recovery::{self, Entry, Material, Page, Phase, Verified, Verifier},
     scheme,
 };
@@ -44,6 +45,9 @@ pub struct Record<D: Digest> {
 /// Record contents are public for custody/replay inspection, not vote authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action<D: Digest> {
+    /// Permanently closes the original FIRST opportunity without signing a row.
+    /// This is not a FIRST containing an explicitly absent report.
+    NoM1First,
     Reserve {
         message: Message<D>,
         /// Exact retained origin, selection input, proposal/J or RPC body.
@@ -93,6 +97,7 @@ impl<D: Digest> Write for Record<D> {
         self.slot.write(w);
         self.owner.write(w);
         match &self.action {
+            Action::NoM1First => 3u8.write(w),
             Action::Reserve {
                 message,
                 authority,
@@ -141,6 +146,7 @@ impl<D: Digest> EncodeSize for Record<D> {
         2 + self.slot.encode_size()
             + self.owner.encode_size()
             + match &self.action {
+                Action::NoM1First => 0,
                 Action::Reserve {
                     message,
                     authority,
@@ -204,6 +210,7 @@ impl<D: Digest> Read for Record<D> {
                 leader: Participant::read(r)?,
                 value: D::read(r)?,
             },
+            3 => Action::NoM1First,
             _ => return Err(CodecError::Invalid("agreement issuance", "action")),
         };
         Ok(Self {
@@ -304,6 +311,28 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
     }
     pub fn terminal(&self) -> Option<&Record<D>> {
         self.terminal.map(|i| &self.records[i])
+    }
+
+    /// Closes the original FIRST opportunity when no M1 response was ready.
+    /// The owner must sync the returned record before treating this closure as
+    /// durable. An existing FIRST or closure is returned unchanged, even after
+    /// a later fence; that receipt grants no new signing permission. NoM1First
+    /// prevents later FIRST/SELECT, but does not exclude a valid FAST_FINAL.
+    pub fn close_first_without_response<H: Hasher<Digest = D>>(
+        &mut self,
+        authorize: impl Fn(Round) -> Option<Participant>,
+    ) -> Result<Record<D>, Error> {
+        let key = (self.slot.proposal.round, Step::First);
+        if let Some(i) = self.choices.get(&key) {
+            return Ok(self.records[*i].clone());
+        }
+        let record = Record {
+            slot: self.slot.clone(),
+            owner: self.owner,
+            action: Action::NoM1First,
+        };
+        self.restore::<H>(&record, authorize)?;
+        Ok(record)
     }
 
     /// Stage an already validated subject and its durably retained authority.
@@ -470,6 +499,24 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
             return Err(Error::Context);
         }
         match &record.action {
+            Action::NoM1First => {
+                let key = (self.slot.proposal.round, Step::First);
+                if let Some(old) = self.choices.get(&key) {
+                    return if self.records[*old] == *record {
+                        Ok(())
+                    } else {
+                        Err(Error::Conflict)
+                    };
+                }
+                if self.terminal.is_some() {
+                    return Err(Error::Closed);
+                }
+                self.context(self.slot.proposal.round, self.original_leader, &authorize)?;
+                if self.floor > self.slot.proposal.round {
+                    return Err(Error::Floor);
+                }
+                self.choices.insert(key, self.records.len());
+            }
             Action::Reserve {
                 message,
                 authority,
@@ -648,6 +695,98 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
             return Err(Error::Floor);
         }
         Signed::sign(&self.scheme, message.clone()).map_err(|_| Error::Signature)
+    }
+
+    /// Verifies the full origin and stages one joint unsigned authorization.
+    ///
+    /// Native eligibility and the native once-choice must be preflighted by the
+    /// owning voter before this transition. Retain `origin` and synchronize the
+    /// returned item in the native journal before calling `sign_normal`. An old
+    /// same-value authorization must name this exact origin; its authority is
+    /// never silently replaced by another proof encoding.
+    pub fn reserve_normal<H: Hasher<Digest = D>, R: CryptoRng>(
+        &mut self,
+        rng: &mut R,
+        origin: &FastProof<S, D>,
+        policy: impl FnOnce(&Value<D>) -> bool,
+        authorize: impl Fn(Round) -> Option<Participant>,
+        strategy: &impl Strategy,
+    ) -> Result<Reservation<D>, normal::Error> {
+        if self.terminal.is_some() {
+            return Err(Error::Closed.into());
+        }
+        if self.floor > self.slot.proposal.round {
+            return Err(Error::Floor.into());
+        }
+        origin.verify::<H, _>(
+            rng,
+            &self.scheme,
+            &self.slot,
+            self.original_leader,
+            self.limits,
+            policy,
+            strategy,
+        )?;
+        let subject = normal::subject::<H>(&origin.value);
+        let root = Material::Origin(origin.clone()).id::<H>();
+        let agreement = self.reserve::<H>(
+            Message {
+                slot: self.slot.id::<H>(),
+                round: self.slot.proposal.round,
+                leader: self.original_leader,
+                kind: Kind::FastFinal(subject.extension),
+            },
+            Some(root),
+            None,
+            authorize,
+        )?;
+        if !matches!(agreement.action(), Action::Reserve { authority: Some(old), .. } if *old == root)
+        {
+            return Err(Error::Authority.into());
+        }
+        Ok(Reservation { subject, agreement })
+    }
+
+    /// Checks the joint subject and restores its M1 choice from one journal item.
+    ///
+    /// The voter restores its native once-choice from `record.subject()` in that
+    /// same replay transition. Required origin custody and native eligibility
+    /// remain caller prerequisites. Restore all later records before signing.
+    pub fn restore_normal<H: Hasher<Digest = D>>(
+        &mut self,
+        record: &Reservation<D>,
+        authorize: impl Fn(Round) -> Option<Participant>,
+    ) -> Result<(), Error> {
+        record.check::<H>()?;
+        self.restore::<H>(&record.agreement, authorize)
+    }
+
+    /// Releases the two genuine signatures after the owner's joint WAL barrier.
+    /// No asynchronous boundary separates the latest fence check and the calls.
+    /// A higher floor or terminal never permits creation of the missing FAST half.
+    pub fn sign_normal<H: Hasher<Digest = D>>(
+        &self,
+        record: &Reservation<D>,
+    ) -> Result<normal::Vote<S, D>, Error> {
+        record.check::<H>()?;
+        // Check and release M1 first. A fenced reservation must not call either
+        // signer, even when only the native half would otherwise be usable.
+        let agreement = self.sign_reserved(&record.agreement)?;
+        let native =
+            crate::simplex::extension::vote::Vote::sign(&self.scheme, record.subject.clone())
+                .ok_or(Error::Signature)?;
+        let Action::Reserve {
+            authority: Some(origin),
+            ..
+        } = record.agreement.action()
+        else {
+            return Err(Error::Authority);
+        };
+        Ok(normal::Vote {
+            native,
+            agreement,
+            origin: *origin,
+        })
     }
 
     fn report_bound(&self, report: &Option<bytes::Bytes>) -> Result<(), Error> {

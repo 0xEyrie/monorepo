@@ -578,6 +578,8 @@ where
 /// Always usable as a [`Verifier`] for certificate verification. The full signing scheme is
 /// recoverable with [`Scoped::into_scheme`] only when the scope was built with [`Scoped::scheme`].
 /// A scope built with [`Scoped::verifier`] yields `None`.
+/// Public participant metadata and individual attestation verification do not require
+/// signing access.
 #[derive(Clone, Debug)]
 pub struct Scoped<S: Scheme> {
     scheme: Arc<S>,
@@ -599,6 +601,29 @@ impl<S: Scheme> Scoped<S> {
             scheme,
             can_sign: true,
         }
+    }
+
+    /// Returns the ordered public identity keys of this scope's scheme.
+    #[commonware_macros::stability(BETA)]
+    pub fn participants(&self) -> &Set<S::PublicKey> {
+        self.scheme.participants()
+    }
+
+    /// Verifies an individual attestation under this scope without granting signing access.
+    #[commonware_macros::stability(BETA)]
+    pub fn verify_attestation<R, D>(
+        &self,
+        rng: &mut R,
+        subject: S::Subject<'_, D>,
+        attestation: &Attestation<S>,
+        strategy: &impl Strategy,
+    ) -> bool
+    where
+        R: CryptoRng,
+        D: Digest,
+    {
+        self.scheme
+            .verify_attestation(rng, subject, attestation, strategy)
     }
 
     /// Returns the full signing scheme, or `None` for a verify-only scope.
@@ -849,7 +874,11 @@ mod tests {
     use commonware_codec::{Decode, Encode};
     use commonware_math::algebra::Random;
     use commonware_parallel::Sequential;
-    use commonware_utils::{N3f1, TryCollect, non_empty, ordered::Set, test_rng};
+    use commonware_utils::{
+        N3f1, TryCollect, non_empty,
+        ordered::{Quorum as _, Set},
+        test_rng,
+    };
     #[cfg(feature = "bls12381")]
     use commonware_utils::{NZU32, ordered::BiMap, sync::Mutex};
     #[cfg(feature = "bls12381")]
@@ -1129,6 +1158,105 @@ mod tests {
         let provider = ConstantProvider::<_, ()>::new(schemes[0].clone());
         assert!(provider.scoped(()).is_some());
         assert!(provider.scheme(()).is_some());
+    }
+
+    #[test]
+    fn test_scoped_verifier_authenticates_attestations_without_signing_access() {
+        let mut rng = test_rng();
+        let (schemes, _) = setup_ed25519(7);
+        let subject = TestSubject { message: MESSAGE };
+        let attestation = schemes[0].sign::<Sha256Digest>(subject).unwrap();
+        // Keep an actual signer behind the restricted handle to test the
+        // wrapper's capability boundary independently of the inner key setup.
+        let scoped = Scoped::verifier(Arc::new(schemes[0].clone()));
+        assert!(scoped.clone().into_scheme().is_none());
+        assert_eq!(scoped.participants(), schemes[0].participants());
+        assert_eq!(scoped.participants().len(), 7);
+        assert!(scoped.verify_attestation::<_, Sha256Digest>(
+            &mut rng,
+            subject,
+            &attestation,
+            &Sequential,
+        ));
+        assert!(!scoped.verify_attestation::<_, Sha256Digest>(
+            &mut rng,
+            TestSubject {
+                message: BAD_MESSAGE,
+            },
+            &attestation,
+            &Sequential,
+        ));
+
+        let mut forged = attestation;
+        forged.signer = schemes[1].me().unwrap();
+        assert!(!scoped.verify_attestation::<_, Sha256Digest>(
+            &mut rng,
+            subject,
+            &forged,
+            &Sequential,
+        ));
+        forged.signer = Participant::new(7);
+        assert!(!scoped.verify_attestation::<_, Sha256Digest>(
+            &mut rng,
+            subject,
+            &forged,
+            &Sequential,
+        ));
+        assert!(scoped.into_scheme().is_none());
+    }
+
+    #[test]
+    fn test_scoped_attestation_verification_respects_namespace_and_roster() {
+        let mut rng = test_rng();
+        let (schemes, verifier) = setup_ed25519(7);
+        let subject = TestSubject { message: MESSAGE };
+        let attestation = schemes[0].sign::<Sha256Digest>(subject).unwrap();
+        let participants = verifier.participants().clone();
+        let scoped = Scoped::verifier(Arc::new(verifier));
+        assert!(scoped.verify_attestation::<_, Sha256Digest>(
+            &mut rng,
+            subject,
+            &attestation,
+            &Sequential,
+        ));
+
+        // Model an epoch-specific namespace with exactly the same keys. Scope
+        // separation comes from the provider's key/namespace setup, not an epoch
+        // number inferred by Scoped itself.
+        let next_epoch = Scoped::verifier(Arc::new(Ed25519Scheme::verifier(
+            b"_COMMONWARE_CRYPTOGRAPHY_SCOPED_NEXT_EPOCH_TEST",
+            participants.clone(),
+        )));
+        assert_eq!(next_epoch.participants(), scoped.participants());
+        assert!(!next_epoch.verify_attestation::<_, Sha256Digest>(
+            &mut rng,
+            subject,
+            &attestation,
+            &Sequential,
+        ));
+
+        let signer_key = participants.key(attestation.signer).unwrap();
+        let other_participants = participants
+            .iter()
+            .filter(|key| *key != signer_key)
+            .cloned()
+            .try_collect()
+            .unwrap();
+        let other_roster = Scoped::verifier(Arc::new(Ed25519Scheme::verifier(
+            NAMESPACE,
+            other_participants,
+        )));
+        assert_eq!(other_roster.participants().len(), 6);
+        assert!(other_roster.participants().index(signer_key).is_none());
+        assert!(!other_roster.verify_attestation::<_, Sha256Digest>(
+            &mut rng,
+            subject,
+            &attestation,
+            &Sequential,
+        ));
+        assert!(scoped.into_scheme().is_none());
+        assert!(next_epoch.into_scheme().is_none());
+        assert!(other_roster.into_scheme().is_none());
     }
 
     #[cfg(feature = "bls12381")]

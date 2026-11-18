@@ -23,10 +23,40 @@ use commonware_utils::{TestRng, non_empty};
 type S = ed25519::Scheme;
 type Proof = FastProof<S, Digest>;
 
+#[path = "extension_agreement/general.rs"]
+mod general;
+#[path = "extension_agreement/general_authentication.rs"]
+mod general_authentication;
+#[path = "extension_agreement/general_checked_issuance.rs"]
+mod general_checked_issuance;
+#[path = "extension_agreement/general_core.rs"]
+mod general_core;
+#[path = "extension_agreement/general_entry.rs"]
+mod general_entry;
+#[path = "extension_agreement/general_history.rs"]
+mod general_history;
+#[path = "extension_agreement/general_issuance.rs"]
+mod general_issuance;
+#[path = "extension_agreement/general_normal.rs"]
+mod general_normal;
+#[path = "extension_agreement/general_normal_bounds.rs"]
+mod general_normal_bounds;
+#[path = "extension_agreement/general_recovery.rs"]
+mod general_recovery;
+#[path = "extension_agreement/general_recovery_issuance.rs"]
+mod general_recovery_issuance;
+#[path = "extension_agreement/general_signers.rs"]
+mod general_signers;
+#[path = "extension_agreement/general_wish.rs"]
+mod general_wish;
 #[path = "extension_agreement/issuance.rs"]
 mod issuance;
+#[path = "extension_agreement/normal.rs"]
+mod normal;
 #[path = "extension_agreement/recovery.rs"]
 mod recovery;
+#[path = "extension_agreement/scoped.rs"]
+mod scoped;
 const LIMITS: Limits = Limits {
     report_bytes: 64,
     direction_bytes: 64,

@@ -344,6 +344,15 @@ impl<S: Scheme<D>, D: Digest, M: Aggregation<S, D>> VerifierWith<S, D, M> {
             .await
     }
 
+    /// Installs locally checked immutable assembly material for this exact round.
+    /// Material cannot select or replace the native authoritative proposal.
+    pub(super) fn install_assembly(&mut self, material: M::Assembly) -> bool {
+        if M::assembly_proposal(&material).round != self.round {
+            return false;
+        }
+        self.finalize.install_assembly(material)
+    }
+
     /// Attempts to construct a finalization from buffered votes.
     pub async fn try_construct_finalization<R: CryptoRng + Send>(
         &mut self,
@@ -2089,3 +2098,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../../phase2/aggregation/general_verifier_tests.rs"]
+mod general_tests;

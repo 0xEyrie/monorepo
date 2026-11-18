@@ -2,7 +2,7 @@
 //! fast path; Extended groups complete signed interpretation subjects.
 use super::{Mode, Plain};
 pub use crate::simplex::actors::batcher::{
-    Round as BatcherRound, RoundWith, Verifier, VerifierWith,
+    Mailbox as BatcherMailbox, Round as BatcherRound, RoundWith, Verifier, VerifierWith,
 };
 use crate::{
     simplex::{
@@ -26,7 +26,13 @@ use tracing::{Instrument as _, Span, info_span};
 /// Native-owned accumulation policy selected by the sealed representation mode.
 pub trait Aggregation<S: Scheme<D>, D: Digest>: Mode<S, D> {
     /// Final votes never share a quorum across different signed subjects.
-    type FinalBuffer: FinalBuffer<S, D, Vote = Self::Vote, Certificate = Self::Certificate>;
+    type FinalBuffer: FinalBuffer<
+            S,
+            D,
+            Vote = Self::Vote,
+            Certificate = Self::Certificate,
+            Assembly = Self::Assembly,
+        >;
 }
 /// Native final-vote accumulation. The caller verifies sender identity and admits
 /// at most one vote per participant per phase. Application validation is separate.
@@ -35,6 +41,13 @@ pub trait FinalBuffer<S: Scheme<D>, D: Digest>: Send {
     type Vote;
     /// Mode-specific original-round certificate.
     type Certificate: Send + 'static;
+    /// Locally checked immutable material selected by the sealed Mode.
+    type Assembly;
+    /// Installs checked material without granting signing or native eligibility.
+    /// A false result leaves custody and retry responsibility with the caller.
+    fn install_assembly(&mut self, _: Self::Assembly) -> bool {
+        false
+    }
     /// Opens bounded per-view accumulation using the native roster and quorum.
     fn new(quorum: usize, participants: usize) -> Self;
     /// Retains a locally verified or source-authenticated remote vote.
@@ -45,7 +58,8 @@ pub trait FinalBuffer<S: Scheme<D>, D: Digest>: Send {
     fn complete(&mut self);
     /// Whether an authenticated certificate already completed collection.
     fn is_complete(&self) -> bool;
-    /// Whether prior individually verified votes already have an exact quorum.
+    /// Whether retained inputs can attempt an exact quorum before proposal selection.
+    /// This is readiness, never a substitute for authenticating the constructed result.
     fn has_constructable_quorum(&self) -> bool;
     /// Verifies pending votes and constructs an exact-subject certificate.
     fn construct<R: CryptoRng + Send>(
@@ -62,6 +76,7 @@ impl<S: Scheme<D>, D: Digest> Aggregation<S, D> for Plain {
 impl<S: Scheme<D>, D: Digest> FinalBuffer<S, D> for Certification<Proposal<D>, S> {
     type Vote = Finalize<S, D>;
     type Certificate = Finalization<S, D>;
+    type Assembly = super::recovery::NoRecovery;
     fn new(quorum: usize, _participants: usize) -> Self {
         Self::new(quorum)
     }
@@ -108,6 +123,7 @@ impl<S: Scheme<D>, D: Digest> FinalBuffer<S, D> for Certification<Proposal<D>, S
     }
 }
 commonware_macros::stability_mod!(ALPHA, pub mod extended);
+commonware_macros::stability_mod!(ALPHA, pub mod general);
 
 /// Runs a CPU-bound job through [Strategy::spawn], entering `span` on the worker thread and
 /// instrumenting the returned future so the offloaded work stays attributed to the caller's trace.

@@ -48,8 +48,20 @@ mod startup_tests;
 #[path = "reservation_tests.rs"]
 mod reservation_tests;
 
+#[path = "first_reservation_tests.rs"]
+mod first_reservation_tests;
+
+#[path = "final_reservation_tests.rs"]
+mod final_reservation_tests;
+
+#[path = "fallible_tests.rs"]
+mod fallible_tests;
+
 #[path = "ancestry_tests.rs"]
 mod ancestry_tests;
+
+#[path = "admission_tests.rs"]
+mod admission_tests;
 
 #[derive(Clone, Default)]
 struct App(Arc<Mutex<Vec<oneshot::Sender<D>>>>);
@@ -438,6 +450,12 @@ fn extension_overflow_preserves_parent_and_readiness() {
 
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
+
+#[path = "recovery_release_tests.rs"]
+mod recovery_release_tests;
+
+#[path = "general_voting_tests.rs"]
+mod general_voting_tests;
 
 #[path = "recovered_tests.rs"]
 mod recovered_tests;

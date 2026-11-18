@@ -131,6 +131,299 @@ fn trace(f: &Fixture<S>) -> (State<S, Digest>, Store, Vec<Record<Digest>>, Diges
     (state, store, records, prepared)
 }
 
+fn assert_no_late_first(state: &mut State<S, Digest>, p: &Proof) {
+    assert_eq!(
+        state.reserve::<Sha256>(
+            p.firsts[0].message.clone(),
+            None,
+            Some(p.core.clone()),
+            leader,
+        ),
+        Err(IssuanceError::Conflict)
+    );
+    let selection_rejection = if state.floor() > p.value.slot.proposal.round {
+        IssuanceError::Floor
+    } else {
+        IssuanceError::Conflict
+    };
+    assert_eq!(
+        state.reserve::<Sha256>(
+            p.selection.message.clone(),
+            Some(Digest::from([8; 32])),
+            None,
+            leader,
+        ),
+        Err(selection_rejection)
+    );
+}
+
+#[test]
+fn no_m1_first_is_an_unsigned_permanent_closure_not_an_absent_report() {
+    let f = fixture(7);
+    let p = proof(&f);
+    let mut state = local(&f, 0);
+    let closed = state
+        .close_first_without_response::<Sha256>(leader)
+        .unwrap();
+    assert!(matches!(closed.action(), Action::NoM1First));
+    assert_eq!(closed.slot(), &slot(&f));
+    assert_eq!(closed.owner(), Participant::new(0));
+    assert_eq!(closed.view(), slot(&f).proposal.round.view());
+    assert_eq!(
+        state
+            .close_first_without_response::<Sha256>(leader)
+            .unwrap(),
+        closed
+    );
+    assert_eq!(state.records().len(), 1);
+    assert_eq!(
+        state.sign_reserved(&closed).unwrap_err(),
+        IssuanceError::Reservation
+    );
+    assert_no_late_first(&mut state, &p);
+
+    // A same-identity FIRST receipt from another state is not this owner's
+    // retained choice. This models a stale caller, not permission for two owners.
+    let mut stale = local(&f, 0);
+    let first = stale
+        .reserve::<Sha256>(
+            p.firsts[0].message.clone(),
+            None,
+            Some(p.core.clone()),
+            leader,
+        )
+        .unwrap();
+    assert_eq!(
+        state.sign_reserved(&first).unwrap_err(),
+        IssuanceError::Reservation
+    );
+    let mut replay = local(&f, 0);
+    replay.restore::<Sha256>(&closed, leader).unwrap();
+    replay.restore::<Sha256>(&closed, leader).unwrap();
+    assert_eq!(replay.records(), &[closed]);
+    assert_no_late_first(&mut replay, &p);
+}
+
+#[test]
+fn closing_without_response_preserves_existing_first_even_with_explicit_absence() {
+    let f = fixture(7);
+    for absent in [false, true] {
+        let mut p = proof(&f);
+        if absent {
+            let Kind::First { report, .. } = &mut p.firsts[0].message.kind else {
+                unreachable!()
+            };
+            *report = None;
+            p.core.leader_report = Core::<Digest>::row::<Sha256>(report);
+            let Kind::First { core, .. } = &mut p.firsts[0].message.kind else {
+                unreachable!()
+            };
+            *core = p.core.id::<Sha256>();
+        }
+        let mut state = local(&f, 0);
+        let first = state
+            .reserve::<Sha256>(
+                p.firsts[0].message.clone(),
+                None,
+                Some(p.core.clone()),
+                leader,
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .close_first_without_response::<Sha256>(leader)
+                .unwrap(),
+            first
+        );
+        assert_eq!(state.records(), std::slice::from_ref(&first));
+        assert!(state.sign_reserved(&first).unwrap().verify(
+            &mut TestRng::new(720),
+            &f.verifier,
+            &Sequential
+        ));
+        let mut other = local(&f, 0);
+        let closure = other
+            .close_first_without_response::<Sha256>(leader)
+            .unwrap();
+        assert_eq!(
+            state.restore::<Sha256>(&closure, leader),
+            Err(IssuanceError::Conflict)
+        );
+        assert_eq!(state.records(), std::slice::from_ref(&first));
+        state
+            .recover::<Sha256>(round(5), Participant::new(1), None, leader)
+            .unwrap();
+        assert_eq!(
+            state
+                .close_first_without_response::<Sha256>(leader)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            state.sign_reserved(&first).unwrap_err(),
+            IssuanceError::Floor
+        );
+    }
+}
+
+#[test]
+fn no_m1_first_allows_authenticated_normal_final_from_a_noncohort_validator() {
+    let f = fixture(7);
+    let p = proof(&f);
+    assert!(!p.core.followers.contains(&Participant::new(6)));
+    let mut state = local(&f, 6);
+    let closure = state
+        .close_first_without_response::<Sha256>(leader)
+        .unwrap();
+    let reservation = state
+        .reserve_normal::<Sha256, _>(&mut TestRng::new(721), &p, policy, leader, &Sequential)
+        .unwrap();
+    let pair = state.sign_normal::<Sha256>(&reservation).unwrap();
+    assert!(pair.verify_attestations::<Sha256, _>(
+        &mut TestRng::new(722),
+        &f.verifier,
+        &p,
+        &Sequential,
+    ));
+    let mut replay = local(&f, 6);
+    replay.restore::<Sha256>(&closure, leader).unwrap();
+    replay
+        .restore_normal::<Sha256>(&reservation, leader)
+        .unwrap();
+    assert!(replay.sign_normal::<Sha256>(&reservation).is_ok());
+    assert_eq!(
+        replay
+            .close_first_without_response::<Sha256>(leader)
+            .unwrap(),
+        closure
+    );
+}
+
+fn raw_no_first(expected: Slot<Digest>, owner: Participant) -> Record<Digest> {
+    let mut bytes = Vec::new();
+    1u8.write(&mut bytes);
+    expected.write(&mut bytes);
+    owner.write(&mut bytes);
+    3u8.write(&mut bytes);
+    Record::decode(Bytes::from(bytes)).unwrap()
+}
+
+#[test]
+fn no_m1_first_replay_rejects_foreign_context_and_new_closure_below_floor() {
+    let f = fixture(7);
+    let mut state = local(&f, 0);
+    assert_eq!(
+        state.close_first_without_response::<Sha256>(|_| None),
+        Err(IssuanceError::Context)
+    );
+    assert!(state.records().is_empty());
+    let foreign_owner = raw_no_first(slot(&f), Participant::new(1));
+    assert_eq!(
+        state.restore::<Sha256>(&foreign_owner, leader),
+        Err(IssuanceError::Context)
+    );
+    let mut different = slot(&f);
+    different.cut += 1;
+    let foreign_slot = raw_no_first(different, Participant::new(0));
+    assert_eq!(
+        state.restore::<Sha256>(&foreign_slot, leader),
+        Err(IssuanceError::Context)
+    );
+    assert!(state.records().is_empty());
+    state
+        .recover::<Sha256>(round(5), Participant::new(1), None, leader)
+        .unwrap();
+    let closed = raw_no_first(slot(&f), Participant::new(0));
+    assert_eq!(
+        state.restore::<Sha256>(&closed, leader),
+        Err(IssuanceError::Floor)
+    );
+    assert_eq!(
+        state.close_first_without_response::<Sha256>(leader),
+        Err(IssuanceError::Floor)
+    );
+    assert_eq!(state.records().len(), 1);
+    assert_eq!(state.floor(), round(5));
+}
+
+#[test]
+fn no_m1_first_never_creates_new_issuance_after_a_terminal() {
+    let f = fixture(7);
+    let p = proof(&f);
+    let mut store = Store::new();
+    let origin = put(&mut store, Material::Origin(p.clone()));
+    let terminal = put(
+        &mut store,
+        Material::Terminal {
+            authority: origin,
+            quorum: phase_quorum(
+                &f,
+                4,
+                Kind::FastFinal(p.value.id::<Sha256>()),
+                &[0, 1, 2, 3, 4],
+            ),
+        },
+    );
+    for had_closure in [false, true] {
+        let mut state = local(&f, 0);
+        let closure = if had_closure {
+            state
+                .close_first_without_response::<Sha256>(leader)
+                .unwrap()
+        } else {
+            raw_no_first(slot(&f), Participant::new(0))
+        };
+        state
+            .retain::<Sha256, _>(
+                &mut TestRng::new(723),
+                terminal,
+                |id| store.get(id),
+                &Sequential,
+                policy,
+                leader,
+            )
+            .unwrap();
+        let before = state.records().len();
+        if had_closure {
+            assert_eq!(
+                state
+                    .close_first_without_response::<Sha256>(leader)
+                    .unwrap(),
+                closure
+            );
+            state.restore::<Sha256>(&closure, leader).unwrap();
+        } else {
+            assert_eq!(
+                state.close_first_without_response::<Sha256>(leader),
+                Err(IssuanceError::Closed)
+            );
+            assert_eq!(
+                state.restore::<Sha256>(&closure, leader),
+                Err(IssuanceError::Closed)
+            );
+        }
+        assert_eq!(state.records().len(), before);
+        assert_eq!(
+            state.sign_reserved(&closure).unwrap_err(),
+            IssuanceError::Closed
+        );
+        assert!(matches!(
+            state.reserve_normal::<Sha256, _>(
+                &mut TestRng::new(724),
+                &p,
+                policy,
+                leader,
+                &Sequential,
+            ),
+            Err(
+                commonware_consensus::simplex::extension::agreement::normal::Error::Issuance(
+                    IssuanceError::Closed
+                )
+            )
+        ));
+    }
+}
+
 #[test]
 fn original_core_first_select_and_any_five_final_roles_are_separate() {
     let f = fixture(7);
@@ -526,7 +819,13 @@ fn terminal_tombstone_survives_replay_and_stops_all_new_signing() {
 fn every_record_codec_is_bounded_and_rejects_truncation_or_unknown_tags() {
     let f = fixture(7);
     let (state, _, _, _) = trace(&f);
-    for r in state.records() {
+    let mut records = state.records().to_vec();
+    records.push(
+        local(&f, 0)
+            .close_first_without_response::<Sha256>(leader)
+            .unwrap(),
+    );
+    for r in &records {
         let bytes = r.encode();
         assert_eq!(r.encode_size(), bytes.len());
         assert_eq!(Record::<Digest>::decode(bytes.clone()).unwrap(), *r);
@@ -699,6 +998,86 @@ fn actual_native_journal_restart_restores_unsigned_choices_and_later_floor() {
     }
 }
 
+#[test]
+fn actual_native_journal_restart_keeps_no_m1_first_closed_across_a_later_floor() {
+    for with_floor in [false, true] {
+        let f = fixture(7);
+        let mut state = local(&f, 0);
+        let closed = state
+            .close_first_without_response::<Sha256>(leader)
+            .unwrap();
+        if with_floor {
+            state
+                .recover::<Sha256>(round(5), Participant::new(1), None, leader)
+                .unwrap();
+        }
+        let written = state.records().to_vec();
+        let (_, checkpoint) =
+            deterministic::Runner::default().start_and_recover(move |context| async move {
+                let mut journal = Journal::<_, Record<Digest>>::init(
+                    context.child("wal"),
+                    JournalConfig {
+                        partition: "agreement-no-m1-first".into(),
+                        compression: None,
+                        codec_config: (),
+                        page_cache: CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(8)),
+                        write_buffer: NZUsize!(1024),
+                    },
+                )
+                .await
+                .unwrap();
+                for record in written {
+                    journal = journal
+                        .append(record.view().get(), &record)
+                        .await
+                        .unwrap()
+                        .0;
+                    journal = journal.sync(record.view().get()).await.unwrap();
+                }
+                drop(journal);
+            });
+        deterministic::Runner::from(checkpoint).start(move |context| async move {
+            let journal = Journal::<_, Record<Digest>>::init(
+                context.child("wal"),
+                JournalConfig {
+                    partition: "agreement-no-m1-first".into(),
+                    compression: None,
+                    codec_config: (),
+                    page_cache: CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(8)),
+                    write_buffer: NZUsize!(1024),
+                },
+            )
+            .await
+            .unwrap();
+            let mut replay = journal
+                .replay(0, 0, NZUsize!(1024), ReadOptions::DONT_CACHE)
+                .await
+                .unwrap();
+            let mut state = local(&f, 0);
+            let mut got = 0;
+            while let Some(row) = replay.next().await {
+                state.restore::<Sha256>(&row.unwrap().3, leader).unwrap();
+                got += 1;
+            }
+            drop(replay.finish().unwrap());
+            assert_eq!(got, 1 + usize::from(with_floor));
+            assert_eq!(state.floor(), round(if with_floor { 5 } else { 4 }));
+            assert_eq!(
+                state
+                    .close_first_without_response::<Sha256>(leader)
+                    .unwrap(),
+                closed
+            );
+            assert_eq!(state.records().len(), got);
+            assert_no_late_first(&mut state, &proof(&f));
+            assert_eq!(
+                state.sign_reserved(&closed).unwrap_err(),
+                IssuanceError::Reservation
+            );
+        });
+    }
+}
+
 struct IssuanceConformance;
 impl Conformance for IssuanceConformance {
     async fn commit(seed: u64) -> Vec<u8> {
@@ -764,3 +1143,43 @@ impl Conformance for IssuanceConformance {
     }
 }
 conformance_tests! {IssuanceConformance=>32}
+
+struct FirstClosureConformance;
+impl Conformance for FirstClosureConformance {
+    async fn commit(seed: u64) -> Vec<u8> {
+        let f = ed25519::fixture(
+            &mut TestRng::new(seed),
+            b"_COMMONWARE_CONSENSUS_FIRST_CLOSURE_CONFORMANCE",
+            7,
+        );
+        let mut state = local(&f, 0);
+        let closure = state
+            .close_first_without_response::<Sha256>(leader)
+            .unwrap();
+        state
+            .recover::<Sha256>(round(5), Participant::new(1), None, leader)
+            .unwrap();
+        let mut replay = local(&f, 0);
+        for record in state.records() {
+            let decoded = Record::<Digest>::decode(record.encode()).unwrap();
+            assert_eq!(decoded, *record);
+            replay.restore::<Sha256>(&decoded, leader).unwrap();
+        }
+        assert_eq!(replay.records(), state.records());
+        assert_eq!(
+            replay
+                .close_first_without_response::<Sha256>(leader)
+                .unwrap(),
+            closure
+        );
+        assert_no_late_first(&mut replay, &proof(&f));
+        replay
+            .records()
+            .iter()
+            .map(Record::encode)
+            .collect::<Vec<_>>()
+            .encode()
+            .to_vec()
+    }
+}
+conformance_tests! {FirstClosureConformance=>32}

@@ -1,5 +1,6 @@
 commonware_macros::stability_mod!(ALPHA, pub mod extensions);
 mod actor;
+mod assembly;
 mod ingress;
 mod round;
 mod verifier;
@@ -51,6 +52,10 @@ pub struct Config<S: Scheme, B: Blocker, Re: Reporter, Rl: Relay, T: Strategy> {
 #[cfg(test)]
 mod tests {
     commonware_macros::stability_mod!(ALPHA, mod extension);
+    commonware_macros::stability_scope!(ALPHA {
+        #[path = "../general_tests.rs"]
+        mod general;
+    });
     use super::{verifier::Batch, *};
     use crate::{
         Viewable,

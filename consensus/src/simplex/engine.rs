@@ -180,9 +180,7 @@ impl<
     /// Returns a local readiness notifier. It cannot inject votes or certificates.
     #[commonware_macros::stability(ALPHA)]
     pub fn readiness(&self) -> Readiness<S, D, M> {
-        Readiness {
-            mailbox: self.voter_mailbox.clone(),
-        }
+        Readiness::new(self.voter_mailbox.clone())
     }
 
     /// Start the `simplex` consensus engine.
@@ -339,6 +337,25 @@ commonware_macros::stability_scope!(ALPHA {
     pub struct Readiness<S: Scheme<D>, D: Digest, M: Voting<S, D>> {
         mailbox: voter::Mailbox<S, D, M>,
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    impl<S, D, H> Readiness<S, D, super::phase2::general::General<H>>
+    where
+        S: Scheme<D>,
+        S::Certificate: super::extension::agreement::general::normal::CertificateSigners,
+        D: Digest,
+        H: commonware_cryptography::Hasher<Digest = D>,
+    {
+        /// Requests original SELECT for an already retained checked body.
+        /// This is not later-ballot recovery permission. The voter governs
+        /// current eligibility and journal sync before a response; closure or
+        /// None is not an ACK, and cancellation cannot undo accepted work.
+        pub fn request_selection(
+            &mut self,
+            request: super::phase2::general::voting::SelectRequest<D>,
+        ) -> commonware_utils::channel::oneshot::Receiver<Option<super::extension::agreement::general::Signed<S, D>>> {
+            self.mailbox.recover_extension(request)
+        }
+    }
     impl<S:Scheme<D>,D:Digest> Readiness<S,D,super::phase2::Extended> {
         /// Admits an exact Accept for custody only after read-only native validation.
         /// Closure or refusal yields no token. Eligibility can change during custody;
@@ -369,6 +386,10 @@ commonware_macros::stability_scope!(ALPHA {
         }
     }
     impl<S: Scheme<D>, D: Digest, M: Voting<S, D>> Readiness<S, D, M> {
+        pub(crate) const fn new(mailbox: voter::Mailbox<S, D, M>) -> Self {
+            Self { mailbox }
+        }
+
         /// Retry this view after evidence has been authenticated and made durable.
         /// Repeated pending notifications for the same view are coalesced.
         pub fn notify(&mut self, view: crate::types::View) {

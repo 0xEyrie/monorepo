@@ -310,7 +310,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest>
             .views
             .get_mut(&view)
             .expect("checked round")
-            .stage_recovery(&record)
+            .stage_recovery(&self.mode_context, &mut self.context, &record)
         {
             return Err(Error::Context);
         }
@@ -385,7 +385,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest>
             .views
             .get_mut(&view)
             .expect("checked round")
-            .stage_recovery(&record)
+            .stage_recovery(&self.mode_context, &mut self.context, &record)
         {
             return Err(Error::Context);
         }

@@ -247,7 +247,7 @@ impl<
         Some(elapsed.as_secs_f64())
     }
 
-    /// Drops views and journal entries that are below the activity floor.
+    /// Retires native activity while preserving opted-in recovery history.
     async fn prune_views(mut self) -> Self {
         let removed = self.state.prune();
         if removed.is_empty() {
@@ -264,19 +264,45 @@ impl<
         self.participation.prune(min_active);
         self.pending_finalizations
             .retain(|view, _| *view >= min_active);
+        // Historical material has no implemented release contract. Preserve the
+        // existing journal; absence cannot be inferred from an old pruned log.
+        let journal_floor = if M::RETAIN_HISTORY {
+            View::zero()
+        } else {
+            min_active
+        };
         if self.journal.is_some() {
             let span = info_span!(
                 "simplex.voter.journal.prune",
                 epoch = self.state.epoch().traced(),
-                min = min_active.traced()
+                min = journal_floor.traced()
             );
             rebind(&mut self.journal, |journal| {
-                journal.prune(min_active.get()).instrument(span)
+                journal.prune(journal_floor.get()).instrument(span)
             })
             .await
             .expect("unable to prune journal");
         }
         self
+    }
+
+    /// Restores retained data without native progress, publication or signing.
+    fn replay_historical(&mut self, artifact: &ArtifactWith<S, D, M>) {
+        assert!(M::RETAIN_HISTORY, "historical replay is disabled");
+        assert!(
+            self.participation.accepts_replay(artifact),
+            "historical replay evidence unavailable or invalid"
+        );
+        if let ArtifactWith::Finalization(certificate) = artifact {
+            assert!(
+                self.participation.accepts_finalization(certificate),
+                "historical finalization evidence unavailable or invalid"
+            );
+        }
+        assert!(
+            self.state.replay_historical(artifact),
+            "invalid historical recovery data"
+        );
     }
 
     /// Appends a verified message to the journal.
@@ -583,7 +609,7 @@ impl<
     /// gate, replay restores the blocked gate (which is safe) and it heals
     /// again as soon as peers redeliver any covering finalization.
     async fn handle_finalization(mut self, finalization: M::Certificate) -> Self {
-        if M::REQUIRE_PARENT_INTERPRETATION {
+        if M::REQUIRE_FINALIZATION_ADMISSION {
             if !M::matches_context(
                 self.state.interpretation_context(),
                 &M::finalization_subject(&finalization),
@@ -612,6 +638,26 @@ impl<
 
     /// Builds and records a notarize vote when this view is ready.
     async fn prepare_notarize(mut self, view: View) -> (Self, Option<M::Notarize>) {
+        if M::RESERVE_NOTARIZE {
+            // The owner synchronized this pin during staging or startup replay.
+            // A temporary release refusal must not capture a new first choice.
+            if self.state.pending_notarize(view) {
+                return self.release_notarize(view).await;
+            }
+            let Some(record) = self
+                .state
+                .stage_notarize_with(view, &mut self.participation)
+            else {
+                return (self, None);
+            };
+            assert!(
+                self.journal.is_some(),
+                "first reservation requires the native journal"
+            );
+            self = self.append_journal(ArtifactWith::Recovery(record)).await;
+            self = self.sync_journal().await;
+            return self.release_notarize(view).await;
+        }
         // Construct a notarize vote
         let Some(notarize) = self.state.construct_notarize(view) else {
             return (self, None);
@@ -630,6 +676,22 @@ impl<
             .append_journal(ArtifactWith::Notarize(notarize.clone()))
             .await;
         (self, Some(notarize))
+    }
+
+    async fn release_notarize(mut self, view: View) -> (Self, Option<M::Notarize>) {
+        let Some((vote, receipt)) = self
+            .state
+            .sign_reserved_notarize(view, &mut self.participation)
+        else {
+            return (self, None);
+        };
+        if let Some(receipt) = receipt {
+            self = self.append_journal(ArtifactWith::Recovery(receipt)).await;
+        }
+        self = self
+            .append_journal(ArtifactWith::Notarize(vote.clone()))
+            .await;
+        (self, Some(vote))
     }
 
     /// Builds and records a notarization certificate once we can assemble it locally.
@@ -687,6 +749,12 @@ impl<
 
     /// Builds and records a finalize vote if the round provides a candidate.
     async fn prepare_finalize(mut self, view: View) -> (Self, Option<M::Vote>) {
+        if let Some(subject) = self.state.pending_finalize(view) {
+            return self.release_finalize(view, subject).await;
+        }
+        if M::JOINT_FINALIZE && self.state.has_finalize_choice(view) {
+            return (self, None);
+        }
         // Construct the finalize vote.
         let Some(proposal) = self.state.proposal(view) else {
             return (self, None);
@@ -694,24 +762,35 @@ impl<
         let Some(subject) = self.participation.final_subject(proposal) else {
             return (self, None);
         };
-        if self
-            .state
-            .stage_finalize_with(view, subject.clone())
-            .is_none()
-        {
+        let Some((_, reservation)) = self.state.stage_finalize_with(view, subject.clone()) else {
             return (self, None);
-        }
+        };
 
-        if let Some(reservation) = M::reserve_finalize(&subject) {
+        if let Some(reservation) = reservation {
+            assert!(
+                self.journal.is_some(),
+                "final reservation requires the native journal"
+            );
             self = self
                 .append_journal(ArtifactWith::Recovery(reservation))
                 .await;
             self = self.sync_journal().await;
         }
-        let Some(finalize) = self.state.sign_reserved_finalize(view, subject) else {
+        self.release_finalize(view, subject).await
+    }
+
+    async fn release_finalize(
+        mut self,
+        view: View,
+        subject: M::FinalSubject,
+    ) -> (Self, Option<M::Vote>) {
+        let Some((finalize, receipt)) = self.state.sign_reserved_finalize(view, subject) else {
             return (self, None);
         };
 
+        if let Some(receipt) = receipt {
+            self = self.append_journal(ArtifactWith::Recovery(receipt)).await;
+        }
         // Record the vote locally before sharing it.
         self = self
             .append_journal(ArtifactWith::Finalize(finalize.clone()))
@@ -921,11 +1000,29 @@ impl<
                     .await;
                 self = self.sync_journal().await;
                 let response = self.state.sign_recovery(&record);
+                let response = match response {
+                    Some((response, Some(receipt))) => {
+                        assert_eq!(
+                            M::recovery_proposal(&receipt),
+                            M::recovery_proposal(&record),
+                            "recovery release changed native proposal"
+                        );
+                        assert!(
+                            M::recovery_context(self.state.interpretation_context(), &receipt),
+                            "recovery release changed interpretation context"
+                        );
+                        self = self.append_journal(ArtifactWith::Recovery(receipt)).await;
+                        self = self.sync_journal().await;
+                        Some(response)
+                    }
+                    Some((response, None)) => Some(response),
+                    None => None,
+                };
                 let _ = reply.send(response);
                 (self, None)
             }
             Message::InterpretationReady { view, .. } => {
-                if !M::REQUIRE_PARENT_INTERPRETATION {
+                if !M::REQUIRE_FINALIZATION_ADMISSION {
                     return (self, None);
                 }
                 if let Some(certificate) = self.pending_finalizations.remove(&view) {
@@ -1036,7 +1133,7 @@ impl<
         resolver: &mut resolver::Mailbox<S, D, M>,
         view: View,
     ) -> (Self, Vec<Staged<S, D, M>>) {
-        if !M::REQUIRE_PARENT_INTERPRETATION {
+        if !M::REQUIRE_FINALIZATION_ADMISSION {
             return (self, Vec::new());
         }
         // A dependent child must not be journaled before its parent anchor is
@@ -1227,6 +1324,7 @@ impl<
         let replayed;
         let mut replay_votes = BTreeMap::new();
         let mut replay_reservations = BTreeMap::new();
+        let mut replay_firsts = BTreeSet::new();
         (self, replayed) = async {
             let mut replay = journal
                 .replay(0, 0, self.replay_buffer, ReadOptions::DONT_CACHE)
@@ -1241,6 +1339,9 @@ impl<
                 // must be revisited.
                 let (_, _, _, artifact) = artifact.expect("unable to replay journal");
                 if artifact.view() <= replay_floor {
+                    if M::RETAIN_HISTORY {
+                        self.replay_historical(&artifact);
+                    }
                     continue;
                 }
 
@@ -1249,6 +1350,12 @@ impl<
                     "extension replay evidence unavailable or invalid"
                 );
                 if let ArtifactWith::Finalization(certificate) = &artifact {
+                    if M::REQUIRE_FINALIZATION_ADMISSION {
+                        assert!(
+                            self.participation.accepts_finalization(certificate),
+                            "replayed finalization application evidence unavailable or invalid"
+                        );
+                    }
                     assert!(
                         self.state.accepts_finalization_parent(certificate),
                         "replayed extension parent unavailable or invalid"
@@ -1259,14 +1366,18 @@ impl<
                 // evidence. Restore their exact bytes to volatile aggregation after
                 // replay; a cluster-wide restart may have lost every network copy.
                 // State replay has already checked that these are our own votes.
-                if M::RETAIN_INTERPRETATION {
+                if M::RETAIN_INTERPRETATION || M::RESERVE_NOTARIZE || M::JOINT_FINALIZE {
                     match &artifact {
                         ArtifactWith::Recovery(record) => {
+                            if M::reserved_notarize(record).is_some() {
+                                replay_firsts.insert(artifact.view());
+                            }
                             if let Some(subject) = M::reserved_subject(record) {
                                 replay_reservations.insert(artifact.view(), subject);
                             }
                         }
                         ArtifactWith::Notarize(vote) => {
+                            replay_firsts.remove(&vote.view());
                             replay_votes.insert((vote.view(), 0), VoteWith::Notarize(vote.clone()));
                         }
                         ArtifactWith::Finalize(vote) => {
@@ -1274,6 +1385,7 @@ impl<
                             replay_votes.insert((vote.view(), 1), VoteWith::Finalize(vote.clone()));
                         }
                         ArtifactWith::Finalization(certificate) => {
+                            replay_firsts.retain(|view| *view > certificate.view());
                             replay_reservations.retain(|view, _| *view > certificate.view());
                             replay_votes.retain(|(view, _), _| *view > certificate.view());
                         }
@@ -1340,21 +1452,30 @@ impl<
         .await;
         self.journal = Some(replayed);
 
+        self.state.finish_notarize_replay();
+        for view in replay_firsts {
+            let vote;
+            (self, vote) = self.release_notarize(view).await;
+            if let Some(vote) = vote {
+                self = self.sync_journal().await;
+                replay_votes.insert((view, 0), VoteWith::Notarize(vote));
+            }
+        }
+
         // Restore signing permission only after the entire durable history has
         // been replayed. Later promises may have fenced an unfinished reservation.
         for (view, subject) in replay_reservations {
-            if !self.state.allows_reserved_finalize(view, &subject) {
+            if !M::JOINT_FINALIZE && !self.state.allows_reserved_finalize(view, &subject) {
                 continue;
             }
-            let vote = self
-                .state
-                .sign_reserved_finalize(view, subject)
-                .expect("reserved signer unavailable");
-            self = self
-                .append_journal(ArtifactWith::Finalize(vote.clone()))
-                .await;
-            self = self.sync_journal().await;
-            replay_votes.insert((view, 1), VoteWith::Finalize(vote));
+            let vote;
+            (self, vote) = self.release_finalize(view, subject).await;
+            if let Some(vote) = vote {
+                self = self.sync_journal().await;
+                replay_votes.insert((view, 1), VoteWith::Finalize(vote));
+            } else {
+                assert!(M::JOINT_FINALIZE, "reserved signer unavailable");
+            }
         }
         self = self.sync_journal().await;
 

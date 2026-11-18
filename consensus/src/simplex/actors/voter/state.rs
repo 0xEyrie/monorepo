@@ -1,6 +1,6 @@
 use super::{super::Kind, round::RoundWith};
 use crate::{
-    Viewable,
+    Epochable, Viewable,
     simplex::{
         FloorWith, Lookahead, Viewport,
         elector::Elector,
@@ -150,6 +150,8 @@ pub struct StateWith<
     last_finalized: View,
     genesis: Option<D>,
     views: BTreeMap<View, RoundWith<S, D, M>>,
+    // Retained data never participates in native progress or signer lookup.
+    historical: BTreeMap<View, RoundWith<S, D, M>>,
     recovered: BTreeMap<View, M::Recovered>,
 
     /// Monotone cursor for the oldest entered, unfinalized view (the anchor of
@@ -259,6 +261,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
             last_finalized: GENESIS_VIEW,
             genesis: None,
             views: BTreeMap::new(),
+            historical: BTreeMap::new(),
             recovered: BTreeMap::new(),
             stall_anchor: GENESIS_VIEW,
             nullify_views: BTreeSet::new(),
@@ -300,8 +303,13 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         }
     }
 
-    /// Signs an already synchronized recovery decision; the actor owns the durability barrier.
-    pub fn sign_recovery(&self, record: &M::Recovery) -> Option<M::RecoveryResponse> {
+    /// Releases a synchronized recovery decision through the sole owned ledger.
+    /// The actor must synchronize any returned receipt before publishing the
+    /// response. This method does not itself establish journal durability.
+    pub fn sign_recovery(
+        &mut self,
+        record: &M::Recovery,
+    ) -> Option<(M::RecoveryResponse, Option<M::Recovery>)> {
         let proposal = M::recovery_proposal(record);
         if proposal.round.epoch() != self.epoch
             || proposal.view() <= self.last_finalized
@@ -309,16 +317,69 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         {
             return None;
         }
-        let round = self.views.get(&proposal.view())?;
+        let round = self.views.get_mut(&proposal.view())?;
         if round.proposal() != Some(proposal) {
             return None;
         }
         M::sign_recovery_current(
             &self.scheme,
             &self.mode_context,
-            round.recovery_state(),
+            &mut self.context,
+            round.recovery_state_mut(),
             record,
         )
+    }
+
+    /// Lends the sole mode ledger after resolving current native input.
+    /// The closure must validate its mode-specific authority and leave the
+    /// ledger unchanged on refusal. It must not sign or publish. The caller
+    /// journals and synchronizes the returned record before release.
+    #[commonware_macros::stability(ALPHA)]
+    pub(crate) fn stage_mode_recovery(
+        &mut self,
+        view: View,
+        stage: impl FnOnce(
+            &S,
+            &M::Context,
+            &mut E,
+            &mut M::RecoveryState,
+            &Proposal<D>,
+            &Context<D, S::PublicKey>,
+            &Notarization<S, D>,
+        ) -> Option<M::Recovery>,
+    ) -> Option<M::Recovery> {
+        if view <= self.last_finalized {
+            return None;
+        }
+        let round = self.views.get(&view)?;
+        let proposal = round.proposal()?.clone();
+        if proposal.round.epoch() != self.epoch || proposal.view() != view {
+            return None;
+        }
+        let notarization = round.notarization()?.clone();
+        if notarization.proposal != proposal {
+            return None;
+        }
+        let native = Context {
+            round: proposal.round,
+            leader: round.leader()?.key,
+            parent: (proposal.parent, self.parent_payload(&proposal).ok()?),
+        };
+        let record = stage(
+            &self.scheme,
+            &self.mode_context,
+            &mut self.context,
+            self.views.get_mut(&view)?.recovery_state_mut(),
+            &proposal,
+            &native,
+            &notarization,
+        )?;
+        assert!(
+            M::recovery_context(&self.mode_context, &record)
+                && M::recovery_proposal(&record) == &proposal,
+            "mode recovery reservation changed native proposal or context"
+        );
+        Some(record)
     }
 
     /// Trusted interpretation context fixed when this epoch state was created.
@@ -701,7 +762,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         self.enter_view(view.next());
         self.set_leader(
             view.next(),
-            Some(M::finalization_certificate(&finalization)),
+            Some(M::finalization_election_certificate(&finalization)),
         );
         let result = self.create_round(view).add_finalization(finalization);
         if result.0 {
@@ -736,6 +797,10 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
 
     /// Construct a notarize vote for this view when we're ready to sign.
     pub fn construct_notarize(&mut self, view: View) -> Option<Notarize<S, D>> {
+        // Opted-in modes require the Actor's reservation/sync/release path.
+        if M::RESERVE_NOTARIZE {
+            return None;
+        }
         if !self.admits_outbound(view) {
             return None;
         }
@@ -763,6 +828,147 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         Notarize::sign(&self.scheme, candidate)
     }
 
+    fn notarize_candidate(&self, view: View, reserved: bool) -> Option<Proposal<D>> {
+        self.scheme.me()?;
+        if !self.admits_outbound(view) {
+            return None;
+        }
+        let round = self.views.get(&view)?;
+        if !M::allows_original(round.recovery_state()) {
+            return None;
+        }
+        let proposal = if reserved {
+            if view <= self.last_finalized {
+                return None;
+            }
+            let proposal = round.reserved_notarize()?;
+            if !round.permits_reserved_notarize(proposal) {
+                return None;
+            }
+            proposal
+        } else {
+            if !round.can_construct_notarize() {
+                return None;
+            }
+            round.proposal()?
+        };
+        if self.in_issuance_window(view) && !self.optimistic_parent_ready(view)
+            || !self.verification_matches(view)
+        {
+            return None;
+        }
+        (proposal.round.epoch() == self.epoch).then(|| proposal.clone())
+    }
+
+    pub(crate) fn stage_notarize_with(
+        &mut self,
+        view: View,
+        evidence: &mut impl super::participation::Participation<S, D, M>,
+    ) -> Option<M::Recovery> {
+        assert!(M::RESERVE_NOTARIZE, "first reservation disabled");
+        let candidate = self.notarize_candidate(view, false)?;
+        let leader = self
+            .views
+            .get(&view)?
+            .leader()
+            .expect("first leader unavailable");
+        let native = Context {
+            round: candidate.round,
+            leader: leader.key,
+            parent: (
+                candidate.parent,
+                self.parent_payload(&candidate)
+                    .expect("first reservation native parent unavailable"),
+            ),
+        };
+        let input = evidence
+            .capture_notarize(&candidate, &native)
+            .expect("mandatory first input unavailable");
+        let record = M::reserve_notarize(
+            &self.scheme,
+            &self.mode_context,
+            self.views.get_mut(&view)?.recovery_state_mut(),
+            &candidate,
+            &native,
+            input,
+        )
+        .expect("mandatory first reservation unavailable");
+        assert!(
+            M::recovery_context(&self.mode_context, &record)
+                && M::recovery_proposal(&record) == &candidate
+                && M::notarize_record(&record) == Some(&candidate)
+                && M::reserved_notarize(&record) == Some(&candidate),
+            "first reservation changed the native proposal"
+        );
+        assert_eq!(
+            self.notarize_candidate(view, false).as_ref(),
+            Some(&candidate),
+            "first reservation changed native eligibility"
+        );
+        assert!(self.views.get_mut(&view)?.reserve_notarize(&candidate));
+        Some(record)
+    }
+
+    pub(crate) fn pending_notarize(&self, view: View) -> bool {
+        self.views
+            .get(&view)
+            .is_some_and(RoundWith::pending_notarize)
+    }
+
+    pub(crate) fn sign_reserved_notarize(
+        &mut self,
+        view: View,
+        evidence: &mut impl super::participation::Participation<S, D, M>,
+    ) -> Option<(M::Notarize, Option<M::Recovery>)> {
+        assert!(M::RESERVE_NOTARIZE, "first reservation disabled");
+        let candidate = self.notarize_candidate(view, true)?;
+        let native = Context {
+            round: candidate.round,
+            leader: self.views.get(&view)?.leader()?.key,
+            parent: (candidate.parent, self.parent_payload(&candidate).ok()?),
+        };
+        let result = M::sign_notarize_current(
+            &self.scheme,
+            &self.mode_context,
+            &mut self.context,
+            self.views.get_mut(&view)?.recovery_state_mut(),
+            candidate.clone(),
+            &native,
+            evidence,
+        )?;
+        assert_eq!(
+            M::notarize(&result.0).proposal,
+            candidate,
+            "first release changed the native proposal"
+        );
+        assert_eq!(
+            Some(crate::types::Attributable::signer(M::notarize(&result.0))),
+            self.scheme.me(),
+            "first release changed the native owner"
+        );
+        if let Some(record) = &result.1 {
+            assert!(
+                M::recovery_context(&self.mode_context, record)
+                    && M::notarize_record(record) == Some(&candidate),
+                "first release receipt changed the native proposal"
+            );
+        }
+        self.views.get_mut(&view)?.complete_notarize(&candidate);
+        self.prepare_optimistic_successor(view);
+        Some(result)
+    }
+
+    pub(crate) fn finish_notarize_replay(&mut self) {
+        if M::RESERVE_NOTARIZE || M::JOINT_FINALIZE {
+            for round in self.views.values_mut().chain(self.historical.values_mut()) {
+                assert!(
+                    round.finish_notarize_replay(),
+                    "incomplete first reservation replay"
+                );
+            }
+        }
+    }
+
     /// Proposal retained by a native tracked round.
     pub(crate) fn proposal(&self, view: View) -> Option<&Proposal<D>> {
         self.views.get(&view)?.proposal()
@@ -770,7 +976,7 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
 
     /// Tracked children that may become eligible after an interpretation arrives.
     pub(crate) fn interpretation_children(&self, parent: View) -> Vec<View> {
-        if !M::REQUIRE_PARENT_INTERPRETATION {
+        if !M::REQUIRE_FINALIZATION_ADMISSION {
             return Vec::new();
         }
         self.views
@@ -846,28 +1052,36 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
     /// Ancestry and exact parent binding for an authenticated original QC.
     ///
     /// Quorum finality settles the proposal's intermediate nullifications, which
-    /// the resolver may already have retired. It does not supply the retained
-    /// parent interpretation or application evidence. Local vote construction
+    /// the resolver may already have retired. Admission still needs the native
+    /// parent anchor and application evidence; an execution interpretation is
+    /// required only by modes declaring that additional dependency. Local vote construction
     /// still uses the full proposal-admission checks in `parent_payload`.
     pub(crate) fn accepts_finalization_parent(&self, certificate: &M::Certificate) -> bool {
-        if !M::REQUIRE_PARENT_INTERPRETATION {
+        if !M::REQUIRE_FINALIZATION_ADMISSION {
             return true;
         }
         let proposal = M::finalization_proposal(certificate);
         let subject = M::finalization_subject(certificate);
-        proposal.round.epoch() == self.epoch
-            && M::matches_context(&self.mode_context, &subject)
-            && M::matches_subject(proposal, &subject)
-            && self.matches_recovered(proposal.view(), &subject)
-            && self.validate_parent_structure(proposal).is_ok()
-            && self.explicit_ancestry_payload(proposal.parent).is_some()
-            && M::matches_parent(
-                &self.mode_context,
-                &subject,
-                self.finalization(proposal.parent),
-                self.recovered.get(&proposal.parent),
-                proposal.parent == GENESIS_VIEW && self.genesis.is_some(),
-            )
+        if proposal.round.epoch() != self.epoch
+            || !M::matches_context(&self.mode_context, &subject)
+            || !M::matches_subject(proposal, &subject)
+            || !self.matches_recovered(proposal.view(), &subject)
+            || self.validate_parent_structure(proposal).is_err()
+        {
+            return false;
+        }
+        let Some(parent) = self.explicit_ancestry_payload(proposal.parent).copied() else {
+            return false;
+        };
+        M::matches_native_parent(&self.mode_context, &subject, (proposal.parent, parent))
+            && (!M::REQUIRE_PARENT_INTERPRETATION
+                || M::matches_parent(
+                    &self.mode_context,
+                    &subject,
+                    self.finalization(proposal.parent),
+                    self.recovered.get(&proposal.parent),
+                    proposal.parent == GENESIS_VIEW && self.genesis.is_some(),
+                ))
     }
 
     /// Construct a finalize vote if the round provides a candidate and it is safe to do so.
@@ -878,13 +1092,20 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
     ///
     /// Indirect notarization can make a view usable as ancestry, but does not
     /// replace the local certification requirement for finalization.
+    ///
+    /// This in-memory state-machine helper establishes no journal durability.
+    /// Operating voters must use the Actor's reservation/sync/release path.
     pub fn construct_finalize_with(
         &mut self,
         view: View,
         subject: M::FinalSubject,
     ) -> Option<M::Vote> {
-        let candidate = self.stage_finalize_with(view, subject.clone())?;
-        M::sign_finalize(&self.scheme, candidate, subject)
+        if M::JOINT_FINALIZE {
+            return None;
+        }
+        self.stage_finalize_with(view, subject.clone())?;
+        self.sign_reserved_finalize(view, subject)
+            .map(|(vote, _)| vote)
     }
 
     /// Reserves the local final choice without invoking any signing scheme.
@@ -893,6 +1114,58 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         &mut self,
         view: View,
         subject: M::FinalSubject,
+    ) -> Option<(Proposal<D>, Option<M::Recovery>)> {
+        let candidate = self.finalize_candidate(view, &subject, false)?;
+        let native = if M::JOINT_FINALIZE {
+            Some(Context {
+                round: candidate.round,
+                leader: self.views.get(&view)?.leader()?.key,
+                parent: (candidate.parent, self.parent_payload(&candidate).ok()?),
+            })
+        } else {
+            None
+        };
+        let reservation = M::stage_final_reservation(
+            &self.scheme,
+            &self.mode_context,
+            &mut self.context,
+            self.views.get_mut(&view)?.recovery_state_mut(),
+            &candidate,
+            native.as_ref(),
+            &subject,
+        )?;
+        assert!(
+            !M::JOINT_FINALIZE || reservation.is_some(),
+            "joint final reservation requires a native journal record"
+        );
+        if let Some(record) = &reservation {
+            assert!(
+                M::recovery_context(&self.mode_context, record)
+                    && M::recovery_proposal(record) == &candidate
+                    && M::reserved_subject(record).as_ref() == Some(&subject),
+                "final reservation does not retain the preflighted native subject"
+            );
+        }
+        assert!(
+            self.finalize_candidate(view, &subject, false).as_ref() == Some(&candidate),
+            "extension reservation changed native final-vote eligibility"
+        );
+        assert!(
+            self.views
+                .get_mut(&view)
+                .and_then(|round| round.construct_finalize_with(subject))
+                .is_some(),
+            "extension reservation changed native final-vote eligibility"
+        );
+        Some((candidate, reservation))
+    }
+
+    /// Runs native eligibility before a fallible extension may reserve history.
+    fn finalize_candidate(
+        &self,
+        view: View,
+        subject: &M::FinalSubject,
+        reserved: bool,
     ) -> Option<Proposal<D>> {
         self.scheme.me()?;
         // We don't need to finalize views that are already finalized.
@@ -927,21 +1200,28 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
             return None;
         }
         let proposal = self.views.get(&view)?.proposal()?;
-        if !M::matches_context(&self.mode_context, &subject)
-            || !M::matches_subject(proposal, &subject)
-            || !self.matches_recovered(view, &subject)
+        if !M::matches_context(&self.mode_context, subject)
+            || !M::matches_subject(proposal, subject)
+            || !self.matches_recovered(view, subject)
         {
             return None;
         }
-        if M::REQUIRE_PARENT_INTERPRETATION {
+        if M::REQUIRE_FINALIZATION_ADMISSION || M::REQUIRE_PARENT_INTERPRETATION {
             if proposal.round.epoch() != self.epoch {
                 return None;
             }
-            self.parent_payload(proposal).ok()?;
+            let parent = self.parent_payload(proposal).ok()?;
+            if M::REQUIRE_FINALIZATION_ADMISSION
+                && !M::matches_native_parent(&self.mode_context, subject, (proposal.parent, parent))
+            {
+                return None;
+            }
+        }
+        if M::REQUIRE_PARENT_INTERPRETATION {
             let genesis = proposal.parent == GENESIS_VIEW && self.genesis.is_some();
             if !M::matches_parent(
                 &self.mode_context,
-                &subject,
+                subject,
                 self.finalization(proposal.parent),
                 self.recovered.get(&proposal.parent),
                 genesis,
@@ -949,10 +1229,13 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
                 return None;
             }
         }
-        self.views
-            .get_mut(&view)?
-            .construct_finalize_with(subject)
-            .cloned()
+        let round = self.views.get(&view)?;
+        let ready = if reserved {
+            round.can_release_finalize_with(subject)
+        } else {
+            round.can_construct_finalize_with(subject)
+        };
+        ready.then(|| proposal.clone())
     }
 
     /// A replayed reservation may be signed only while no later fence excludes it.
@@ -963,16 +1246,114 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
             })
     }
 
+    pub(crate) fn has_finalize_choice(&self, view: View) -> bool {
+        self.views
+            .get(&view)
+            .is_some_and(|round| round.final_subject().is_some())
+    }
+
+    /// Exact pending joint choice; retrying never captures or reserves again.
+    pub(crate) fn pending_finalize(&self, view: View) -> Option<M::FinalSubject> {
+        M::JOINT_FINALIZE
+            .then(|| self.views.get(&view)?.pending_finalize().cloned())
+            .flatten()
+    }
+
     /// Signs a staged exact choice after the actor has synchronized its record.
     pub(crate) fn sign_reserved_finalize(
-        &self,
+        &mut self,
         view: View,
         subject: M::FinalSubject,
-    ) -> Option<M::Vote> {
+    ) -> Option<(M::Vote, Option<M::Recovery>)> {
+        if M::JOINT_FINALIZE && view > self.last_finalized {
+            let round = self.views.get(&view)?;
+            if round.pending_finalize() != Some(&subject) {
+                return None;
+            }
+            if let Some(vote) = M::retained_finalize(round.recovery_state(), &subject) {
+                assert!(
+                    M::final_subject(&vote) == subject
+                        && M::matches_subject(M::finalize_proposal(&vote), &subject)
+                        && M::replay_finalize_vote(round.recovery_state(), &vote)
+                        && Some(crate::types::Attributable::signer(&vote)) == self.scheme.me()
+                        && M::verify_finalize(
+                            &vote,
+                            &mut self.context,
+                            &self.scheme,
+                            &commonware_parallel::Sequential
+                        ),
+                    "invalid retained joint final pair"
+                );
+                self.views.get_mut(&view)?.complete_finalize(&subject);
+                return Some((vote, None));
+            }
+        }
         if !self.allows_reserved_finalize(view, &subject) {
             return None;
         }
-        M::sign_finalize(&self.scheme, self.proposal(view)?.clone(), subject)
+        let (proposal, native) = if M::JOINT_FINALIZE {
+            let proposal = self.finalize_candidate(view, &subject, true)?;
+            let native = Context {
+                round: proposal.round,
+                leader: self.views.get(&view)?.leader()?.key,
+                parent: (proposal.parent, self.parent_payload(&proposal).ok()?),
+            };
+            (proposal, Some(native))
+        } else {
+            let proposal = self.proposal(view)?.clone();
+            if M::REQUIRE_FINALIZATION_ADMISSION {
+                if proposal.round.epoch() != self.epoch {
+                    return None;
+                }
+                let parent = self.parent_payload(&proposal).ok()?;
+                if !M::matches_native_parent(
+                    &self.mode_context,
+                    &subject,
+                    (proposal.parent, parent),
+                ) {
+                    return None;
+                }
+            }
+            (proposal, None)
+        };
+        let result = M::sign_finalize_current(
+            &self.scheme,
+            &self.mode_context,
+            &mut self.context,
+            self.views.get_mut(&view)?.recovery_state_mut(),
+            proposal.clone(),
+            native.as_ref(),
+            subject.clone(),
+        )?;
+        assert_eq!(
+            M::finalize_proposal(&result.0),
+            &proposal,
+            "final release changed native proposal"
+        );
+        assert_eq!(
+            M::final_subject(&result.0),
+            subject,
+            "final release changed reserved subject"
+        );
+        assert_eq!(
+            Some(crate::types::Attributable::signer(&result.0)),
+            self.scheme.me(),
+            "final release changed native owner"
+        );
+        if let Some(record) = &result.1 {
+            assert!(
+                M::recovery_context(&self.mode_context, record)
+                    && M::recovery_proposal(record) == &proposal,
+                "final release receipt changed native proposal"
+            );
+        }
+        assert!(
+            !M::JOINT_FINALIZE
+                || M::replay_finalize_vote(self.views.get(&view)?.recovery_state(), &result.0),
+            "joint final release lacks its exact retained outbox"
+        );
+        self.views.get_mut(&view)?.complete_finalize(&subject);
+        Some(result)
     }
 
     /// Construct a notarization certificate once the round has quorum.
@@ -1030,6 +1411,38 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
     /// making the `nullification_views` insert idempotent on that path), this
     /// never advances the view.
     pub fn replay(&mut self, artifact: &ArtifactWith<S, D, M>) {
+        if let ArtifactWith::Recovery(record) = artifact
+            && M::notarize_record(record).is_some()
+        {
+            assert!(
+                M::RESERVE_NOTARIZE && M::recovery_context(&self.mode_context, record),
+                "first record belongs to another mode context"
+            );
+            assert_eq!(
+                M::recovery_proposal(record).round.epoch(),
+                self.epoch,
+                "first record belongs to another native epoch"
+            );
+            let view = artifact.view();
+            self.create_round(view);
+            self.views
+                .get_mut(&view)
+                .expect("first round exists")
+                .replay_notarize(&self.mode_context, &mut self.context, record);
+            return;
+        }
+        if M::RESERVE_NOTARIZE
+            && let ArtifactWith::Notarize(vote) = artifact
+        {
+            assert!(
+                M::notarize(vote).verify(
+                    &mut self.context,
+                    &self.scheme,
+                    &commonware_parallel::Sequential
+                ),
+                "invalid replayed native first signature"
+            );
+        }
         if let ArtifactWith::Recovered(certificate) = artifact {
             assert!(
                 self.stage_recovered(certificate.clone(), |_| true)
@@ -1041,6 +1454,19 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
             assert!(
                 M::recovery_context(&self.mode_context, record),
                 "replayed recovery decision belongs to another interpretation domain"
+            );
+        }
+        if M::JOINT_FINALIZE
+            && let ArtifactWith::Finalize(vote) = artifact
+        {
+            assert!(
+                M::verify_finalize(
+                    vote,
+                    &mut self.context,
+                    &self.scheme,
+                    &commonware_parallel::Sequential
+                ),
+                "invalid replayed joint final pair"
             );
         }
         if let ArtifactWith::Finalize(vote) = artifact {
@@ -1060,10 +1486,137 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
         {
             self.failed_certifications.insert(artifact.view());
         }
-        self.create_round(artifact.view()).replay(artifact);
+        let view = artifact.view();
+        self.create_round(view);
+        self.views
+            .get_mut(&view)
+            .expect("replay round exists")
+            .replay(&self.mode_context, &mut self.context, artifact);
         if matches!(artifact, ArtifactWith::Notarize(_)) {
             self.prepare_optimistic_successor(artifact.view());
         }
+    }
+
+    /// Restores authenticated stored data without native progress or publication.
+    ///
+    /// The actor checks retained application material before calling this method.
+    /// This preserves rows present in the journal, not proof that an older prefix
+    /// was never pruned. No missing row establishes absence or recovery admission.
+    /// A failed replay retires the owner; accepted earlier rows are not rolled back.
+    pub(crate) fn replay_historical(&mut self, artifact: &ArtifactWith<S, D, M>) -> bool {
+        if !M::RETAIN_HISTORY
+            || artifact.epoch() != self.epoch
+            || artifact.view().is_zero()
+            || artifact.view() > self.last_finalized
+        {
+            return false;
+        }
+
+        let authenticated = match artifact {
+            ArtifactWith::Recovery(record) => {
+                M::recovery_context(&self.mode_context, record)
+                    && (M::notarize_record(record).is_none() || M::RESERVE_NOTARIZE)
+            }
+            ArtifactWith::Notarize(vote) => {
+                self.scheme.me() == Some(M::notarize(vote).attestation.signer)
+                    && M::notarize(vote).verify(
+                        &mut self.context,
+                        &self.scheme,
+                        &commonware_parallel::Sequential,
+                    )
+            }
+            ArtifactWith::Notarization(certificate) => certificate.verify(
+                &mut self.context,
+                &self.scheme,
+                &commonware_parallel::Sequential,
+            ),
+            ArtifactWith::Certification(_, _) => true,
+            ArtifactWith::Nullify(vote) => {
+                self.scheme.me() == Some(vote.attestation.signer)
+                    && vote.verify::<_, D>(
+                        &mut self.context,
+                        &self.scheme,
+                        &commonware_parallel::Sequential,
+                    )
+            }
+            ArtifactWith::Nullification(certificate) => certificate.verify::<_, D>(
+                &mut self.context,
+                &self.scheme,
+                &commonware_parallel::Sequential,
+            ),
+            ArtifactWith::Finalize(vote) => {
+                self.scheme.me() == Some(crate::types::Attributable::signer(vote))
+                    && M::matches_context(&self.mode_context, &M::final_subject(vote))
+                    && M::verify_finalize(
+                        vote,
+                        &mut self.context,
+                        &self.scheme,
+                        &commonware_parallel::Sequential,
+                    )
+            }
+            ArtifactWith::Finalization(certificate) => {
+                M::matches_context(&self.mode_context, &M::finalization_subject(certificate))
+                    && M::verify(
+                        certificate,
+                        &mut self.context,
+                        &self.scheme,
+                        &commonware_parallel::Sequential,
+                    )
+            }
+            // Later-ballot historical installation needs its own admission path.
+            ArtifactWith::Recovered(_) => false,
+        };
+        if !authenticated {
+            return false;
+        }
+
+        let view = artifact.view();
+        let rounds = if view >= self.min_active() {
+            assert!(
+                !self.historical.contains_key(&view),
+                "historical round entered the active viewport"
+            );
+            &mut self.views
+        } else {
+            assert!(
+                !self.views.contains_key(&view),
+                "inactive round remains in the active viewport"
+            );
+            &mut self.historical
+        };
+        let round = rounds
+            .entry(view)
+            .or_insert_with(|| RoundWith::new(self.scheme.clone(), Rnd::new(self.epoch, view)));
+
+        match artifact {
+            ArtifactWith::Recovery(record) if M::notarize_record(record).is_some() => {
+                round.replay_notarize(&self.mode_context, &mut self.context, record);
+                return true;
+            }
+            ArtifactWith::Notarization(certificate) => {
+                round.add_notarization(certificate.clone());
+            }
+            ArtifactWith::Nullification(certificate) => {
+                round.add_nullification(certificate.clone());
+            }
+            ArtifactWith::Finalization(certificate) => {
+                round.add_finalization(certificate.clone());
+            }
+            ArtifactWith::Certification(_, _) if round.notarization().is_none() => return false,
+            _ => {}
+        }
+        round.replay(&self.mode_context, &mut self.context, artifact);
+        true
+    }
+
+    #[cfg(test)]
+    #[commonware_macros::stability(ALPHA)]
+    pub(crate) fn retained_round(&self, view: View) -> Option<&RoundWith<S, D, M>> {
+        assert!(
+            !(self.views.contains_key(&view) && self.historical.contains_key(&view)),
+            "native round has two recovery owners"
+        );
+        self.views.get(&view).or_else(|| self.historical.get(&view))
     }
 
     /// Returns the leader index for `view` if we already entered it.
@@ -1498,7 +2051,18 @@ impl<E: Clock + CryptoRng + Metrics, S: Scheme<D>, L: Elector<S>, D: Digest, M: 
     pub fn prune(&mut self) -> Vec<View> {
         let min = self.min_active();
         let kept = self.views.split_off(&min);
-        let removed = replace(&mut self.views, kept).into_keys().collect();
+        let retired = replace(&mut self.views, kept);
+        let removed = retired.keys().copied().collect();
+        if M::RETAIN_HISTORY {
+            for (view, mut round) in retired {
+                round.abort_certify();
+                round.close_span();
+                assert!(
+                    self.historical.insert(view, round).is_none(),
+                    "native round has two recovery owners"
+                );
+            }
+        }
         self.recovered = self.recovered.split_off(&min);
         self.nullification_views = self.nullification_views.split_off(&min);
         self.nullify_views = self.nullify_views.split_off(&min);

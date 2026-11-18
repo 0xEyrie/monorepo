@@ -8,7 +8,7 @@ use commonware_consensus::{
         },
         phase2::{
             Extended, Plain,
-            voting::{RoundWith, Voting},
+            voting::{ExtendedContext, RoundWith, Voting},
         },
         scheme::{
             self, bls12381_multisig,
@@ -20,7 +20,9 @@ use commonware_consensus::{
     types::{Epoch, Round, View},
 };
 use commonware_cryptography::{
-    bls12381::primitives::variant::MinSig, certificate::mocks::Fixture, sha256::Digest,
+    bls12381::primitives::variant::MinSig,
+    certificate::mocks::Fixture,
+    sha256::{Digest, Sha256},
 };
 use commonware_parallel::Sequential;
 use commonware_utils::{TestRng, non_empty};
@@ -63,6 +65,7 @@ fn exercise<S: scheme::Scheme<Digest>>(f: Fixture<S>) {
     let chosen = subject(4);
     let alternate = subject(5);
     let mut rng = TestRng::new(44);
+    let context = ExtendedContext::new::<Sha256>(Digest::from([2; 32]), Digest::from([3; 32]));
     let mut pending = RoundWith::<_, _, Extended>::new(f.schemes[0].clone(), p.round);
     pending.proposed(SystemTime::UNIX_EPOCH, p.clone());
     assert!(pending.construct_finalize_with(chosen.clone()).is_none());
@@ -96,9 +99,9 @@ fn exercise<S: scheme::Scheme<Digest>>(f: Fixture<S>) {
     )
     .unwrap();
     let mut recovered = RoundWith::<_, _, Extended>::new(f.schemes[0].clone(), p.round);
-    recovered.replay(&ArtifactWith::Notarize(first));
-    recovered.replay(&ArtifactWith::Finalize(vote.clone()));
-    recovered.replay(&ArtifactWith::Finalize(vote));
+    recovered.replay(&context, &mut rng, &ArtifactWith::Notarize(first));
+    recovered.replay(&context, &mut rng, &ArtifactWith::Finalize(vote.clone()));
+    recovered.replay(&context, &mut rng, &ArtifactWith::Finalize(vote));
     recovered.add_notarization(notarization(&f));
     recovered.certified(true);
     assert_eq!(recovered.final_subject(), Some(&chosen));
@@ -131,12 +134,14 @@ fn exercise<S: scheme::Scheme<Digest>>(f: Fixture<S>) {
     assert_eq!(recovered.final_subject(), Some(&chosen));
     let mut certificate_replay = RoundWith::<_, _, Extended>::new(f.schemes[0].clone(), p.round);
     certificate_replay.add_finalization(cert.clone());
-    certificate_replay.replay(&ArtifactWith::Finalization(cert));
+    certificate_replay.replay(&context, &mut rng, &ArtifactWith::Finalization(cert));
     assert!(certificate_replay.broadcast_finalization().is_none());
     let mut skipped = ready(&f);
-    skipped.replay(&ArtifactWith::Nullify(
-        Nullify::sign::<Digest>(&f.schemes[0], p.round).unwrap(),
-    ));
+    skipped.replay(
+        &context,
+        &mut rng,
+        &ArtifactWith::Nullify(Nullify::sign::<Digest>(&f.schemes[0], p.round).unwrap()),
+    );
     assert!(skipped.construct_finalize_with(chosen).is_none());
     // Plain still uses unit local state and the original native signing subject.
     let mut plain = RoundWith::<_, _, Plain>::new(f.schemes[0].clone(), p.round);
@@ -175,12 +180,14 @@ fn vrf_voter_round() {
 #[test]
 #[should_panic(expected = "replayed conflicting final subjects")]
 fn conflicting_durable_subjects_fail_closed() {
-    let f = ed25519::fixture(&mut TestRng::new(5), NS, 6);
+    let mut rng = TestRng::new(5);
+    let f = ed25519::fixture(&mut rng, NS, 6);
+    let context = ExtendedContext::new::<Sha256>(Digest::from([2; 32]), Digest::from([3; 32]));
     let mut round = RoundWith::<_, _, Extended>::new(f.schemes[0].clone(), proposal().round);
     for d in [4, 5] {
         let vote =
             <Extended as Voting<_, Digest>>::sign_finalize(&f.schemes[0], proposal(), subject(d))
                 .unwrap();
-        round.replay(&ArtifactWith::Finalize(vote));
+        round.replay(&context, &mut rng, &ArtifactWith::Finalize(vote));
     }
 }

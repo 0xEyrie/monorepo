@@ -342,6 +342,14 @@ hash = "08b71984edd228701c79fa628672b28705b97e8e70e20101699398c28e92aebe"
 n_cases = 65536
 hash = "481cd68f2e6452c0dda512c75d74ddd2e19ac6c9fb19c642c1a152a0d830c1b2"
 
+["commonware_consensus::simplex::phase2::general::tests::GeneralModeConformance"]
+n_cases = 16
+hash = "e077df8150c198051ffc4c9c5a2404ab1f05ba5d67c6aa438242672b183d3a95"
+
+["commonware_consensus::simplex::phase2::general::voting_wal::tests::conformance::CodecConformance<Wal<S,D>>"]
+n_cases = 128
+hash = "37878f2454443ca3a97b476f2c7843f9809b0325b4f58dc8c2cdbce94dba8d03"
+
 ["commonware_consensus::simplex::scheme::bls12381_threshold::vrf::tests::conformance::CodecConformance<Certificate<MinSig>>"]
 n_cases = 65536
 hash = "16b2dec188a1bd12146d62909bffdbb560f5a54e81de57aec8ec4aef2e8a5e88"
@@ -458,6 +466,66 @@ hash = "c2501d0cac66ff650df81b979545d2bf84492656b9c2341c29cfcabdb2de8cf3"
 n_cases = 65536
 hash = "bebb2d2616de0716732a4459600c57cade16ab94952bfa39089104983937ad85"
 
+["extension_agreement::AgreementEvidenceConformance"]
+n_cases = 32
+hash = "f53526186f4f796c83e94963d2369dbaab93707981d7d7e4b7136057f5f882dc"
+
+["extension_agreement::general::GeneralEvidenceConformance"]
+n_cases = 32
+hash = "4b9bb82bc75e46a9e570df29f4a1992a8792e6af65b3adfb82ffde5276cdce1d"
+
+["extension_agreement::general_entry::GeneralEntryConformance"]
+n_cases = 32
+hash = "dcfbf80f8ce914a88c80679976daa1f43cb6efe24349acb3903611a94438cef1"
+
+["extension_agreement::general_history::GeneralHistoryConformance"]
+n_cases = 32
+hash = "438de5cd7e1c747522623a264db3bcc0a4fb2ab7475f567d0c7db2fdfbc9771d"
+
+["extension_agreement::general_issuance::GeneralIssuanceConformance"]
+n_cases = 32
+hash = "49546994ed139ae8da15d57a9c7091f4c3db9a97ba6d74b3cf2b30ec0480d0c8"
+
+["extension_agreement::general_normal::GeneralNormalConformance"]
+n_cases = 32
+hash = "e7d9c3a23d3821622716155ac02fe259beabbbbbaa89a197263599ba480965d6"
+
+["extension_agreement::general_recovery::GeneralRecoveryConformance"]
+n_cases = 32
+hash = "798a8efc9e65ec30077eb660742fb161aaf1f1d76a33808618f6d217a7351f1d"
+
+["extension_agreement::general_recovery_issuance::GeneralRecoveryIssuanceConformance"]
+n_cases = 32
+hash = "3682215cea2af9107041fbe49d3893c0132e5acc2a2175cead1425ed3955a9da"
+
+["extension_agreement::general_wish::GeneralWishConformance"]
+n_cases = 32
+hash = "1fcc8bbaa9b7303ce774589dc7e3315e36e5dd0193b8bdc22fa01bbae7293df9"
+
+["extension_agreement::general_wish::arbitrary_conformance::CodecConformance<Amp>"]
+n_cases = 32
+hash = "17f551b3dd30c2a0b07d713d04ed94c30621822c3cbae16f53cf6cacb24e1a99"
+
+["extension_agreement::general_wish::arbitrary_conformance::CodecConformance<Record<Digest>>"]
+n_cases = 32
+hash = "20db2f85b24f95dd9d8c9bff17051715efa15e79f4b35d6fccd54e820f1a7cd8"
+
+["extension_agreement::issuance::FirstClosureConformance"]
+n_cases = 32
+hash = "00490905342b96e6906ea9c62e7fc61e9211714ad89645de0a32a6838002537b"
+
+["extension_agreement::issuance::IssuanceConformance"]
+n_cases = 32
+hash = "77379abffefcbd232b3c3df8ffbfe8196cffa038591170e653d6a6bffd9da154"
+
+["extension_agreement::normal::NormalConformance"]
+n_cases = 32
+hash = "e46a6fe2c5f7e39ab1e53daf9ae1c0365ff2c446daa567717073b16fc3256609"
+
+["extension_agreement::recovery::RecoveryEvidenceConformance"]
+n_cases = 32
+hash = "f8c3151bd12b89fc491370164b68f06ceafa4f2f6b8f0e8b43fa7bd21c872f04"
+
 ["extension_batcher::conformance::CodecConformance<Certificate<ed25519::Scheme,Digest>>"]
 n_cases = 1024
 hash = "fe464fb10148b9c308551902737da766635246cea1d364b7959f31c90e21057d"
@@ -486,6 +554,10 @@ hash = "22899f92c0fd25004010d52f436c00335ef122f9496cff9ec5b4d9ae6ac7e983"
 n_cases = 65536
 hash = "01cc3b0d41d0ef29f02de2729d51b1b31bb96f00c6390e56aadd0fb5117cc7b1"
 
+["extension_mode::conformance::CodecConformance<commonware_consensus::simplex::extension::certificate\n::Recovered<Scheme,Digest>>"]
+n_cases = 1024
+hash = "084c78655549d9b857f1928babeb7136b9c5230fac3495ec9b8be6548e487ffd"
+
 ["extension_recovery::conformance::CodecConformance<Promise<Digest>>"]
 n_cases = 65536
 hash = "5e7ca3b903fefcf5d82aaf9bbc8aa8833c1f3b82819f830cd73fe3a1fca94ef0"
@@ -497,6 +569,22 @@ hash = "fd8637aac25711e03269a217b533c56e815e8f671d498a1de7e5d5f455fdc50f"
 ["extension_recovery::conformance::CodecConformance<Status<ed25519::Scheme,Digest>>"]
 n_cases = 65536
 hash = "ef2a9c53b3c10f775d7dd0827fa8c1ca60d6eee1ae9d8a1f1d52410a622b8a6a"
+
+["extension_request::conformance::CodecConformance<Command<Digest>>"]
+n_cases = 1024
+hash = "aa2eac7408cda2b4cf4113b8ddb239ad57902bf41bef7cafd5020ba6e9290f1a"
+
+["extension_request::conformance::CodecConformance<RecoveryRequest>"]
+n_cases = 1024
+hash = "2d3747b8a5c6d11a1d612a65beb858690001db3e552cb2ad86acd4bb711fc116"
+
+["extension_request::conformance::CodecConformance<RecoveryResponse>"]
+n_cases = 1024
+hash = "1d9daea4c35b15d90150925395cdb42e552bd4001c468a907429c06e4936bc95"
+
+["extension_request::conformance::CodecConformance<RecoveryWire>"]
+n_cases = 1024
+hash = "3a48d6e3d01e5b5a9ff7cf7da9f9f0a084f562d16a7967e88ee980ae453672d2"
 
 ["extension_vote::conformance::CodecConformance<Certificate<ed25519::Scheme,Digest>>"]
 n_cases = 65536
@@ -521,35 +609,3 @@ hash = "a4aceec089209ba46b6b10dd8f5ed5391a4c385db9fff2518b73fe6564fa85cc"
 ["extension_vote::conformance::CodecConformance<commonware_consensus::simplex::types::Finalization<\nOriginalScheme,Digest>>"]
 n_cases = 65536
 hash = "c78e26f7142aed21d0bb8bef88e007baae0fe34b3a2533d1085f7c2b08464e95"
-
-["extension_request::conformance::CodecConformance<Command<Digest>>"]
-n_cases = 1024
-hash = "aa2eac7408cda2b4cf4113b8ddb239ad57902bf41bef7cafd5020ba6e9290f1a"
-
-["extension_request::conformance::CodecConformance<RecoveryRequest>"]
-n_cases = 1024
-hash = "2d3747b8a5c6d11a1d612a65beb858690001db3e552cb2ad86acd4bb711fc116"
-
-["extension_mode::conformance::CodecConformance<commonware_consensus::simplex::extension::certificate\n::Recovered<Scheme,Digest>>"]
-n_cases = 1024
-hash = "084c78655549d9b857f1928babeb7136b9c5230fac3495ec9b8be6548e487ffd"
-
-["extension_request::conformance::CodecConformance<RecoveryWire>"]
-n_cases = 1024
-hash = "3a48d6e3d01e5b5a9ff7cf7da9f9f0a084f562d16a7967e88ee980ae453672d2"
-
-["extension_request::conformance::CodecConformance<RecoveryResponse>"]
-n_cases = 1024
-hash = "1d9daea4c35b15d90150925395cdb42e552bd4001c468a907429c06e4936bc95"
-
-["extension_agreement::AgreementEvidenceConformance"]
-n_cases = 32
-hash = "f53526186f4f796c83e94963d2369dbaab93707981d7d7e4b7136057f5f882dc"
-
-["extension_agreement::issuance::IssuanceConformance"]
-n_cases = 32
-hash = "77379abffefcbd232b3c3df8ffbfe8196cffa038591170e653d6a6bffd9da154"
-
-["extension_agreement::recovery::RecoveryEvidenceConformance"]
-n_cases = 32
-hash = "f8c3151bd12b89fc491370164b68f06ceafa4f2f6b8f0e8b43fa7bd21c872f04"

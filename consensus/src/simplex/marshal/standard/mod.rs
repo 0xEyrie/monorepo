@@ -41,6 +41,10 @@ pub use variant::Standard;
 
 #[cfg(test)]
 mod tests {
+    mod companion_tests {
+        include!("companion_tests.rs");
+    }
+
     use super::{Deferred, Inline, Standard, relay};
     use crate::{
         Automaton, CertifiableAutomaton, Heightable, Relay, Reporter,

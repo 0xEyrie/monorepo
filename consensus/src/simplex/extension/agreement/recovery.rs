@@ -7,15 +7,18 @@
 //! Verification is iterative and has no fixed history-depth or total-history cap.
 
 use super::{
-    FastProof, Kind, Limits, Message, Origin, Quorum, Row, Signed, Slot, Value, VerifiedOrigin,
-    scheme,
+    FastProof, Kind, Limits, Message, Origin, Quorum, Row, Signed, Slot, Value, VerificationSource,
+    VerifiedOrigin, scheme,
 };
 use crate::types::{Participant, Round};
 use bytes::BufMut;
 use commonware_codec::{
     Buf, Encode as _, EncodeSize, Error as CodecError, Read, ReadExt as _, Write,
 };
-use commonware_cryptography::{Digest, Hasher, certificate};
+use commonware_cryptography::{
+    Digest, Hasher,
+    certificate::{self, Scoped},
+};
 use commonware_parallel::Strategy;
 use rand_core::CryptoRng;
 use std::{
@@ -385,8 +388,8 @@ pub enum Error<D: Digest> {
 
 /// Replays the authenticated selector and historical native election context.
 /// `authorize` returns a leader only for a native-authorized carrier of this Slot.
-pub struct Verifier<'a, S, D: Digest, T, P, L> {
-    scheme: &'a S,
+pub struct Verifier<'a, S: certificate::Scheme, D: Digest, T, P, L> {
+    source: VerificationSource<'a, S>,
     slot: &'a Slot<D>,
     limits: Limits,
     strategy: &'a T,
@@ -409,7 +412,7 @@ where
         authorize: L,
     ) -> Self {
         Self {
-            scheme,
+            source: VerificationSource::Scheme(scheme),
             slot,
             limits,
             strategy,
@@ -417,6 +420,28 @@ where
             authorize,
         }
     }
+
+    /// Uses a captured public-only scope for the same complete proof checks.
+    /// Exact Slot, selector policy and authorized native carrier context remain
+    /// caller inputs. The scope does not grant signing or delivery authority.
+    pub const fn new_scoped(
+        scoped: &'a Scoped<S>,
+        slot: &'a Slot<D>,
+        limits: Limits,
+        strategy: &'a T,
+        policy: P,
+        authorize: L,
+    ) -> Self {
+        Self {
+            source: VerificationSource::Scoped(scoped),
+            slot,
+            limits,
+            strategy,
+            policy,
+            authorize,
+        }
+    }
+
     /// Checks all reachable bodies with one roster/namespace/policy configuration.
     /// Callers may retrieve a Missing body and resume; no partial capability is returned.
     pub fn verify<'b, H: Hasher<Digest = D>, R: CryptoRng>(
@@ -429,7 +454,7 @@ where
         S: 'b,
         D: 'b,
     {
-        self.slot.check_roster::<H, S>(self.scheme)?;
+        self.slot.check_roster_with::<H, S>(&self.source)?;
         let mut nodes = BTreeMap::new();
         let mut visiting = BTreeSet::new();
         let mut work = vec![(root, None)];
@@ -508,9 +533,9 @@ where
         let slot = self.slot.id::<H>();
         Ok(match body {
             Material::Origin(p) => Checked::Origin(
-                p.verify::<H, R>(
+                p.verify_with::<H, R>(
                     rng,
-                    self.scheme,
+                    &self.source,
                     self.slot,
                     self.leader(self.slot.proposal.round)?,
                     self.limits,
@@ -578,7 +603,7 @@ where
                     || report
                         .as_ref()
                         .is_some_and(|r| r.len() > self.limits.report_bytes)
-                    || !s.verify(rng, self.scheme, self.strategy)
+                    || !s.verify_with(rng, &self.source, self.strategy)
                 {
                     return Err(Error::Invalid("snapshot authentication"));
                 }
@@ -632,7 +657,7 @@ where
                                 value: p.value.id::<H>(),
                             },
                         })
-                    || !endorsement.verify(rng, self.scheme, self.strategy)
+                    || !endorsement.verify_with(rng, &self.source, self.strategy)
                 {
                     return Err(Error::Invalid("leader proposal endorsement"));
                 }
@@ -696,7 +721,7 @@ where
                 leader: meta.leader,
                 kind,
             })
-            || !quorum.verify(rng, self.scheme, self.strategy)
+            || !quorum.verify_with(rng, &self.source, self.strategy)
         {
             return Err(Error::Invalid("exact phase quorum"));
         }
