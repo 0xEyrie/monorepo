@@ -827,9 +827,10 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
     strategy: &impl Strategy,
     meter: &mut Meter,
 ) -> Result<(), Error<D>> {
-    let mut signature = |signed: &Signed<S, D>| -> Result<(), Error<D>> {
+    let slot = core.slot.id::<H>();
+    let mut signature = |signed: &Signed<S, D>, expected_slot: D| -> Result<(), Error<D>> {
         meter.work::<D>(1)?;
-        if signed.message.slot != core.slot.id::<H>() || !signed.verify(rng, s, limits, strategy) {
+        if signed.message.slot != expected_slot || !signed.verify(rng, s, limits, strategy) {
             return Err(super::Error::Signature.into());
         }
         Ok(())
@@ -837,9 +838,9 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
     match material {
         Material::Origin(o) => {
             for first in &o.body.firsts {
-                signature(first)?;
+                signature(first, slot)?;
             }
-            signature(&o.selection)?;
+            signature(&o.selection, slot)?;
             if o.selection.message
                 != (Message {
                     slot: core.slot.id::<H>(),
@@ -856,11 +857,11 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
         }
         Material::Body(b) => {
             for first in &b.firsts {
-                signature(first)?;
+                signature(first, slot)?;
             }
         }
         Material::History { notice, .. } => {
-            signature(notice)?;
+            signature(notice, slot)?;
             let Kind::Recover(r) = &notice.message.kind else {
                 return Err(Error::Invalid("history notice role"));
             };
@@ -869,7 +870,7 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
             }
         }
         Material::Proposal { endorsement, .. } => {
-            signature(endorsement)?;
+            signature(endorsement, slot)?;
             if !matches!(&endorsement.message.kind,Kind::Recovery{phase:Phase::Propose,subject} if subject.core==core.id::<H>()&&subject.input==input)
             {
                 return Err(Error::Invalid("PROPOSE role/context"));
@@ -883,7 +884,16 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
                 let signed =
                     <Signed<S, D> as commonware_codec::Decode>::decode_cfg(frame.clone(), &limits)
                         .map_err(|_| Error::Invalid("outbox codec"))?;
-                signature(&signed)?;
+                // Only the initial route has its own scoped subject. Its native
+                // slot, reporter, prior reservation and exact release are checked
+                // again when replaying the complete page chain.
+                let expected = match &signed.message.kind {
+                    Kind::First(row) if row.core != core.id::<H>() && row.input == input => {
+                        First::route_slot::<H>(&core.slot, row.core, input)
+                    }
+                    _ => slot,
+                };
+                signature(&signed, expected)?;
             }
         }
         Material::Amplification(p) => {
@@ -916,7 +926,7 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
             }
             entry::Proof::Higher { wishes, .. } => {
                 for wish in wishes {
-                    signature(wish)?;
+                    signature(wish, slot)?;
                 }
             }
         },
