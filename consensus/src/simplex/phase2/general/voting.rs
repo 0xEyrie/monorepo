@@ -176,6 +176,10 @@ impl<S: scheme::Scheme<D>, D: Digest> Selection<S, D> {
 #[derive(Clone, Debug)]
 enum Command<D: Digest> {
     Select(D),
+    Ballot {
+        slot: D,
+        evidence: D,
+    },
     InitialHistory {
         slot: D,
         input: D,
@@ -218,6 +222,15 @@ impl<D: Digest> SelectRequest<D> {
             },
             proposal: capture.core.slot.proposal.clone(),
         })
+    }
+    pub(crate) fn ballot<H: Hasher<Digest = D>>(capture: &FirstInput<D>, evidence: D) -> Self {
+        Self {
+            command: Command::Ballot {
+                slot: capture.core.slot.id::<H>(),
+                evidence,
+            },
+            proposal: capture.core.slot.proposal.clone(),
+        }
     }
     /// Original native proposal view, not a later recovery ballot.
     pub const fn view(&self) -> View {
@@ -301,6 +314,14 @@ struct Index<S: scheme::Scheme<D>, D: Digest> {
     origins: BTreeMap<D, g::normal::Assembly<S, D>>,
     bytes: usize,
 }
+/// Verify a durably retained recovery graph under the deployment's registered
+/// policy in the supplied local scope. The host must hydrate original evidence
+/// and replay its application Builds before starting the voter. A cache miss
+/// refuses issuance and cannot erase a reservation during journal replay.
+pub type RecoveryEvidence<S, D> = dyn Fn(&mut dyn CryptoRng, &g::VerificationContext<S>, D) -> Option<g::recovery::Verified<D>>
+    + Send
+    + Sync;
+
 /// Trusted immutable deployment and a bounded index of checked application
 /// handles. The index owns no signer, issuance ledger, body archive or actor.
 pub struct Context<S: scheme::Scheme<D>, D: Digest> {
@@ -311,6 +332,7 @@ pub struct Context<S: scheme::Scheme<D>, D: Digest> {
     limits: g::Limits,
     resources: Resources,
     index: Arc<Mutex<Index<S, D>>>,
+    recovery_evidence: Option<Arc<RecoveryEvidence<S, D>>>,
 }
 impl<S: scheme::Scheme<D>, D: Digest> Clone for Context<S, D> {
     fn clone(&self) -> Self {
@@ -322,6 +344,7 @@ impl<S: scheme::Scheme<D>, D: Digest> Clone for Context<S, D> {
             limits: self.limits,
             resources: self.resources,
             index: self.index.clone(),
+            recovery_evidence: self.recovery_evidence.clone(),
         }
     }
 }
@@ -353,6 +376,7 @@ where
             genesis,
             limits,
             resources,
+            recovery_evidence: None,
             index: Arc::new(Mutex::new(Index {
                 slots: BTreeMap::new(),
                 slots_by_view: BTreeMap::new(),
@@ -362,6 +386,11 @@ where
                 bytes: 0,
             })),
         })
+    }
+    /// Install the local durable evidence reader before constructing the voter.
+    pub fn with_recovery_evidence(mut self, reader: Arc<RecoveryEvidence<S, D>>) -> Self {
+        self.recovery_evidence = Some(reader);
+        self
     }
     fn slot(&self, slot: &g::Slot<D>) -> bool {
         slot.profile == self.profile
@@ -567,6 +596,7 @@ struct SlotLedger<S: scheme::Scheme<D>, D: Digest> {
     select: Option<g::issuance::Record<D>>,
     history: Option<(Wal<S, D>, g::entry::Proof<S, D>)>,
     history_from_replay: bool,
+    replayed_ballots: std::collections::BTreeSet<D>,
     normal: Option<g::normal::Reservation<D>>,
 }
 /// The sole round-owned collection of actual issuance ledgers, one per exact Slot.
@@ -694,6 +724,7 @@ where
                 select: None,
                 history: None,
                 history_from_replay: false,
+                replayed_ballots: Default::default(),
                 normal: None,
             },
         );
@@ -782,6 +813,7 @@ where
                 select: None,
                 history: None,
                 history_from_replay: false,
+                replayed_ballots: Default::default(),
                 normal: None,
             });
         }
@@ -1069,6 +1101,7 @@ where
                     select: None,
                     history: None,
                     history_from_replay: false,
+                    replayed_ballots: Default::default(),
                     normal: None,
                 });
             }
@@ -1159,6 +1192,41 @@ where
             return false;
         };
         match &r.0 {
+            Event::Ballot { rpc, reservation } => {
+                let Some(id) = reservation.authority() else {
+                    return false;
+                };
+                let Some(authority) = c
+                    .recovery_evidence
+                    .as_ref()
+                    .and_then(|reader| reader(rng, &l.ledger.verification_context(), id))
+                else {
+                    return false;
+                };
+                if l.history.is_none() || authority.evidence() != id || !matches!(reservation.message().map(|m| &m.kind), Some(g::Kind::Recovery {..}))
+                    || rpc.is_some() != (authority.role() == g::recovery::Role::Rpc)
+                    || rpc.as_ref().is_some_and(|r| !matches!(r.action(), g::issuance::Action::RetainRpc { proof,.. } if *proof == id)) {
+                    return false;
+                }
+                for record in rpc.iter().chain(std::iter::once(reservation)) {
+                    replay_room(c, l, &[record]);
+                    if l.ledger
+                        .restore::<H, R>(
+                            rng,
+                            record,
+                            g::issuance::Material::Recovery(&authority),
+                            |_| false,
+                            |_, _| false,
+                            &Sequential,
+                        )
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+                l.replayed_ballots.insert(reservation.id::<H>());
+                true
+            }
             Event::History { .. } => initial_history::replay::<H, S, D, R>(s, c, rng, l, r),
             Event::Select(record) => {
                 replay_room(c, l, &[record]);
@@ -1187,6 +1255,10 @@ where
             | Event::HistoryReleased {
                 reservation,
                 receipt,
+            }
+            | Event::BallotReleased {
+                reservation,
+                receipt,
             } => {
                 let g::issuance::Action::Released {
                     reservation: released,
@@ -1195,7 +1267,15 @@ where
                 else {
                     return false;
                 };
-                let held = if matches!(&r.0, Event::HistoryReleased { .. }) {
+                let held = if matches!(&r.0, Event::BallotReleased { .. }) {
+                    l.ledger.records().iter().find(|record| {
+                        *record == reservation
+                            && matches!(
+                                record.message().map(|m| &m.kind),
+                                Some(g::Kind::Recovery { .. })
+                            )
+                    })
+                } else if matches!(&r.0, Event::HistoryReleased { .. }) {
                     l.history.as_ref().map(|(wal, _)| wal.record())
                 } else {
                     l.select.as_ref()
@@ -1288,6 +1368,14 @@ where
         let c = state.interpretation_context();
         let body_id = match &request.command {
             Command::Select(id) => *id,
+            Command::Ballot { slot, .. } => {
+                return c.recovery_evidence.is_some()
+                    && c.bootstrap(*slot)
+                        .is_some_and(|b| b.core.slot.proposal == request.proposal)
+                    && state
+                        .notarization(request.proposal.view())
+                        .is_some_and(|nqc| nqc.proposal == request.proposal);
+            }
             Command::InitialHistory {
                 slot,
                 input,
@@ -1339,6 +1427,62 @@ where
             |s, c, rng, state, p, native, nqc| {
                 let body_id = match &request.command {
                     Command::Select(id) => *id,
+                    Command::Ballot { slot, evidence } => {
+                        let l = state.slots.get_mut(slot)?;
+                        if !native_matches::<H, S, D>(l.ledger.core(), s, p, native)
+                            || l.history.is_none()
+                        {
+                            return None;
+                        }
+                        let authority = c.recovery_evidence.as_ref()?(
+                            rng,
+                            &l.ledger.verification_context(),
+                            *evidence,
+                        )?;
+                        if authority.evidence() != *evidence {
+                            return None;
+                        }
+                        let role = authority.role();
+                        if role == g::recovery::Role::Terminal {
+                            return None;
+                        }
+                        // Include release capacity before calling the signer. Once
+                        // chosen, aliases cannot replace the retained original.
+                        let old = l.ledger.records().iter().find(|r| {
+                            r.authority() == Some(*evidence)
+                                && matches!(
+                                    r.message().map(|m| &m.kind),
+                                    Some(g::Kind::Recovery { .. })
+                                )
+                        });
+                        if old.is_none()
+                            && l.ledger
+                                .records()
+                                .len()
+                                .checked_add(if role == g::recovery::Role::Rpc { 3 } else { 2 })?
+                                > c.resources.records_per_slot
+                        {
+                            return None;
+                        }
+                        let (rpc, reservation) = match role {
+                            g::recovery::Role::Admission => {
+                                (None, l.ledger.reserve_propose::<H>(&authority).ok()?)
+                            }
+                            g::recovery::Role::Proposal => {
+                                (None, l.ledger.reserve_prepare::<H>(&authority).ok()?)
+                            }
+                            g::recovery::Role::Rpc => {
+                                let (rpc, vote) =
+                                    l.ledger.reserve_rpc_commit::<H>(&authority).ok()?;
+                                (Some(rpc), vote)
+                            }
+                            g::recovery::Role::Terminal => unreachable!(),
+                        };
+                        if reservation.authority() != Some(*evidence) {
+                            return None;
+                        }
+                        return Some(Wal(Event::Ballot { rpc, reservation }));
+                    }
                     Command::InitialHistory { slot, report, .. } => {
                         let b = c.bootstrap(*slot)?;
                         if s.me() != Some(b.owner)
@@ -1368,6 +1512,7 @@ where
                                 normal: None,
                                 history: None,
                                 history_from_replay: false,
+                                replayed_ballots: Default::default(),
                             }),
                         };
                         return initial_history::stage::<H, S, D, E>(
@@ -1424,6 +1569,7 @@ where
         let record = r.record();
         let l = state.slots.get_mut(&record.slot().id::<H>())?;
         let held = match &r.0 {
+            Event::Ballot { .. } => l.ledger.records().iter().find(|r| *r == record),
             Event::Select(_) => l.select.as_ref(),
             Event::History { .. } => l.history.as_ref().map(|(wal, _)| wal.record()),
             _ => return None,
@@ -1435,7 +1581,9 @@ where
             let signed = g::Signed::decode_cfg(frame.clone(), &c.limits).ok()?;
             return Some((signed, None));
         }
-        if matches!(&r.0, Event::History { .. }) && l.history_from_replay {
+        if (matches!(&r.0, Event::History { .. }) && l.history_from_replay)
+            || l.replayed_ballots.contains(&record.id::<H>())
+        {
             // A reservation without a receipt does not say if the signer ran.
             return None;
         }
@@ -1447,7 +1595,12 @@ where
             .expect("General recovery mailbox receipt failed");
         Some((
             signed,
-            Some(Wal(if matches!(&r.0, Event::History { .. }) {
+            Some(Wal(if matches!(&r.0, Event::Ballot { .. }) {
+                Event::BallotReleased {
+                    reservation: record.clone(),
+                    receipt,
+                }
+            } else if matches!(&r.0, Event::History { .. }) {
                 Event::HistoryReleased {
                     reservation: record.clone(),
                     receipt,

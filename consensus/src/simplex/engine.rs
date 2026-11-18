@@ -368,6 +368,15 @@ commonware_macros::stability_scope!(ALPHA {
                 receiver
             }
         }
+        /// Issue a recovery endorsement, PREPARE or COMMIT for original evidence
+        /// retained by the configured host. The evidence determines the role.
+        pub fn request_recovery_ballot(
+            &mut self,
+            capture: &super::phase2::general::voting::FirstInput<D>,
+            evidence: D,
+        ) -> commonware_utils::channel::oneshot::Receiver<Option<super::extension::agreement::general::Signed<S,D>>> {
+            self.mailbox.recover_extension(super::phase2::general::voting::SelectRequest::ballot::<H>(capture,evidence))
+        }
         /// Requests original SELECT for an already retained checked body.
         /// This is not later-ballot recovery permission. The voter governs
         /// current eligibility and journal sync before a response; closure or

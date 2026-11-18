@@ -457,7 +457,8 @@ impl<S: scheme::Scheme<D>, D: Digest> Material<S, D> {
             _ => H::hash(&[MATERIAL, &self.encode()]),
         }
     }
-    fn links(&self) -> Vec<D> {
+    /// Direct content-addressed dependencies to retain with this original.
+    pub fn links(&self) -> Vec<D> {
         match self {
             Self::Entry(p) => p.dependencies().collect(),
             Self::Amplification(p) => p.dependencies().collect(),

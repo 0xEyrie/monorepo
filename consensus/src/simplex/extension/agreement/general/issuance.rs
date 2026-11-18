@@ -1177,6 +1177,21 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
         let record = self.recovery_record::<H>(checked, recovery::Phase::Commit)?;
         Ok(self.commit::<H>(record))
     }
+    /// Validate both records before advancing the ledger. The actor writes these
+    /// together before publishing COMMIT, including an exact repeat after restart.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn reserve_rpc_commit<H: Hasher<Digest = D>>(
+        &mut self,
+        checked: &recovery::Verified<D>,
+    ) -> Result<(Record<D>, Record<D>), Error> {
+        self.active()?;
+        let vote = self.recovery_record::<H>(checked, recovery::Phase::Commit)?;
+        if vote.authority() != Some(checked.evidence()) {
+            return Err(Error::Authority);
+        }
+        let rpc = self.rpc_record::<H>(checked)?;
+        Ok((self.commit::<H>(rpc), self.commit::<H>(vote)))
+    }
     fn rpc_record<H: Hasher<Digest = D>>(
         &self,
         checked: &recovery::Verified<D>,

@@ -75,6 +75,26 @@ impl<S: Scheme, D: Digest> PartialEq for Wal<S, D> {
                     receipt: y,
                 },
             ) => a == x && b == y,
+            (
+                Event::Ballot {
+                    rpc: a,
+                    reservation: b,
+                },
+                Event::Ballot {
+                    rpc: c,
+                    reservation: d,
+                },
+            ) => a == c && b == d,
+            (
+                Event::BallotReleased {
+                    reservation: a,
+                    receipt: b,
+                },
+                Event::BallotReleased {
+                    reservation: c,
+                    receipt: d,
+                },
+            ) => a == c && b == d,
             (Event::NormalReleased(a), Event::NormalReleased(b)) => a == b,
             _ => false,
         }
@@ -100,6 +120,14 @@ pub(super) enum Event<S: Scheme, D: Digest> {
         reservation: g::normal::Reservation<D>,
     },
     NormalReleased(g::normal::Released<S, D>),
+    Ballot {
+        rpc: Option<g::issuance::Record<D>>,
+        reservation: g::issuance::Record<D>,
+    },
+    BallotReleased {
+        reservation: g::issuance::Record<D>,
+        receipt: g::issuance::Record<D>,
+    },
     History {
         entry: g::issuance::Record<D>,
         reservation: g::issuance::Record<D>,
@@ -116,6 +144,8 @@ impl<S: Scheme, D: Digest> Wal<S, D> {
         match &self.0 {
             Event::First(r) | Event::Select(r) => r,
             Event::History { reservation, .. }
+            | Event::Ballot { reservation, .. }
+            | Event::BallotReleased { reservation, .. }
             | Event::HistoryReleased { reservation, .. }
             | Event::FirstReleased { reservation, .. }
             | Event::SelectReleased { reservation, .. } => reservation,
@@ -148,6 +178,11 @@ impl<S: Scheme, D: Digest> Wal<S, D> {
                 reservation,
             } => no_first.encode_size() + reservation.encode_size(),
             Event::NormalReleased(r) => r.encode_size(),
+            Event::Ballot { rpc, reservation } => rpc.encode_size() + reservation.encode_size(),
+            Event::BallotReleased {
+                reservation,
+                receipt,
+            } => reservation.encode_size() + receipt.encode_size(),
             Event::History {
                 entry,
                 reservation,
@@ -232,6 +267,19 @@ impl<S: Scheme, D: Digest> Write for Wal<S, D> {
                 reservation.write(w);
                 receipt.write(w);
             }
+            Event::Ballot { rpc, reservation } => {
+                8u8.write(w);
+                rpc.write(w);
+                reservation.write(w);
+            }
+            Event::BallotReleased {
+                reservation,
+                receipt,
+            } => {
+                9u8.write(w);
+                reservation.write(w);
+                receipt.write(w);
+            }
             Event::NormalReleased(r) => {
                 5u8.write(w);
                 r.write(w);
@@ -279,6 +327,14 @@ impl<S: Scheme, D: Digest> Read for Wal<S, D> {
                 },
             },
             7 => Event::HistoryReleased {
+                reservation: record(&mut b)?,
+                receipt: record(&mut b)?,
+            },
+            8 => Event::Ballot {
+                rpc: Option::<g::issuance::Record<D>>::read_cfg(&mut b, &WIRE_LIMITS)?,
+                reservation: record(&mut b)?,
+            },
+            9 => Event::BallotReleased {
                 reservation: record(&mut b)?,
                 receipt: record(&mut b)?,
             },
