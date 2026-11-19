@@ -675,7 +675,10 @@ where
             .slots
             .get(&assembly.core().slot.id::<H>())
             .ok_or(g::Error::Context)?;
-        if b.route_scope.is_some() || b.core != *assembly.core() || b.input != assembly.input() {
+        if b.route_scope != assembly.route_authority().and_then(|cap| cap.route_scope())
+            || b.core != *assembly.core()
+            || b.input != assembly.input()
+        {
             return Err(g::Error::Context);
         }
         if i.origins.contains_key(&id) {

@@ -577,6 +577,8 @@ pub enum Material<'a, S: certificate::Scheme, D: Digest> {
     RouteBody(&'a OriginBody<S, D>, &'a super::VerifiedBody<D>),
     /// Complete original fast origin.
     Origin(&'a Origin<S, D>),
+    /// Exact endorsed route and independently replayed local policy.
+    RouteOrigin(&'a Origin<S, D>, &'a super::VerifiedBody<D>),
     /// Complete original fast origin and genuine original q-FAST certificate.
     Terminal {
         origin: &'a Origin<S, D>,
@@ -1614,7 +1616,21 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
             };
         }
         self.normal()?;
-        if let Some(scope) = checked.route_scope() {
+        self.original_first::<H>(body, checked.route_scope())?;
+        Ok(self.record(Action::Reserve {
+            message: self.message::<H>(Kind::Select {
+                body: checked.body(),
+                decision: checked.decision(),
+            }),
+            authority: Some(checked.body()),
+        }))
+    }
+    fn original_first<H: Hasher<Digest = D>>(
+        &self,
+        body: &OriginBody<S, D>,
+        scope: Option<D>,
+    ) -> Result<(), Error> {
+        if let Some(scope) = scope {
             let own = self
                 .old(Step::First)
                 .and_then(Record::message)
@@ -1638,13 +1654,7 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
         } else {
             self.own_first::<H>(body)?;
         }
-        Ok(self.record(Action::Reserve {
-            message: self.message::<H>(Kind::Select {
-                body: checked.body(),
-                decision: checked.decision(),
-            }),
-            authority: Some(checked.body()),
-        }))
+        Ok(())
     }
     /// Checks the full body before reserving SELECT. A same-decision retry returns
     /// the original reservation and body authority, never a replacement SELECT.
@@ -1680,8 +1690,34 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
             validate_build,
             strategy,
         )?;
+        self.final_record::<H>(origin, checked.decision(), None)
+    }
+
+    fn route_final<H: Hasher<Digest = D>, R: CryptoRng>(
+        &self,
+        rng: &mut R,
+        origin: &Origin<S, D>,
+        cap: &super::VerifiedBody<D>,
+        strategy: &impl Strategy,
+    ) -> Result<Record<D>, Error> {
+        if origin.body.core != self.core
+            || origin.body.decision.input != self.input
+            || cap.limits() != self.limits
+        {
+            return Err(Error::Context);
+        }
+        origin.verify_route_endorsement::<H, R>(rng, self.context.scheme(), cap, strategy)?;
+        self.final_record::<H>(origin, cap.decision(), cap.route_scope())
+    }
+
+    fn final_record<H: Hasher<Digest = D>>(
+        &self,
+        origin: &Origin<S, D>,
+        decision: D,
+        scope: Option<D>,
+    ) -> Result<Record<D>, Error> {
         if let Some(old) = self.old(Step::Final) {
-            return if matches!(old.message().map(|m| &m.kind), Some(Kind::Phase { phase: Phase::FastFinal, decision }) if *decision == checked.decision())
+            return if matches!(old.message().map(|m| &m.kind), Some(Kind::Phase { phase: Phase::FastFinal, decision: saved }) if *saved == decision)
             {
                 Ok(old.clone())
             } else {
@@ -1689,7 +1725,7 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
             };
         }
         self.normal()?;
-        self.own_first::<H>(&origin.body)?;
+        self.original_first::<H>(&origin.body, scope)?;
         if self.owner == self.core.leader
             && self.old(Step::Select).and_then(Record::message) != Some(&origin.selection.message)
         {
@@ -1698,9 +1734,9 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
         Ok(self.record(Action::Reserve {
             message: self.message::<H>(Kind::Phase {
                 phase: Phase::FastFinal,
-                decision: checked.decision(),
+                decision,
             }),
-            authority: Some(checked.origin()),
+            authority: Some(origin.id::<H>()),
         }))
     }
     /// Stages both original final subjects as one native-journal authorization.
@@ -1718,6 +1754,14 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
         self.active()?;
         let agreement =
             self.final_vote::<H, R>(rng, origin, validate_row, validate_build, strategy)?;
+        self.reserve_joint::<H>(origin, agreement)
+    }
+
+    fn reserve_joint<H: Hasher<Digest = D>>(
+        &mut self,
+        origin: &Origin<S, D>,
+        agreement: Record<D>,
+    ) -> Result<super::normal::Reservation<D>, Error> {
         let reservation = super::normal::Reservation {
             subject: super::normal::subject::<H>(&origin.body.decision),
             agreement,
@@ -2310,14 +2354,20 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
                     },
                 authority,
             } => {
-                let Material::Origin(origin) = material else {
-                    return Err(Error::Authority);
+                let (origin, route) = match material {
+                    Material::Origin(origin) => (origin, None),
+                    Material::RouteOrigin(origin, cap) => (origin, Some(cap)),
+                    _ => return Err(Error::Authority),
                 };
                 self.preflight_origin(origin)?;
                 if *authority != Some(origin.id::<H>()) {
                     return Err(Error::Authority);
                 }
-                self.final_vote::<H, R>(rng, origin, validate_row, validate_build, strategy)?
+                if let Some(cap) = route {
+                    self.route_final::<H, R>(rng, origin, cap, strategy)?
+                } else {
+                    self.final_vote::<H, R>(rng, origin, validate_row, validate_build, strategy)?
+                }
             }
             Action::Reserve { .. } => return Err(Error::Authority),
             Action::Released { reservation, frame } => {

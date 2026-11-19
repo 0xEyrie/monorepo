@@ -34,6 +34,7 @@ struct Material<S: scheme::Scheme<D>, D: Digest> {
     notarization: Notarization<S, D>,
     limits: Limits,
     id: D,
+    route: Option<super::super::VerifiedBody<D>>,
     origin_bytes: Bytes,
     notarization_bytes: Bytes,
 }
@@ -82,13 +83,25 @@ where
             rng,
             &VerificationSource::Scheme(s),
             core,
-            input,
             origin,
             notarization,
             limits,
             &s.certificate_codec_config(),
-            validate_row,
-            validate_build,
+            None,
+            |rng, source, origin| {
+                origin
+                    .verify_with::<H, R>(
+                        rng,
+                        source,
+                        core,
+                        input,
+                        limits,
+                        validate_row,
+                        validate_build,
+                        strategy,
+                    )
+                    .map(|_| ())
+            },
             strategy,
         )
     }
@@ -111,29 +124,80 @@ where
             rng,
             &VerificationSource::Scoped(s),
             core,
-            input,
             origin,
             notarization,
             limits,
             &s.certificate_codec_config(),
-            validate_row,
-            validate_build,
+            None,
+            |rng, source, origin| {
+                origin
+                    .verify_with::<H, R>(
+                        rng,
+                        source,
+                        core,
+                        input,
+                        limits,
+                        validate_row,
+                        validate_build,
+                        strategy,
+                    )
+                    .map(|_| ())
+            },
             strategy,
         )
     }
 
+    /// Build normal vote material from an exact route-policy token, the elected
+    /// leader's signed origin and a genuine notarization for its proposal.
+    pub fn from_route<H: Hasher<Digest = D>, R: CryptoRng>(
+        rng: &mut R,
+        scheme: &S,
+        origin: Origin<S, D>,
+        notarization: Notarization<S, D>,
+        cap: super::super::VerifiedBody<D>,
+        strategy: &impl Strategy,
+    ) -> Result<Self, Error> {
+        if cap.route_scope().is_none() {
+            return Err(Error::Policy);
+        }
+        origin.preflight(
+            super::super::committee::<S>(&VerificationSource::Scheme(scheme))?,
+            cap.limits(),
+        )?;
+        let core = origin.body.core.clone();
+        Self::new_with::<H, R>(
+            rng,
+            &VerificationSource::Scheme(scheme),
+            &core,
+            origin,
+            notarization,
+            cap.limits(),
+            &scheme.certificate_codec_config(),
+            Some(cap.clone()),
+            |rng, _, origin| origin.verify_route_endorsement::<H, R>(rng, scheme, &cap, strategy),
+            strategy,
+        )
+    }
+
+    /// Locally checked original FIRST scope for a route-based assembly.
+    pub fn route_authority(&self) -> Option<&super::super::VerifiedBody<D>> {
+        self.0.route.as_ref()
+    }
     #[allow(clippy::too_many_arguments)]
     fn new_with<H: Hasher<Digest = D>, R: CryptoRng>(
         rng: &mut R,
         s: &VerificationSource<'_, S>,
         core: &Core<D>,
-        input: D,
         origin: Origin<S, D>,
         notarization: Notarization<S, D>,
         limits: Limits,
         certificate_cfg: &<S::Certificate as commonware_codec::Read>::Cfg,
-        validate_row: impl FnMut(&First<D>) -> bool,
-        validate_build: impl FnOnce(&VerifiedRows<S, D>, &OriginBody<S, D>) -> bool,
+        route: Option<super::super::VerifiedBody<D>>,
+        verify_origin: impl FnOnce(
+            &mut R,
+            &VerificationSource<'_, S>,
+            &Origin<S, D>,
+        ) -> Result<(), Error>,
         strategy: &impl Strategy,
     ) -> Result<Self, Error> {
         // Reject dynamic shape before encode_size, hashing or compact copies.
@@ -162,16 +226,7 @@ where
         ) {
             return Err(Error::Signature);
         }
-        origin.verify_with::<H, R>(
-            rng,
-            s,
-            core,
-            input,
-            limits,
-            validate_row,
-            validate_build,
-            strategy,
-        )?;
+        verify_origin(rng, s, &origin)?;
 
         // Fresh exact-size encodings discard oversized Vec capacities and any
         // unrelated backing hidden behind incoming Bytes slices.
@@ -204,6 +259,7 @@ where
             notarization,
             limits,
             id,
+            route,
             origin_bytes,
             notarization_bytes,
         })))

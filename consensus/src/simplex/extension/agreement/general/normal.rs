@@ -396,8 +396,27 @@ where
             return Err(Error::Limit);
         }
         bounded(self)?;
-        self.origin
-            .authenticate_with::<H, R>(rng, s, limits, strategy)?;
+        let body = &self.origin.body;
+        if let Some(Kind::First(row)) = body.firsts.first().map(|first| &first.message.kind)
+            && row.core != body.core.id::<H>()
+        {
+            // Wire authentication of an already paired final quorum. A signer or
+            // application consumer still needs local policy replay for this scope.
+            body.authenticate_route_rows::<H, R>(
+                rng,
+                s,
+                &body.core,
+                body.decision.input,
+                row.core,
+                limits,
+                strategy,
+            )?;
+            self.origin
+                .check_selection::<H, R>(rng, s, &body.core, limits, strategy)?;
+        } else {
+            self.origin
+                .authenticate_with::<H, R>(rng, s, limits, strategy)?;
+        }
         self.check_certificates::<H, R>(rng, s, &self.origin.body.core, c, limits, strategy)
     }
     /// Validates a full origin, both QCs' identical q-owner populations and the

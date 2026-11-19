@@ -419,7 +419,7 @@ where
                     },
                     ..
                 },
-                Material::Origin(_)
+                Material::Origin(_) | Material::RouteOrigin(_, _)
             ) | (Action::RetainOrigin { .. }, Material::Origin(_))
                 | (Action::Terminal { .. }, Material::Terminal { .. })
                 | (Action::Enter { .. }, Material::Entry(_))
@@ -472,7 +472,7 @@ where
                 state.preflight_body(body)?;
                 budget.charge(body.encode_size())?;
             }
-            Material::Origin(origin) => {
+            Material::Origin(origin) | Material::RouteOrigin(origin, _) => {
                 state.preflight_origin(origin)?;
                 budget.charge(origin.encode_size())?;
             }

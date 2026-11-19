@@ -787,7 +787,7 @@ enum Checked<'a, S: scheme::Scheme<D>, D: Digest> {
     Amplification(entry::VerifiedAmplification<'a, S, D>),
     Body,
     RouteBody(super::VerifiedBody<D>),
-    Origin(Arc<Decision<D>>),
+    Origin(Arc<Decision<D>>, Option<super::VerifiedBody<D>>),
     Page,
     History {
         entry: entry::Target<D>,
@@ -839,8 +839,11 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
     };
     match material {
         Material::Origin(o) => {
+            let subject = route_scope.map_or(slot, |scope| {
+                First::route_slot::<H>(&core.slot, scope, input)
+            });
             for first in &o.body.firsts {
-                signature(first, slot)?;
+                signature(first, subject)?;
             }
             signature(&o.selection, slot)?;
             if o.selection.message
@@ -1111,7 +1114,10 @@ fn replay_material<'n, 'a: 'n, S: scheme::Scheme<D>, D: Digest>(
             (Some(Material::Body(b)), Some(Checked::RouteBody(cap))) => {
                 return M::RouteBody(b, cap);
             }
-            (Some(Material::Origin(o)), Some(Checked::Origin(_))) => return M::Origin(o),
+            (Some(Material::Origin(o)), Some(Checked::Origin(_, Some(cap)))) => {
+                return M::RouteOrigin(o, cap);
+            }
+            (Some(Material::Origin(o)), Some(Checked::Origin(_, None))) => return M::Origin(o),
             (_, Some(Checked::Entry(e))) => return M::Entry(e),
             (_, Some(Checked::Value(v))) => return M::Recovery(v),
             _ => {}
@@ -1207,7 +1213,7 @@ fn admission<'a, H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest>(
     for positive in &body.positive {
         if !matches!(
             node(checked, *positive)?,
-            Checked::Origin(_)
+            Checked::Origin(..)
                 | Checked::Value(Verified {
                     role: Role::Rpc | Role::Terminal,
                     ..
@@ -1234,7 +1240,7 @@ fn admission<'a, H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest>(
         }
         let material = raw.get(&evidence).ok_or(Error::Missing(evidence))?;
         match node(checked, evidence)? {
-            Checked::Origin(value) => {
+            Checked::Origin(value, None) => {
                 origins.insert(evidence, value.id::<H>());
             }
             Checked::Value(v) if v.role == Role::Rpc => {
@@ -1254,9 +1260,28 @@ fn admission<'a, H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest>(
                 terminals.insert(evidence, value.id::<H>());
             }
             Checked::Page => {
+                // For the route profile, a SELECT by itself does not require carry.
+                // A reserved FINAL is already a possible signature, even before release.
+                if let Material::Page(p) = material
+                    && let issuance::Action::Reserve {
+                        message:
+                            Message {
+                                kind:
+                                    Kind::Phase {
+                                        phase: super::Phase::FastFinal,
+                                        ..
+                                    },
+                                ..
+                            },
+                        authority: Some(origin),
+                    } = p.record().action()
+                    && let Checked::Origin(value, Some(_)) = node(checked, *origin)?
+                {
+                    origins.insert(*origin, value.id::<H>());
+                }
                 if let Material::Page(p) = material
                     && let issuance::Action::Terminal { origin, .. } = p.record().action()
-                    && let Checked::Origin(value) = node(checked, *origin)?
+                    && let Checked::Origin(value, _) = node(checked, *origin)?
                 {
                     terminals.insert(evidence, value.id::<H>());
                 }
@@ -1290,7 +1315,7 @@ fn admission<'a, H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest>(
     let origin = match (required, &body.choice) {
         (Some(required), Choice::Carry(actual)) if required == *actual => {
             match node(checked, required)? {
-                Checked::Origin(value) if value.as_ref() == &body.value => required,
+                Checked::Origin(value, _) if value.as_ref() == &body.value => required,
                 Checked::Value(v) if v.role == Role::Rpc && v.value.as_ref() == &body.value => {
                     v.origin
                 }
@@ -1499,6 +1524,7 @@ where
             limits,
             match material {
                 Material::Body(b) => route_scope(b),
+                Material::Origin(o) => route_scope(&o.body),
                 _ => None,
             },
             strategy,
@@ -1591,17 +1617,39 @@ where
             }
             Material::Origin(origin) => {
                 meter.work::<D>(2 * c.len() as u64)?;
-                origin.verify::<H, R>(
-                    rng,
-                    scheme,
-                    core,
-                    input,
-                    limits,
-                    &mut validate_first,
-                    &mut validate_original_build,
-                    strategy,
-                )?;
-                Checked::Origin(Arc::new(origin.body.decision.clone()))
+                let route = if let Some(scope) = route_scope(&origin.body) {
+                    let cap = origin.body.verify_route_selection::<H, R>(
+                        rng,
+                        scheme,
+                        core,
+                        input,
+                        scope,
+                        limits,
+                        |_| true,
+                        strategy,
+                    )?;
+                    origin.check_selection::<H, R>(
+                        rng,
+                        &super::VerificationSource::Scheme(scheme),
+                        core,
+                        limits,
+                        strategy,
+                    )?;
+                    Some(cap)
+                } else {
+                    origin.verify::<H, R>(
+                        rng,
+                        scheme,
+                        core,
+                        input,
+                        limits,
+                        &mut validate_first,
+                        &mut validate_original_build,
+                        strategy,
+                    )?;
+                    None
+                };
+                Checked::Origin(Arc::new(origin.body.decision.clone()), route)
             }
             Material::Page(_) => Checked::Page,
             Material::History { entry, notice } => {
@@ -1717,7 +1765,7 @@ where
             }
             Material::FastQuorum(_) => Checked::FastQuorum,
             Material::FastTerminal { origin, quorum } => {
-                let Checked::Origin(value) = node(&checked, *origin)? else {
+                let Checked::Origin(value, _) = node(&checked, *origin)? else {
                     return Err(Error::Invalid("original terminal origin role"));
                 };
                 original_terminal::<S, D, H>(core, value, quorum)?;

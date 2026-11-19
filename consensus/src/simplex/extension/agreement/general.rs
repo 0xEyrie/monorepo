@@ -1423,7 +1423,38 @@ impl<S: scheme::Scheme<D>, D: Digest> OriginBody<S, D> {
         validate_stability: impl FnOnce(&Self) -> bool,
         strategy: &impl Strategy,
     ) -> Result<VerifiedBody<D>, Error> {
-        let c = core.check::<H, S>(&VerificationSource::Scheme(scheme))?;
+        self.authenticate_route_rows::<H, R>(
+            rng,
+            &VerificationSource::Scheme(scheme),
+            core,
+            input,
+            scope,
+            limits,
+            strategy,
+        )?;
+        if !validate_stability(self) {
+            return Err(Error::Policy);
+        }
+        Ok(VerifiedBody {
+            route_scope: Some(scope),
+            slot: core.slot.id::<H>(),
+            decision: self.decision.id::<H>(),
+            body: self.id::<H>(),
+            limits,
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn authenticate_route_rows<H: Hasher<Digest = D>, R: CryptoRng>(
+        &self,
+        rng: &mut R,
+        source: &VerificationSource<'_, S>,
+        core: &Core<D>,
+        input: D,
+        scope: D,
+        limits: Limits,
+        strategy: &impl Strategy,
+    ) -> Result<(), Error> {
+        let c = core.check::<H, S>(source)?;
         limits.validate::<S, D>(core)?;
         self.preflight(c, limits)?;
         if &self.core != core
@@ -1456,21 +1487,13 @@ impl<S: scheme::Scheme<D>, D: Digest> OriginBody<S, D> {
             {
                 return Err(Error::Context);
             }
-            if !signed.verify(rng, scheme, limits, strategy) {
+            if !signed.verify_with(rng, source, limits, strategy) {
                 return Err(Error::Signature);
             }
         }
-        if !validate_stability(self) {
-            return Err(Error::Policy);
-        }
-        Ok(VerifiedBody {
-            route_scope: Some(scope),
-            slot: core.slot.id::<H>(),
-            decision: self.decision.id::<H>(),
-            body: self.id::<H>(),
-            limits,
-        })
+        Ok(())
     }
+
     fn check_fast(&self, rows: &[First<D>], committee: Committee) -> Result<(), Error> {
         let support = rows
             .iter()

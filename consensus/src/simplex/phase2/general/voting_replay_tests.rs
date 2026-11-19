@@ -434,4 +434,63 @@ fn scoped_leader_replays_select_when_its_first_is_outside_the_quorum() {
     cold.restore_select_checked::<Sha256, _>(&mut rng, &select, &body, &cap, &Sequential)
         .unwrap();
     assert_eq!(cold.records(), issuer.records());
+    let origin = g::Origin {
+        body,
+        selection: issuer.sign_reserved(&select).unwrap(),
+    };
+    let notarizes: Vec<_> = f
+        .schemes
+        .iter()
+        .take(5)
+        .map(|s| Notarize::sign(s, slot.proposal.clone()).unwrap())
+        .collect();
+    let qc = crate::simplex::types::Notarization::from_notarizes(
+        &f.verifier,
+        commonware_utils::non_empty![@notarizes.iter()],
+        &Sequential,
+    )
+    .unwrap();
+    let assembly = g::normal::Assembly::from_route::<Sha256, _>(
+        &mut rng,
+        &f.verifier,
+        origin.clone(),
+        qc,
+        cap,
+        &Sequential,
+    )
+    .unwrap();
+    let reservation = issuer
+        .reserve_normal_checked::<Sha256, _>(&mut rng, &assembly, &Sequential)
+        .unwrap();
+    cold.restore_normal_checked::<Sha256, _>(&mut rng, &reservation, &assembly, &Sequential)
+        .unwrap();
+    assert_eq!(issuer.records(), cold.records());
+    let mut votes = vec![issuer.sign_normal::<Sha256>(&reservation).unwrap()];
+    for owner in [1usize, 2, 3, 6] {
+        let mut peer = g::issuance::State::new::<Sha256>(
+            f.schemes[owner].clone(),
+            origin.body.core.clone(),
+            input,
+            LIMITS,
+        )
+        .unwrap();
+        peer.reserve_route_first::<Sha256>(row(Participant::new(owner as u32)), |_| true)
+            .unwrap();
+        let reserved = peer
+            .reserve_normal_checked::<Sha256, _>(&mut rng, &assembly, &Sequential)
+            .unwrap();
+        votes.push(peer.sign_normal::<Sha256>(&reserved).unwrap());
+    }
+    let mut certificate = assembly
+        .assemble::<Sha256, _>(&mut rng, &f.verifier, &votes, &Sequential)
+        .unwrap();
+    certificate
+        .authenticate::<Sha256, _>(&mut rng, &f.verifier, LIMITS, &Sequential)
+        .unwrap();
+    certificate.origin.selection = certificate.origin.body.firsts[0].clone();
+    assert!(
+        certificate
+            .authenticate::<Sha256, _>(&mut rng, &f.verifier, LIMITS, &Sequential)
+            .is_err()
+    );
 }

@@ -154,6 +154,11 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
     {
         self.check_assembly(rng, checked, strategy)?;
         let origin = checked.origin();
+        if let Some(cap) = checked.route_authority() {
+            self.active()?;
+            let agreement = self.route_final::<H, R>(rng, origin, cap, strategy)?;
+            return self.reserve_joint::<H>(origin, agreement);
+        }
         self.reserve_normal::<H, R>(
             rng,
             origin,
@@ -181,6 +186,20 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
     {
         self.check_assembly(rng, checked, strategy)?;
         let origin = checked.origin();
+        if let Some(cap) = checked.route_authority() {
+            reservation.check::<H>()?;
+            if reservation.subject != super::super::normal::subject::<H>(&origin.body.decision) {
+                return Err(Error::Context);
+            }
+            return self.restore::<H, R>(
+                rng,
+                &reservation.agreement,
+                Material::RouteOrigin(origin, cap),
+                |_| false,
+                |_, _| false,
+                strategy,
+            );
+        }
         self.restore_normal::<H, R>(
             rng,
             reservation,
