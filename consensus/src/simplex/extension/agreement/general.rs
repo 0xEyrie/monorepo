@@ -1401,7 +1401,71 @@ impl<S: scheme::Scheme<D>, D: Digest> OriginBody<S, D> {
         }
         self.check_fast(&rows.rows, rows.committee)?;
         Ok(VerifiedBody {
+            route_scope: None,
             slot: self.core.slot.id::<H>(),
+            decision: self.decision.id::<H>(),
+            body: self.id::<H>(),
+            limits,
+        })
+    }
+    /// Verify the original route-only FIRST signatures for a locally registered
+    /// scope. The application must independently verify the native vote pairs,
+    /// replay its selector and establish its fast-path stability condition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_route_selection<H: Hasher<Digest = D>, R: CryptoRng>(
+        &self,
+        rng: &mut R,
+        scheme: &S,
+        core: &Core<D>,
+        input: D,
+        scope: D,
+        limits: Limits,
+        validate_stability: impl FnOnce(&Self) -> bool,
+        strategy: &impl Strategy,
+    ) -> Result<VerifiedBody<D>, Error> {
+        let c = core.check::<H, S>(&VerificationSource::Scheme(scheme))?;
+        limits.validate::<S, D>(core)?;
+        self.preflight(c, limits)?;
+        if &self.core != core
+            || self.decision.slot != core.slot
+            || self.decision.input != input
+            || scope == core.id::<H>()
+            || self.firsts.len() != c.quorum()
+        {
+            return Err(Error::Context);
+        }
+        let subject = First::route_slot::<H>(&core.slot, scope, input);
+        let mut previous = None;
+        for signed in &self.firsts {
+            let Kind::First(row) = &signed.message.kind else {
+                return Err(Error::Phase);
+            };
+            if previous.is_some_and(|owner| owner >= row.owner)
+                || usize::from(row.owner) >= c.len()
+                || row.owner != signed.attestation.signer
+            {
+                return Err(Error::Identity);
+            }
+            previous = Some(row.owner);
+            if row.core != scope
+                || row.input != input
+                || row.preference.is_some()
+                || signed.message.slot != subject
+                || signed.message.round != core.slot.proposal.round
+                || signed.message.leader != core.leader
+            {
+                return Err(Error::Context);
+            }
+            if !signed.verify(rng, scheme, limits, strategy) {
+                return Err(Error::Signature);
+            }
+        }
+        if !validate_stability(self) {
+            return Err(Error::Policy);
+        }
+        Ok(VerifiedBody {
+            route_scope: Some(scope),
+            slot: core.slot.id::<H>(),
             decision: self.decision.id::<H>(),
             body: self.id::<H>(),
             limits,
@@ -1424,12 +1488,18 @@ impl<S: scheme::Scheme<D>, D: Digest> OriginBody<S, D> {
 /// A checked pre-SELECT body, without leader endorsement or native admission.
 #[derive(Clone, Debug)]
 pub struct VerifiedBody<D: Digest> {
+    route_scope: Option<D>,
     slot: D,
     decision: D,
     body: D,
     limits: Limits,
 }
 impl<D: Digest> VerifiedBody<D> {
+    /// Logical FIRST scope when this body passed the registered route policy.
+    pub const fn route_scope(&self) -> Option<D> {
+        self.route_scope
+    }
+
     /// Exact local field limits under which application meaning was checked.
     pub const fn limits(&self) -> Limits {
         self.limits
@@ -1601,6 +1671,39 @@ impl<S: scheme::Scheme<D>, D: Digest> Origin<S, D> {
             return Err(Error::Signature);
         }
         Ok((decision, body))
+    }
+    /// Verify the original leader's endorsement of a previously checked route
+    /// body. This signature does not constitute an original FINAL or authorize
+    /// delivery. Reauthenticate the original FIRSTs in the current namespace.
+    pub fn verify_route_endorsement<H: Hasher<Digest = D>, R: CryptoRng>(
+        &self,
+        rng: &mut R,
+        scheme: &S,
+        cap: &VerifiedBody<D>,
+        strategy: &impl Strategy,
+    ) -> Result<(), Error> {
+        let scope = cap.route_scope().ok_or(Error::Policy)?;
+        let source = VerificationSource::Scheme(scheme);
+        let core = &self.body.core;
+        self.preflight(committee::<S>(&source)?, cap.limits())?;
+        if cap.slot() != core.slot.id::<H>()
+            || cap.body() != self.body.id::<H>()
+            || cap.decision() != self.body.decision.id::<H>()
+        {
+            return Err(Error::Context);
+        }
+        self.body.verify_route_selection::<H, R>(
+            rng,
+            scheme,
+            core,
+            self.body.decision.input,
+            scope,
+            cap.limits(),
+            |_| true,
+            strategy,
+        )?;
+        self.check_selection::<H, R>(rng, &source, core, cap.limits(), strategy)?;
+        Ok(())
     }
     /// Verifies full origin and fast eligibility. The callbacks must validate
     /// complete exact-P semantics and replay all Build/population/cost/catalogue

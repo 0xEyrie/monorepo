@@ -407,7 +407,7 @@ where
                     },
                     ..
                 },
-                Material::Body(_)
+                Material::Body(_) | Material::RouteBody(_, _)
             ) | (
                 Action::Reserve {
                     message: Message {
@@ -468,7 +468,7 @@ where
         match &material {
             Material::None if material_count(record) != 0 => return Err(Error::Material),
             Material::None => {}
-            Material::Body(body) => {
+            Material::Body(body) | Material::RouteBody(body, _) => {
                 state.preflight_body(body)?;
                 budget.charge(body.encode_size())?;
             }

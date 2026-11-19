@@ -2,10 +2,7 @@
 use super::*;
 use crate::simplex::extension::agreement::general::{VerifiedBody, normal::Assembly};
 
-impl<S: scheme::Scheme<D>, D: Digest> State<S, D>
-where
-    S::Certificate: super::super::normal::CertificateSigners,
-{
+impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
     fn check_body_cap<H: Hasher<Digest = D>>(
         &self,
         body: &OriginBody<S, D>,
@@ -25,6 +22,28 @@ where
         Ok(())
     }
 
+    pub(super) fn checked_route_select<H: Hasher<Digest = D>, R: CryptoRng>(
+        &self,
+        rng: &mut R,
+        body: &OriginBody<S, D>,
+        checked: &VerifiedBody<D>,
+        strategy: &impl Strategy,
+    ) -> Result<Record<D>, Error> {
+        self.check_body_cap::<H>(body, checked)?;
+        let scope = checked.route_scope().ok_or(Error::Authority)?;
+        body.verify_route_selection::<H, R>(
+            rng,
+            self.context.scheme(),
+            &self.core,
+            self.input,
+            scope,
+            self.limits,
+            |_| true,
+            strategy,
+        )?;
+        self.selection_record::<H>(body, checked)
+    }
+
     /// Reserves SELECT using a private-constructor full application check.
     /// The existing verifier reauthenticates every original under this owner's
     /// current scheme and rechecks all local signing fences. No peer can decode
@@ -36,6 +55,11 @@ where
         checked: &VerifiedBody<D>,
         strategy: &impl Strategy,
     ) -> Result<Record<D>, Error> {
+        if checked.route_scope().is_some() {
+            self.active()?;
+            let record = self.checked_route_select::<H, R>(rng, body, checked, strategy)?;
+            return Ok(self.commit::<H>(record));
+        }
         self.check_body_cap::<H>(body, checked)?;
         self.reserve_select::<H, R>(
             rng,
@@ -76,7 +100,11 @@ where
         self.restore::<H, R>(
             rng,
             record,
-            Material::Body(body),
+            if checked.route_scope().is_some() {
+                Material::RouteBody(body, checked)
+            } else {
+                Material::Body(body)
+            },
             |row| contains_row(body, row),
             |rows, candidate| {
                 rows.core() == &body.core
@@ -92,7 +120,10 @@ where
         rng: &mut R,
         checked: &Assembly<S, D>,
         strategy: &impl Strategy,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        S::Certificate: super::super::normal::CertificateSigners,
+    {
         if checked.core() != &self.core
             || checked.input() != self.input
             || checked.limits() != self.limits
@@ -117,7 +148,10 @@ where
         rng: &mut R,
         checked: &Assembly<S, D>,
         strategy: &impl Strategy,
-    ) -> Result<super::super::normal::Reservation<D>, Error> {
+    ) -> Result<super::super::normal::Reservation<D>, Error>
+    where
+        S::Certificate: super::super::normal::CertificateSigners,
+    {
         self.check_assembly(rng, checked, strategy)?;
         let origin = checked.origin();
         self.reserve_normal::<H, R>(
@@ -141,7 +175,10 @@ where
         reservation: &super::super::normal::Reservation<D>,
         checked: &Assembly<S, D>,
         strategy: &impl Strategy,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        S::Certificate: super::super::normal::CertificateSigners,
+    {
         self.check_assembly(rng, checked, strategy)?;
         let origin = checked.origin();
         self.restore_normal::<H, R>(

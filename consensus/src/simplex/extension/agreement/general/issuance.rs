@@ -573,6 +573,8 @@ pub enum Material<'a, S: certificate::Scheme, D: Digest> {
     None,
     /// Original pre-SELECT body.
     Body(&'a OriginBody<S, D>),
+    /// Exact route authority from local policy replay and original FIRSTs.
+    RouteBody(&'a OriginBody<S, D>, &'a super::VerifiedBody<D>),
     /// Complete original fast origin.
     Origin(&'a Origin<S, D>),
     /// Complete original fast origin and genuine original q-FAST certificate.
@@ -1592,6 +1594,17 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
             validate_build,
             strategy,
         )?;
+        self.selection_record::<H>(body, &checked)
+    }
+
+    fn selection_record<H: Hasher<Digest = D>>(
+        &self,
+        body: &OriginBody<S, D>,
+        checked: &super::VerifiedBody<D>,
+    ) -> Result<Record<D>, Error> {
+        if self.owner != self.core.leader {
+            return Err(Error::Context);
+        }
         if let Some(old) = self.old(Step::Select) {
             return if matches!(old.message().map(|m| &m.kind), Some(Kind::Select { decision, .. }) if *decision == checked.decision())
             {
@@ -1601,7 +1614,30 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
             };
         }
         self.normal()?;
-        self.own_first::<H>(body)?;
+        if let Some(scope) = checked.route_scope() {
+            let own = self
+                .old(Step::First)
+                .and_then(Record::message)
+                .ok_or(Error::Reservation)?;
+            let Kind::First(row) = &own.kind else {
+                return Err(Error::Authority);
+            };
+            if row.core != scope
+                || own.slot != First::route_slot::<H>(&self.core.slot, scope, self.input)
+            {
+                return Err(Error::Authority);
+            }
+            if body
+                .firsts
+                .iter()
+                .find(|r| r.attestation.signer == self.owner)
+                .is_some_and(|r| &r.message != own)
+            {
+                return Err(Error::Conflict);
+            }
+        } else {
+            self.own_first::<H>(body)?;
+        }
         Ok(self.record(Action::Reserve {
             message: self.message::<H>(Kind::Select {
                 body: checked.body(),
@@ -2252,16 +2288,16 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
                         ..
                     },
                 authority,
-            } => {
-                let Material::Body(body) = material else {
-                    return Err(Error::Authority);
-                };
-                self.preflight_body(body)?;
-                if *authority != Some(body.id::<H>()) {
-                    return Err(Error::Authority);
+            } => match material {
+                Material::Body(body) if *authority == Some(body.id::<H>()) => {
+                    self.preflight_body(body)?;
+                    self.select::<H, R>(rng, body, validate_row, validate_build, strategy)?
                 }
-                self.select::<H, R>(rng, body, validate_row, validate_build, strategy)?
-            }
+                Material::RouteBody(body, cap) if *authority == Some(cap.body()) => {
+                    self.checked_route_select::<H, R>(rng, body, cap, strategy)?
+                }
+                _ => return Err(Error::Authority),
+            },
             Action::Reserve {
                 message:
                     Message {

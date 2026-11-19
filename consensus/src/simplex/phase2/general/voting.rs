@@ -642,7 +642,7 @@ where
             g::OriginBody::decode_cfg(body.encode(), &self.limits).map_err(|_| g::Error::Limit)?;
         let mut i = self.index.lock();
         let bootstrap = i.slots.get(&checked.slot()).ok_or(g::Error::Context)?;
-        if bootstrap.route_scope.is_some()
+        if bootstrap.route_scope != checked.route_scope()
             || bootstrap.core != body.core
             || bootstrap.input != body.decision.input
         {

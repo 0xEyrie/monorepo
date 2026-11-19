@@ -786,6 +786,7 @@ enum Checked<'a, S: scheme::Scheme<D>, D: Digest> {
     Entry(entry::VerifiedEntry<'a, S, D>),
     Amplification(entry::VerifiedAmplification<'a, S, D>),
     Body,
+    RouteBody(super::VerifiedBody<D>),
     Origin(Arc<Decision<D>>),
     Page,
     History {
@@ -824,6 +825,7 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
     input: D,
     material: &Material<S, D>,
     limits: Limits,
+    route_scope: Option<D>,
     strategy: &impl Strategy,
     meter: &mut Meter,
 ) -> Result<(), Error<D>> {
@@ -856,8 +858,11 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
             }
         }
         Material::Body(b) => {
+            let subject = route_scope.map_or(slot, |scope| {
+                First::route_slot::<H>(&core.slot, scope, input)
+            });
             for first in &b.firsts {
-                signature(first, slot)?;
+                signature(first, subject)?;
             }
         }
         Material::History { notice, .. } => {
@@ -1103,6 +1108,9 @@ fn replay_material<'n, 'a: 'n, S: scheme::Scheme<D>, D: Digest>(
     if let Some(id) = authority {
         match (raw.get(&id).copied(), checked.get(&id)) {
             (Some(Material::Body(b)), Some(Checked::Body)) => return M::Body(b),
+            (Some(Material::Body(b)), Some(Checked::RouteBody(cap))) => {
+                return M::RouteBody(b, cap);
+            }
             (Some(Material::Origin(o)), Some(Checked::Origin(_))) => return M::Origin(o),
             (_, Some(Checked::Entry(e))) => return M::Entry(e),
             (_, Some(Checked::Value(v))) => return M::Recovery(v),
@@ -1388,9 +1396,51 @@ pub fn verify_root<'a, H, S, D, R>(
     core: &'a Core<D>,
     input: D,
     root: D,
+    resolve: impl FnMut(&D) -> Option<&'a Material<S, D>>,
+    limits: Limits,
+    bounds: Bounds,
+    validate_first: impl FnMut(&First<D>) -> bool,
+    validate_original_build: impl FnMut(&VerifiedRows<S, D>, &OriginBody<S, D>) -> bool,
+    validate_fresh: impl FnMut(&VerifiedRecoveryRows<S, D>, &ProposalBody<D>) -> bool,
+    strategy: &impl Strategy,
+) -> Result<VerifiedRoot<D>, Error<D>>
+where
+    H: Hasher<Digest = D>,
+    S: scheme::Scheme<D>,
+    D: Digest,
+    R: CryptoRng,
+{
+    verify_root_with_routes::<H, S, D, R>(
+        rng,
+        context,
+        core,
+        input,
+        root,
+        resolve,
+        limits,
+        bounds,
+        |_| None,
+        validate_first,
+        validate_original_build,
+        validate_fresh,
+        strategy,
+    )
+}
+
+/// Verify a recovery closure with route-only SELECT witnesses. The local policy
+/// supplies a scope only for an exact body whose paired native votes, Build and
+/// stability condition it has already replayed. FINAL still needs its own origin.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_root_with_routes<'a, H, S, D, R>(
+    rng: &mut R,
+    context: &VerificationContext<S>,
+    core: &'a Core<D>,
+    input: D,
+    root: D,
     mut resolve: impl FnMut(&D) -> Option<&'a Material<S, D>>,
     limits: Limits,
     bounds: Bounds,
+    route_scope: impl Fn(&OriginBody<S, D>) -> Option<D>,
     mut validate_first: impl FnMut(&First<D>) -> bool,
     mut validate_original_build: impl FnMut(&VerifiedRows<S, D>, &OriginBody<S, D>) -> bool,
     mut validate_fresh: impl FnMut(&VerifiedRecoveryRows<S, D>, &ProposalBody<D>) -> bool,
@@ -1441,7 +1491,18 @@ where
             return Err(Error::Hash);
         }
         preauthenticate::<H, S, D, R>(
-            rng, scheme, core, input, material, limits, strategy, &mut meter,
+            rng,
+            scheme,
+            core,
+            input,
+            material,
+            limits,
+            match material {
+                Material::Body(b) => route_scope(b),
+                _ => None,
+            },
+            strategy,
+            &mut meter,
         )?;
         raw.insert(id, material);
         todo.push((id, true));
@@ -1503,17 +1564,30 @@ where
             }
             Material::Body(body) => {
                 meter.work::<D>(2 * c.len() as u64)?;
-                body.verify::<H, R>(
-                    rng,
-                    scheme,
-                    core,
-                    input,
-                    limits,
-                    &mut validate_first,
-                    &mut validate_original_build,
-                    strategy,
-                )?;
-                Checked::Body
+                if let Some(scope) = route_scope(body) {
+                    Checked::RouteBody(body.verify_route_selection::<H, R>(
+                        rng,
+                        scheme,
+                        core,
+                        input,
+                        scope,
+                        limits,
+                        |_| true,
+                        strategy,
+                    )?)
+                } else {
+                    body.verify::<H, R>(
+                        rng,
+                        scheme,
+                        core,
+                        input,
+                        limits,
+                        &mut validate_first,
+                        &mut validate_original_build,
+                        strategy,
+                    )?;
+                    Checked::Body
+                }
             }
             Material::Origin(origin) => {
                 meter.work::<D>(2 * c.len() as u64)?;

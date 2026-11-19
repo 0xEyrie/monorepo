@@ -309,3 +309,129 @@ fn select_release_replay_rejects_a_genuine_first_receipt_without_mutation() {
         );
     }
 }
+
+#[test]
+fn scoped_leader_replays_select_when_its_first_is_outside_the_quorum() {
+    let mut rng = test_rng();
+    let f: Fixture<S> = ed25519::fixture(&mut rng, b"route_select_wal", 7);
+    let slot = g::Slot {
+        profile: D::from([1; 32]),
+        domain: D::from([2; 32]),
+        roster: g::Slot::roster::<Sha256, S>(&f.verifier),
+        cut: 1,
+        proposal: Proposal::new(
+            Round::new(Epoch::new(1), View::new(1)),
+            View::zero(),
+            D::from([3; 32]),
+        ),
+        parent: g::NativeParent::Genesis(D::from([4; 32])),
+    };
+    let leader = Participant::new(0);
+    let core = g::Core::derive::<Sha256, S>(&f.verifier, slot.clone(), leader).unwrap();
+    let input = D::from([5; 32]);
+    let scope = D::from([6; 32]);
+    let row = |owner| g::First {
+        owner,
+        input,
+        core: scope,
+        preference: None,
+        report: None,
+    };
+    let subject = g::First::route_slot::<Sha256>(&slot, scope, input);
+    let mut issuer =
+        g::issuance::State::new::<Sha256>(f.schemes[0].clone(), core.clone(), input, LIMITS)
+            .unwrap();
+    let first = issuer
+        .reserve_route_first::<Sha256>(row(leader), |_| true)
+        .unwrap();
+    let mut body = g::OriginBody {
+        core: core.clone(),
+        decision: g::Decision {
+            slot: slot.clone(),
+            input,
+            order: Bytes::from_static(b"BA"),
+        },
+        population: D::from([7; 32]),
+        build: Bytes::from_static(b"build"),
+        material: Bytes::new(),
+        firsts: (1..=5)
+            .map(|i| {
+                g::Signed::sign(
+                    &f.schemes[i],
+                    g::Message {
+                        slot: subject,
+                        round: slot.proposal.round,
+                        leader,
+                        kind: g::Kind::First(row(Participant::new(i as u32))),
+                    },
+                    LIMITS,
+                )
+                .unwrap()
+            })
+            .collect(),
+    };
+    let policy = |b: &g::OriginBody<S, D>| b.decision.order.as_ref() == b"BA";
+    let cap = body
+        .verify_route_selection::<Sha256, _>(
+            &mut rng,
+            &f.verifier,
+            &core,
+            input,
+            scope,
+            LIMITS,
+            policy,
+            &Sequential,
+        )
+        .unwrap();
+    assert!(
+        body.verify_route_selection::<Sha256, _>(
+            &mut rng,
+            &f.verifier,
+            &core,
+            input,
+            scope,
+            LIMITS,
+            |_| false,
+            &Sequential
+        )
+        .is_err()
+    );
+    assert!(
+        body.verify::<Sha256, _>(
+            &mut rng,
+            &f.verifier,
+            &core,
+            input,
+            LIMITS,
+            |_| true,
+            |_, _| true,
+            &Sequential
+        )
+        .is_err()
+    );
+    let select = issuer
+        .reserve_select_checked::<Sha256, _>(&mut rng, &body, &cap, &Sequential)
+        .unwrap();
+    let mut cold =
+        g::issuance::State::for_replay::<Sha256>(f.schemes[0].clone(), core, input, LIMITS)
+            .unwrap();
+    cold.restore::<Sha256, _>(
+        &mut rng,
+        &first,
+        g::issuance::Material::None,
+        |r| r == &row(leader),
+        |_, _| false,
+        &Sequential,
+    )
+    .unwrap();
+    let raw = body.material.clone();
+    body.material = Bytes::from_static(b"other");
+    assert!(
+        cold.restore_select_checked::<Sha256, _>(&mut rng, &select, &body, &cap, &Sequential)
+            .is_err()
+    );
+    body.material = raw;
+    cold.restore_select_checked::<Sha256, _>(&mut rng, &select, &body, &cap, &Sequential)
+        .unwrap();
+    assert_eq!(cold.records(), issuer.records());
+}
