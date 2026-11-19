@@ -1638,8 +1638,10 @@ impl<S: scheme::Scheme<D>, D: Digest> State<S, D> {
             let Kind::First(row) = &own.kind else {
                 return Err(Error::Authority);
             };
-            if row.core != scope
-                || own.slot != First::route_slot::<H>(&self.core.slot, scope, self.input)
+            if !row.matches_route_scope(
+                scope,
+                First::empty_route_scope::<H>(&self.core.slot, self.core.leader, self.input),
+            ) || own.slot != First::route_slot::<H>(&self.core.slot, row.core, self.input)
             {
                 return Err(Error::Authority);
             }

@@ -112,7 +112,9 @@ impl<D: Digest> FirstInput<D> {
             return Err(g::Error::Context);
         };
         let scope = row.core;
-        if scope == core.id::<H>()
+        if (scope == g::First::empty_route_scope::<H>(&core.slot, core.leader, input)
+            && row.report.is_some())
+            || scope == core.id::<H>()
             || message.round != core.slot.proposal.round
             || message.leader != core.leader
             || row.input != input
@@ -430,6 +432,18 @@ struct Bootstrap<D: Digest> {
     input: D,
     owner: Participant,
 }
+impl<D: Digest> Bootstrap<D> {
+    fn accepts_scope<H: Hasher<Digest = D>>(&self, verified: Option<D>) -> bool {
+        self.route_scope == verified
+            || (verified.is_some()
+                && self.route_scope
+                    == Some(g::First::empty_route_scope::<H>(
+                        &self.core.slot,
+                        self.core.leader,
+                        self.input,
+                    )))
+    }
+}
 struct Index<S: scheme::Scheme<D>, D: Digest> {
     slots: BTreeMap<D, Bootstrap<D>>,
     slots_by_view: BTreeMap<View, Vec<D>>,
@@ -642,7 +656,7 @@ where
             g::OriginBody::decode_cfg(body.encode(), &self.limits).map_err(|_| g::Error::Limit)?;
         let mut i = self.index.lock();
         let bootstrap = i.slots.get(&checked.slot()).ok_or(g::Error::Context)?;
-        if bootstrap.route_scope != checked.route_scope()
+        if !bootstrap.accepts_scope::<H>(checked.route_scope())
             || bootstrap.core != body.core
             || bootstrap.input != body.decision.input
         {
@@ -675,7 +689,7 @@ where
             .slots
             .get(&assembly.core().slot.id::<H>())
             .ok_or(g::Error::Context)?;
-        if b.route_scope != assembly.route_authority().and_then(|cap| cap.route_scope())
+        if !b.accepts_scope::<H>(assembly.route_authority().and_then(|cap| cap.route_scope()))
             || b.core != *assembly.core()
             || b.input != assembly.input()
         {

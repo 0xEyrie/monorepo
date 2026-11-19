@@ -402,12 +402,25 @@ where
         {
             // Wire authentication of an already paired final quorum. A signer or
             // application consumer still needs local policy replay for this scope.
+            let empty = First::empty_route_scope::<H>(
+                &body.core.slot,
+                body.core.leader,
+                body.decision.input,
+            );
+            let scope = body
+                .firsts
+                .iter()
+                .find_map(|s| match &s.message.kind {
+                    Kind::First(r) if r.core != empty => Some(r.core),
+                    _ => None,
+                })
+                .unwrap_or(empty);
             body.authenticate_route_rows::<H, R>(
                 rng,
                 s,
                 &body.core,
                 body.decision.input,
-                row.core,
+                scope,
                 limits,
                 strategy,
             )?;

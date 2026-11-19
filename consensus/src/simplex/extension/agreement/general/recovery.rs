@@ -837,13 +837,25 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
         }
         Ok(())
     };
+    let first_subject = |signed: &Signed<S, D>| {
+        let Some(scope) = route_scope else {
+            return Ok(slot);
+        };
+        let Kind::First(row) = &signed.message.kind else {
+            return Err(Error::Invalid("route FIRST role"));
+        };
+        if !row.matches_route_scope(
+            scope,
+            First::empty_route_scope::<H>(&core.slot, core.leader, input),
+        ) {
+            return Err(Error::Invalid("route FIRST scope"));
+        }
+        Ok(First::route_slot::<H>(&core.slot, row.core, input))
+    };
     match material {
         Material::Origin(o) => {
-            let subject = route_scope.map_or(slot, |scope| {
-                First::route_slot::<H>(&core.slot, scope, input)
-            });
             for first in &o.body.firsts {
-                signature(first, subject)?;
+                signature(first, first_subject(first)?)?;
             }
             signature(&o.selection, slot)?;
             if o.selection.message
@@ -861,11 +873,8 @@ fn preauthenticate<H: Hasher<Digest = D>, S: scheme::Scheme<D>, D: Digest, R: Cr
             }
         }
         Material::Body(b) => {
-            let subject = route_scope.map_or(slot, |scope| {
-                First::route_slot::<H>(&core.slot, scope, input)
-            });
             for first in &b.firsts {
-                signature(first, subject)?;
+                signature(first, first_subject(first)?)?;
             }
         }
         Material::History { notice, .. } => {

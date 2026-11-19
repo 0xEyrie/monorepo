@@ -685,6 +685,28 @@ impl<D: Digest> First<D> {
         ])
     }
 
+    /// Scope for an explicitly empty route signed before the execution parent is known.
+    pub fn empty_route_scope<H: Hasher<Digest = D>>(
+        slot: &Slot<D>,
+        leader: Participant,
+        input: D,
+    ) -> D {
+        H::hash(&[
+            b"_COMMONWARE_CONSENSUS_GENERAL_EMPTY_ROUTE_V1",
+            &slot.id::<H>().encode(),
+            &input.encode(),
+            &leader.get().to_be_bytes(),
+        ])
+    }
+
+    fn matches_route_scope(&self, scope: D, empty_scope: D) -> bool {
+        if self.core == empty_scope {
+            self.report.is_none() && self.preference.is_none()
+        } else {
+            self.core == scope
+        }
+    }
+
     fn check(&self, l: Limits) -> Result<(), Error> {
         if usize::from(self.owner) >= 64
             || self
@@ -1467,7 +1489,7 @@ impl<S: scheme::Scheme<D>, D: Digest> OriginBody<S, D> {
         {
             return Err(Error::Context);
         }
-        let subject = First::route_slot::<H>(&core.slot, scope, input);
+        let empty_scope = First::empty_route_scope::<H>(&core.slot, core.leader, input);
         let mut previous = None;
         for signed in &self.firsts {
             let Kind::First(row) = &signed.message.kind else {
@@ -1480,10 +1502,10 @@ impl<S: scheme::Scheme<D>, D: Digest> OriginBody<S, D> {
                 return Err(Error::Identity);
             }
             previous = Some(row.owner);
-            if row.core != scope
+            if !row.matches_route_scope(scope, empty_scope)
                 || row.input != input
                 || row.preference.is_some()
-                || signed.message.slot != subject
+                || signed.message.slot != First::route_slot::<H>(&core.slot, row.core, input)
                 || signed.message.round != core.slot.proposal.round
                 || signed.message.leader != core.leader
             {

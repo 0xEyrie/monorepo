@@ -22,6 +22,16 @@ clear old signing history to change profiles.
   SELECT, RECOVER, recovery ballots and timeout WISH through Readiness.
   Alignment collects recovery evidence and drives attempts.
 
+### Empty routes in FIRST votes
+
+A validator that knows the native parent but has no verified execution parent
+can sign an empty route for the exact proposal, leader and input. This scope
+allows no report bytes or preference. A route quorum may mix these submissions
+with parent-scoped originals. Each identity contributes once. The consumer
+replays the selector against its verified execution parent before requesting a
+SELECT or FINAL. The original FINAL quorum and native signing journal still
+govern issuance. Enable the new signed domain consistently across the epoch.
+
 ### Read the initial recovery history
 
 The voter arms a recovery-only clock when it first observes the admitted original
