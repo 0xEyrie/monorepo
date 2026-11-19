@@ -487,6 +487,16 @@ fn scoped_leader_replays_select_when_its_first_is_outside_the_quorum() {
     certificate
         .authenticate::<Sha256, _>(&mut rng, &f.verifier, LIMITS, &Sequential)
         .unwrap();
+    // Marshal and the certificate receiver use wire ceilings rather than the
+    // smaller, jointly feasible limits that were required to sign.
+    certificate
+        .authenticate::<Sha256, _>(
+            &mut rng,
+            &f.verifier,
+            crate::simplex::phase2::general::WIRE_LIMITS,
+            &Sequential,
+        )
+        .unwrap();
     certificate.origin.selection = certificate.origin.body.firsts[0].clone();
     assert!(
         certificate

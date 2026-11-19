@@ -1423,6 +1423,7 @@ impl<S: scheme::Scheme<D>, D: Digest> OriginBody<S, D> {
         validate_stability: impl FnOnce(&Self) -> bool,
         strategy: &impl Strategy,
     ) -> Result<VerifiedBody<D>, Error> {
+        limits.validate::<S, D>(core)?;
         self.authenticate_route_rows::<H, R>(
             rng,
             &VerificationSource::Scheme(scheme),
@@ -1455,7 +1456,8 @@ impl<S: scheme::Scheme<D>, D: Digest> OriginBody<S, D> {
         strategy: &impl Strategy,
     ) -> Result<(), Error> {
         let c = core.check::<H, S>(source)?;
-        limits.validate::<S, D>(core)?;
+        // Wire limits bound each received frame; only deployment profiles budget
+        // the simultaneous worst case for all fields before issuing authority.
         self.preflight(c, limits)?;
         if &self.core != core
             || self.decision.slot != core.slot
